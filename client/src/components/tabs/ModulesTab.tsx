@@ -1,0 +1,283 @@
+// Modules tab: read-only module list + gesture tables (Task 5.2).
+//
+// Left column: docked modules from the aux sweep (type, FW, rail per half).
+// Right: per-layer 30/100b configs, gesture slots 0..8 (the S2-proven range)
+// as gesture → action-label rows with FLASHABLE / APP ONLY badges.
+// Higher slots are unproven — listed raw under a collapsible section.
+// Non-flashable rows are greyed: only family-01 records have a proven write
+// path (S2), everything else is read-only in this client.
+// Reads run on mount with the left half connected; any failure degrades to a
+// muted "module config unavailable" note, never a crash.
+import { useCallback, useEffect, useState } from 'react';
+import { toast } from 'sonner';
+import { Button } from '../ui/button';
+import { Badge } from '../ui/badge';
+import { Card, CardContent, CardHeader } from '../ui/card';
+import { Tabs, TabsList, TabsTrigger } from '../ui/tabs';
+import type { NayaSession, Side } from '@create-reflow/sdk';
+import { describeRecord, toHex } from '@create-reflow/sdk';
+import { matchAction } from '@create-reflow/sdk';
+import type { HalfSnapshot } from '@create-reflow/sdk';
+import type { Draft } from '@create-reflow/sdk';
+import { parseModuleConfig } from '@create-reflow/sdk';
+import type { GestureBinding, ModuleConfig } from '@create-reflow/sdk';
+import { queueModuleGesture } from '@create-reflow/sdk';
+import { usePersistentFlag } from '../../hooks/usePersistentFlag';
+import type { LogFn } from '../../hooks/useLog';
+import { cn } from '../../lib/utils';
+
+const LAYERS = ['0', '1', '2'];
+
+// Slots 0..8 are the 9 host gestures (S2-proven range); the rest is raw.
+const GESTURE_SLOTS = 9;
+
+function actionLabel(g: GestureBinding): string {
+  return matchAction(g.actionRaw)?.label ?? describeRecord(g.actionRaw);
+}
+
+function ModuleRow({ half, info }: { half: string; info: HalfSnapshot }) {
+  if (!info.modPresent)
+    return (
+      <div className="py-2 text-sm text-muted-foreground">
+        {half}: no module docked
+      </div>
+    );
+  const rail =
+    info.modMv !== null
+      ? `${info.modMv} mV${info.modPctVal !== null ? ` (≈${info.modPctVal}%)` : ''}`
+      : 'rail n/a';
+  return (
+    <div className="py-2">
+      <div className="text-sm font-medium">
+        {half}: {info.modType}
+      </div>
+      <div className="text-xs tabular-nums text-muted-foreground">
+        {info.modFw ? `FW ${info.modFw} · ` : ''}
+        {rail}
+      </div>
+    </div>
+  );
+}
+
+export default function ModulesTab({
+  left,
+  halves,
+  leftOn,
+  log,
+  draftRef,
+  bumpDraft,
+}: {
+  left: NayaSession | undefined;
+  halves: Record<Side, HalfSnapshot>;
+  leftOn: boolean;
+  log: LogFn;
+  draftRef: React.RefObject<Draft>;
+  bumpDraft: () => void;
+}) {
+  const [layer, setLayer] = useState('1');
+  const [cfgs, setCfgs] = useState<Record<string, ModuleConfig | null>>({});
+  const [loaded, setLoaded] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+  // Experimental gesture write (Task 5.3): toggled only via devtools /
+  // localStorage, no UI toggle (deliberate). When on, clicking a FLASHABLE
+  // row expands a donor picker that copies another slot's bytes — exactly
+  // the S2-proven same-shape swap. The plan's ActionPalette pick cannot work
+  // here: palette actions are key-record bodies (6-10B) and can never satisfy
+  // the same-length rule for 1B gesture payloads.
+  const [writeEnabled] = usePersistentFlag('naya-modules-write', false);
+  const [donorFor, setDonorFor] = useState<number | null>(null);
+
+  const load = useCallback(async () => {
+    if (!left) return;
+    setBusy(true);
+    setErr(null);
+    const next: Record<string, ModuleConfig | null> = {};
+    for (const l of [0, 1, 2]) {
+      try {
+        const blob = await left.readModuleConfig(l);
+        const cfg = parseModuleConfig(blob, l);
+        next[String(l)] = cfg ? { ...cfg, profile: `Layer ${l}` } : null;
+      } catch (e) {
+        next[String(l)] = null;
+        setErr(`L${l}: ${(e as Error).message}`);
+      }
+    }
+    setCfgs(next);
+    setLoaded(true);
+    setBusy(false);
+    log('inf', 'module configs loaded (30/100b L0-L2, read-only)');
+  }, [left, log]);
+
+  // Load via a microtask (not a sync effect body): the loader sets state
+  // up-front (busy), which the set-state-in-effect rule forbids inline.
+  useEffect(() => {
+    if (!leftOn) return;
+    void Promise.resolve()
+      .then(() => load())
+      .catch(() => {});
+  }, [leftOn, load]);
+
+  const present = (['left', 'right'] as Side[]).filter((s) => halves[s].modPresent).length;
+  const cfg = cfgs[layer] ?? null;
+  const gestures = cfg?.gestures.filter((g) => g.slot < GESTURE_SLOTS) ?? [];
+  const raw = cfg?.gestures.filter((g) => g.slot >= GESTURE_SLOTS) ?? [];
+
+  const copyFrom = useCallback(
+    (g: GestureBinding, donor: GestureBinding) => {
+      const r = queueModuleGesture(
+        draftRef.current,
+        Number(layer),
+        g,
+        Array.from(donor.actionRaw.slice(3)),
+      );
+      if (r.queued) {
+        log('inf', `queued module write L${layer} ${g.gesture} ← slot ${donor.slot} bytes`);
+        bumpDraft();
+        setDonorFor(null);
+      } else {
+        log('err', `module write not queued: ${r.error}`);
+        toast.error('Gesture write rejected', { description: r.error });
+      }
+    },
+    [draftRef, bumpDraft, layer, log],
+  );
+
+  return (
+    <div className="grid grid-cols-[220px_1fr] gap-4 p-4">
+      <Card>
+        <CardHeader>
+          <div className="text-sm font-semibold">Modules</div>
+          <div className="text-xs text-muted-foreground">
+            {present === 0 ? 'none docked' : `${present} docked`}
+          </div>
+        </CardHeader>
+        <CardContent>
+          <ModuleRow half="Left half" info={halves.left} />
+          <ModuleRow half="Right half" info={halves.right} />
+        </CardContent>
+      </Card>
+
+      <Card>
+        <CardHeader>
+          <div className="flex items-center justify-between gap-2">
+            <div className="text-sm font-semibold">
+              {cfg ? cfg.profile : 'Gesture bindings'}
+            </div>
+            <div className="flex items-center gap-2">
+              <Tabs value={layer} onValueChange={setLayer}>
+                <TabsList>
+                  {LAYERS.map((l) => (
+                    <TabsTrigger key={l} value={l}>
+                      L{l}
+                    </TabsTrigger>
+                  ))}
+                </TabsList>
+              </Tabs>
+              <Button size="sm" variant="outline" disabled={!leftOn || busy} onClick={() => void load()}>
+                {busy ? 'Loading…' : 'Refresh'}
+              </Button>
+            </div>
+          </div>
+        </CardHeader>
+        <CardContent>
+          {!leftOn && (
+            <p className="text-sm text-muted-foreground">
+              Connect the left half to read module configs.
+            </p>
+          )}
+          {leftOn && !loaded && !err && (
+            <p className="text-sm text-muted-foreground">Loading…</p>
+          )}
+          {err && <p className="text-sm text-muted-foreground">module config unavailable ({err})</p>}
+          {cfg && (
+            <>
+              <div className="grid grid-cols-[1fr_auto_1fr] items-center gap-x-3 gap-y-1.5">
+                {gestures.map((g) => {
+                  const clickable = writeEnabled && g.flashable;
+                  const donors =
+                    donorFor === g.slot && cfg
+                      ? cfg.gestures.filter(
+                          (d) =>
+                            d.flashable &&
+                            d.slot !== g.slot &&
+                            d.actionRaw.length === g.actionRaw.length,
+                        )
+                      : [];
+                  return (
+                    <div key={g.slot} className="contents">
+                      <span
+                        className={cn(
+                          'font-mono text-xs',
+                          !g.flashable && 'text-muted-foreground opacity-60',
+                          clickable && 'cursor-pointer hover:underline',
+                        )}
+                        onClick={
+                          clickable
+                            ? () => setDonorFor(donorFor === g.slot ? null : g.slot)
+                            : undefined
+                        }
+                        title={
+                          clickable
+                            ? 'Experimental write: pick a donor slot to copy its bytes'
+                            : undefined
+                        }
+                      >
+                        {g.gesture}
+                      </span>
+                      {g.flashable ? (
+                        <Badge variant="ok">FLASHABLE</Badge>
+                      ) : (
+                        <span title="Read-only in this client: only family-01 gestures have a proven write path">
+                          <Badge variant="default">APP ONLY</Badge>
+                        </span>
+                      )}
+                      <span
+                        className={cn(
+                          'truncate font-mono text-xs tabular-nums',
+                          !g.flashable && 'text-muted-foreground opacity-60',
+                        )}
+                        title={toHex(g.actionRaw)}
+                      >
+                        {actionLabel(g)}
+                        {donors.length > 0 && (
+                          <span className="mt-1 flex flex-wrap gap-1">
+                            {donors.map((d) => (
+                              <Button
+                                key={d.slot}
+                                size="sm"
+                                variant="outline"
+                                onClick={() => copyFrom(g, d)}
+                                title={`Copy ${toHex(d.actionRaw)} (S2-proven same-shape swap)`}
+                              >
+                                ← slot {d.slot}
+                              </Button>
+                            ))}
+                          </span>
+                        )}
+                      </span>
+                    </div>
+                  );
+                })}
+              </div>
+              {raw.length > 0 && (
+                <details className="mt-3">
+                  <summary className="cursor-pointer text-xs text-muted-foreground">
+                    Other slots ({raw.length}, unproven layout)
+                  </summary>
+                  <div className="mt-1 space-y-0.5 font-mono text-[11px] break-all text-muted-foreground">
+                    {raw.map((g) => (
+                      <div key={g.slot}>
+                        {g.slot.toString(16).padStart(2, '0')}: {toHex(g.actionRaw)}
+                      </div>
+                    ))}
+                  </div>
+                </details>
+              )}
+            </>
+          )}
+        </CardContent>
+      </Card>
+    </div>
+  );
+}

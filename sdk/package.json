@@ -1,0 +1,20 @@
+{
+  "name": "@create-reflow/sdk",
+  "version": "0.1.0",
+  "type": "module",
+  "license": "MIT",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "main": "./src/index.ts",
+  "types": "./src/index.ts",
+  "scripts": {
+    "build": "tsc --noEmit",
+    "lint": "oxlint src"
+  },
+  "devDependencies": {
+    "@types/w3c-web-serial": "^1.0.8",
+    "oxlint": "^1.46.0",
+    "typescript": "~6.0.2"
+  }
+}

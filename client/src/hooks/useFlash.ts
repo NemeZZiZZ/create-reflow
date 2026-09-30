@@ -1,0 +1,203 @@
+/* Flash: write the whole draft queue to the device. Handshake once, then
+ * every op in order, then a full re-dump (which reconciles the queue).
+ * No fe/100a commit — writes apply instantly and persist. */
+
+import { useCallback, useRef, useState } from 'react';
+import { toast } from 'sonner';
+import { saveAutoBackup, listAutoBackups } from '@create-reflow/sdk';
+import { opSummary } from '@create-reflow/sdk';
+import type { Draft } from '@create-reflow/sdk';
+import { concat, isWriteAck, sleep, toHex } from '@create-reflow/sdk';
+import type { KeyRec, LedRec, NayaSession, Side } from '@create-reflow/sdk';
+import { parseCmdPath } from '@create-reflow/sdk';
+import type { LayerDump } from './useLayers';
+import type { LogFn } from './useLog';
+
+export type FlashResult = 'ok' | 'partial' | 'fail';
+export interface FlashState {
+  phase: 'idle' | 'running' | FlashResult;
+  done: number;
+  total: number;
+  message: string | null;
+}
+
+const IDLE: FlashState = { phase: 'idle', done: 0, total: 0, message: null };
+
+export function useFlash({
+  sesRef,
+  busyRef,
+  draftRef,
+  layers,
+  notes,
+  dumpAll,
+  bumpDraft,
+  log,
+}: {
+  sesRef: React.RefObject<Map<Side, NayaSession>>;
+  busyRef: React.RefObject<boolean>;
+  draftRef: React.RefObject<Draft>;
+  /** live caches — the pre-flash auto-backup snapshots these */
+  layers: {
+    keys: KeyRec[][];
+    leds: LedRec[][];
+    blobKeys: number[];
+    blobLeds: number[];
+  };
+  /** per-key notes ("L:kk") carried into the auto-backup */
+  notes?: Record<string, string>;
+  dumpAll: (ses: NayaSession) => Promise<LayerDump | null>;
+  bumpDraft: () => void;
+  log: LogFn;
+}) {
+  const [flashing, setFlashing] = useState(false);
+  const [flashState, setFlashState] = useState<FlashState>(IDLE);
+  // Double-dispatch guard: a confirm click can reach us twice (automation
+  // double-events, radix re-dispatch) — two concurrent write loops interleave
+  // their multipart reads on the same port and wedge the stream. Second and
+  // later callers await the SAME in-flight promise.
+  const inFlight = useRef<Promise<FlashResult> | null>(null);
+
+  const runFlashQueue = useCallback(async (): Promise<FlashResult> => {
+    const ses = sesRef.current.get('left') ?? null;
+    const d = draftRef.current;
+    if (!ses) {
+      const msg = 'left half not connected';
+      toast.error('Flash failed', { description: msg });
+      log('err', `flash queue: ${msg}`);
+      setFlashState({ phase: 'fail', done: 0, total: d.size, message: msg });
+      return 'fail';
+    }
+    if (d.size === 0) return 'fail';
+    busyRef.current = true;
+    setFlashing(true);
+    setFlashState({ phase: 'running', done: 0, total: d.size, message: null });
+    const total = d.size;
+    let done = 0;
+    try {
+      log('inf', `flash queue: ${total} op(s)`);
+      // Pre-flash auto-backup (UHK compensation pattern): the device has
+      // no staging buffer, so park a restore point of the live caches
+      // first. Failures degrade to a log line — they must never block
+      // the write the user asked for.
+      const bk = saveAutoBackup(
+        layers.keys,
+        layers.leds,
+        layers.blobKeys,
+        layers.blobLeds,
+        notes,
+      );
+      if (bk.status === 'saved')
+        log(
+          'inf',
+          `auto-backup saved (${bk.meta.bytes}B, ${listAutoBackups().length} kept) — "Restore auto-backup…" in the Save menu`,
+        );
+      else if (bk.reason === 'unchanged')
+        log('inf', 'auto-backup: unchanged since last flash (deduped)');
+      else if (bk.reason === 'storage')
+        log('err', 'auto-backup: storage unavailable/full — continuing without');
+      await ses.handshake();
+      // Snapshot iteration: settings ops self-remove from d.ops on ACK.
+      for (const o of [...d.ops]) {
+        log('inf', `flash ${done + 1}/${total}: ${opSummary(o)}`);
+        if (o.kind === 'key') {
+          const ack = await ses.writeKey(o.record, o.layer);
+          if (!isWriteAck(ack, o.layer))
+            throw new Error(`key write NACK: ${toHex(ack)}`);
+        } else if (o.kind === 'led') {
+          const ack = await ses.writeLed(o.kk, o.h, o.s, o.layer);
+          if (!isWriteAck(ack, o.layer))
+            throw new Error(`led write NACK: ${toHex(ack)}`);
+        } else if (o.kind === 'keyset') {
+          for (const rec of o.records) {
+            const ack = await ses.writeKey(rec, o.layer);
+            if (!isWriteAck(ack, o.layer))
+              throw new Error(
+                `keyset write NACK @0x${rec[0].toString(16)}: ${toHex(ack)}`,
+              );
+          }
+        } else if (o.kind === 'settings') {
+          const { t, c0, c1 } = parseCmdPath(o.path);
+          const f = await ses.cmd(t, c0, c1, o.payload);
+          if (f.payload.length === 0 || f.payload[0] !== 0x00)
+            throw new Error(`${o.path} write NACK: ${toHex(f.payload)}`);
+          d.removeAt(d.ops.indexOf(o)); // no GET — ACK is the only verification
+        } else if (o.kind === 'module') {
+          // S2-proven write: 30/100c (c1=0x0c), params [00, LAYER] + full
+          // record, ACK = 00 <layer>. c1=0x0b parse-ACKs WITHOUT applying —
+          // never use it here.
+          const f = await ses.cmd(
+            0x30,
+            0x10,
+            0x0c,
+            concat([new Uint8Array([0, o.layer]), o.payload]),
+          );
+          if (!isWriteAck(f.payload, o.layer))
+            throw new Error(`module write NACK: ${toHex(f.payload)}`);
+          d.removeAt(d.ops.indexOf(o)); // no GET — ACK is the only verification
+        } else {
+          throw new Error('unknown op kind');
+        }
+        done++;
+        setFlashState({ phase: 'running', done, total, message: null });
+      }
+      bumpDraft(); // settings ops removed themselves above
+      log('inf', `flash queue: ${done}/${total} written, re-reading…`);
+      // ED writes (animations) spin the LED engine up and the device drops
+      // or reorders multipart replies right after — immediate re-dumps came
+      // back with spliced parts ("truncated"). Let it settle first.
+      await sleep(600);
+      const fresh = await dumpAll(ses);
+      if (fresh) {
+        d.reconcile(fresh.keys, fresh.leds);
+        bumpDraft();
+      }
+      // Confirmed = ops no longer queued: reconcile-dropped key/led ops plus
+      // ACK-self-removed settings/module ops. (dropped alone undercounts when
+      // the queue held self-removing ops alongside.)
+      const confirmed = total - d.size;
+      if (fresh && d.size === 0) {
+        toast.success('Flash complete', {
+          description: `${total} change(s) verified on device`,
+        });
+        log('inf', 'flash queue: all changes verified on device');
+        setFlashState({ phase: 'ok', done: total, total, message: null });
+        return 'ok';
+      } else {
+        toast.error('Flash partially verified', {
+          description: `${confirmed}/${total} confirmed — ${d.size} still queued`,
+        });
+        log('err', `flash queue: ${d.size} op(s) not reflected`);
+        setFlashState({
+          phase: 'partial', done: confirmed, total,
+          message: `${confirmed}/${total} confirmed — ${d.size} still queued`,
+        });
+        return 'partial';
+      }
+    } catch (e) {
+      const msg = (e as Error).message;
+      console.debug((e as Error).stack);
+      toast.error('Flash failed', { description: msg });
+      log('err', `flash queue: ${msg}`);
+      bumpDraft(); // settings/module ops may have self-removed before the throw
+      setFlashState({
+        phase: 'fail', done, total,
+        message: `${msg} — ${done}/${total} written before the error`,
+      });
+      return 'fail';
+    } finally {
+      busyRef.current = false;
+      setFlashing(false);
+    }
+  }, [sesRef, busyRef, draftRef, layers, notes, dumpAll, bumpDraft, log]);
+
+  const doFlashQueue = useCallback((): Promise<FlashResult> => {
+    if (inFlight.current) return inFlight.current;
+    const p = runFlashQueue().finally(() => {
+      if (inFlight.current === p) inFlight.current = null;
+    });
+    inFlight.current = p;
+    return p;
+  }, [runFlashQueue]);
+
+  return { flashing, flashState, doFlashQueue };
+}

@@ -1,0 +1,98 @@
+// Pure mapping: describeRecord() string -> key-icon file base name (no asset
+// imports here, so node smoke tests stay bundler-free). Filenames live in
+// src/assets/key-icons/<name>.svg — the full 860-glyph NayaFlow renderer set
+// (dist/renderer/assets/icons/action/, recolored #fff -> currentColor;
+// DONGLE/HOLD_LAYER_0 keep their two-tone gray fills). The action_code ->
+// file registry is vendored at src/assets/action-icons.json.
+// Returns null when no icon exists -> caller falls back to text legend.
+import { describeRecord } from '@create-reflow/sdk';
+
+export function keyIconName(d: string): string | null {
+  const m = /^BT Device ([1-5])$/.exec(d);
+  if (m) return 'BT_DEVICE_' + m[1];
+  // T05/7B layer actions: [KK,05,04,ORDER,...] — family 04 id 01 = MO(layer 1)
+  // hold (LH4/RH4 middle thumbs on the factory map). describe() now emits
+  // 'MO layer N' directly; the regex stays for legacy 'special…' strings.
+  if (/^special [0-9a-f]{2} 05 04 01 00 00 00$/.test(d)) return 'MO_LAYER_1';
+  switch (d) {
+    // HID main block
+    case 'Enter': return 'RETURN';
+    case 'Esc': return 'ESC';
+    case 'Backspace': return 'BACKSPACE';
+    case 'Tab': return 'TAB';
+    case 'Space': return 'SPACE';
+    case 'Caps Lock': return 'CAPSLOCK';
+    case 'Print Screen': return 'PRINTSCREEN';
+    case 'Scroll Lock': return 'SCROLLLOCK';
+    case 'Pause': return 'PAUSE_BREAK';
+    case 'Insert': return 'INSERT';
+    case 'Home': return 'HOME';
+    case 'Page Up': return 'PG_UP';
+    case 'Delete': return 'DELETE';
+    case 'End': return 'END';
+    case 'Page Down': return 'PG_DN';
+    case '→': return 'RIGHT';
+    case '←': return 'LEFT';
+    case '↓': return 'DOWN';
+    case '↑': return 'UP';
+    case 'Num Lock': return 'KP_NUMLOCK';
+    // HID modifiers (no Shift icon exists in the NayaFlow set -> text fallback)
+    case 'LCtrl': return 'LCTRL';
+    case 'RCtrl': return 'RCTRL';
+    case 'LAlt': return 'LALT';
+    case 'RAlt': return 'RALT';
+    case 'LGUI': return 'LGUI';
+    case 'RGUI': return 'RGUI';
+    // consumer page
+    case 'Play/Pause': return 'C_PLAY_PAUSE';
+    case 'Mute': return 'C_MUTE';
+    case 'Volume +': return 'C_VOL_UP';
+    case 'Volume −': return 'C_VOL_DOWN'; // U+2212, matches CONSUMER table
+    case 'Next Track': return 'C_NEXT';
+    case 'Prev Track': return 'C_PREVIOUS';
+    // mouse buttons (no middle/wheel-click glyph in the set)
+    case 'Mouse Left': return 'MOUSE_LEFT';
+    case 'Mouse Right': return 'MOUSE_RIGHT';
+    // vendor actions
+    case 'Hold layer 2': return 'HOLD_LAYER_2';
+    case 'MO layer 1': return 'MO_LAYER_1';
+    case 'BT Clear': return 'BT_CLEAR';
+    default: return null;
+  }
+}
+
+/* Short text legend for a keymap record — the same string the keycap shows
+ * when no icon maps. Used by the keyboard and, as a fallback, the palette. */
+export function shortLabel(rec: Uint8Array): string {
+  const d = describeRecord(rec);
+  if (
+    d.startsWith('empty') ||
+    d.startsWith('index block') ||
+    d.startsWith('unknown')
+  )
+    return '';
+  if (d === 'Hold layer 2') return 'Hold 2';
+  if (d === 'MO layer 1') return 'MO 1';
+  if (d === 'BT Clear') return 'BT CLR';
+  if (d === 'USB out') return 'USB';
+  if (d === 'BT out') return 'BT';
+  if (d === 'Disabled' || d === 'Transparent') return '';
+  if (d.startsWith('multi')) return 'Multi';
+  if (d.startsWith('macro')) return 'Macro';
+  let m = d.match(/^BT Device (\d+)$/);
+  if (m) return 'BT' + m[1];
+  m = d.match(/^Mouse (Left|Right|Middle)$/);
+  if (m) return 'M-' + m[1][0];
+  if (d.startsWith('Mouse button')) return 'M?';
+  m = d.match(/^LED effect #(\d+)$/);
+  if (m) return 'FX' + m[1];
+  if (d.startsWith('LED')) return 'LED';
+  if (
+    d.startsWith('vendor') ||
+    d.startsWith('special') ||
+    d.startsWith('Consumer') ||
+    d.startsWith('usage page')
+  )
+    return d.slice(0, 8);
+  return d.length > 10 ? d.slice(0, 10) : d;
+}
