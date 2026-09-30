@@ -17,7 +17,7 @@ import { ACTIONS, buildRecord, findAction, matchAction } from '@create-reflow/sd
 import { Draft, opKey, opSection, opSummary } from '@create-reflow/sdk';
 import type { KeySetOp } from '@create-reflow/sdk';
 import type { KeyRec, LedRec } from '@create-reflow/sdk';
-import { parseSnapshotFile, diffSnapshotToDraft } from '@create-reflow/sdk';
+import { parseSnapshotFile, diffSnapshotToDraft, hexToBytes } from '@create-reflow/sdk';
 import type { SnapMaps } from '@create-reflow/sdk';
 import { timeoutsMs, timeoutsPayload } from '@create-reflow/sdk';
 import Keyboard from '../src/components/Keyboard';
@@ -481,7 +481,7 @@ eq(timeoutsMs(new Uint8Array([1, 2, 3])), null, 'timeoutsMs rejects short');
     if (d3b.ops[0].kind === 'keyset') {
       eq(d3b.ops[0].records.length, 2, 'downgrade writes primary + shadow filler');
       eq(toHex(d3b.ops[0].records[0]), toHex(rec7), 'primary is the snapshot record');
-      eq(toHex(d3b.ops[0].records[1]), '5b 00 00', 'filler clears the shadow slot');
+      eq(toHex(d3b.ops[0].records[1]), '5b 07 00', 'filler clears the shadow slot (NONE type)');
     }
     eq('error' in parseSnapshotFile({ tool: 'nope' }) ? 'err' : 'ok', 'err', 'unknown tool rejected');
   }
@@ -579,7 +579,7 @@ eq(timeoutsMs(new Uint8Array([1, 2, 3])), null, 'timeoutsMs rejects short');
   ] as unknown as KeyRec[];
   const downOps = behaviorSetOps(0x30, { tap: 0x1d, hold: 0x1c, double: null, taphold: null }, 0, 'down', prevShadow);
   eq(downOps?.records.length, 2, 'T03 downgrade from T10 → t03 + shadow filler');
-  eq(toHex(downOps!.records[1]), '82 00 00', 'stale shadow cleared to filler');
+  eq(toHex(downOps!.records[1]), '82 07 00', 'stale shadow cleared to filler');
   eq(behaviorSetOps(0x30, { tap: 0x1d, hold: 0x1c, double: null, taphold: null }, 0, 'plain')?.records.length, 1,
      'T03 without prior shadow → single record');
   eq(toHex(plainRecord(0x22, 0x07)), '22 01 04 07 00 07 00', 'plain T01 record (S1 restore shape)');
@@ -602,14 +602,15 @@ import {
   t03Record, t10Primary, t10ShadowMini, t10ShadowFull,
   behaviorSetOf, behaviorSetOps, withSlot, hidPairOf,
   plainRecord, hasT10Shadow, cascadeClear,
+  behaviorMetaOf, fillerRecord,
 } from '@create-reflow/sdk';
 import type { BehaviorSet } from '@create-reflow/sdk';
 import {
   ANIM_NAMES, edTargetValue, animOp, scanModeOp, maxBrtOp, ledOverrideOp,
   parseCmdPath,
 } from '@create-reflow/sdk';
-import { FLAVORS, flavorById } from '@create-reflow/sdk';
-import { queueSetting, queueBehaviorSet } from '@create-reflow/sdk';
+import { FLAVORS, flavorById, FLAVOR_BYTES, flavorOfByte } from '@create-reflow/sdk';
+import { queueSetting, queueBehaviorSet, describeStatus } from '@create-reflow/sdk';
 import { queueModuleGesture } from '@create-reflow/sdk';
 import {
   GESTURE_NAMES, gestureName, parseModuleConfig, gesturePayload,
@@ -695,7 +696,7 @@ import {
   const recs = (d.ops[0] as { records: Uint8Array[] }).records;
   eq(recs.length, 2, 'plain + filler records');
   eq(toHex(recs[0]), '22 01 04 07 00 07 00', 'primary back to T01');
-  eq(toHex(recs[1]), '74 00 00', 'shadow back to filler');
+  eq(toHex(recs[1]), '74 07 00', 'shadow back to filler');
   eq(hasT10Shadow(prev, 0x22), true, 'hasT10Shadow detects stale shadow');
   eq(hasT10Shadow(undefined, 0x22), false, 'hasT10Shadow without cache');
 }
@@ -725,7 +726,7 @@ import {
   // shadow slot out of its dump — filler [kk,00,00] is satisfied by ABSENCE.
   const dS = new Draft();
   const primS = plainRecord(0x22, 0x07);
-  const fillS = new Uint8Array([0x74, 0x00, 0x00]);
+  const fillS = new Uint8Array([0x74, 0x07, 0x00]);
   dS.add({ kind: 'keyset', layer: 0, kk: 0x22, records: [primS, fillS], label: 'downgrade' });
   eq(dS.reconcile([[{ kk: 0x22, rec: primS }]] as unknown as KeyRec[][], [[]]), 1,
     'keyset reconcile: filler satisfied by absent slot');
@@ -874,7 +875,7 @@ import { queueAction } from '@create-reflow/sdk';
        'ok', 'T10 pick downgrades via keyset');
     if (d.ops[0].kind === 'keyset') {
       eq(toHex(d.ops[0].records[0]), toHex(zRec), 'primary is the picked action');
-      eq(toHex(d.ops[0].records[1]), '82 00 00', 'filler clears shadow @0x82');
+      eq(toHex(d.ops[0].records[1]), '82 07 00', 'filler clears shadow @0x82');
     }
   }
   // plain primary but lingering T10 shadow → still keyset+filler
@@ -1083,6 +1084,53 @@ import { queueAction } from '@create-reflow/sdk';
   if (!('error' in loaded)) {
     eq(loaded.notes?.['0:48'], 'z', '32 backup note round-trips');
   }
+}
+
+// §33 cross-source findings: flavor/flag preservation, NONE filler,
+// status decode, 30 s timeouts floor.
+{
+  // NayaFlow-written Z record (research/dumps, all backups): bodyFlags 0,
+  // holdFlags 2 (unknown hold-quad byte — preserve verbatim), term 200 LE.
+  const Z = hexToBytes(
+    '30 03 15 01 01 00 c8 00 1b 00 07 02 00 00 00 00 1d 00 07 00 00 00 00 00',
+  );
+  const meta = behaviorMetaOf([{ kk: 0x30, rec: Z }], 0x30);
+  eq(meta?.bodyFlags ?? -1, 0, '33 meta reads bodyFlags 0');
+  eq(meta?.holdFlags ?? -1, 2, '33 meta reads holdFlags 2');
+  eq(meta?.termHold ?? -1, 200, '33 meta reads termHold 200');
+  eq(behaviorMetaOf([{ kk: 0x31, rec: plainRecord(0x31, 0x1d) }], 0x31), null, '33 meta null on plain record');
+  eq(toHex(t03Record(0x30, 0x1b, 0x1d, 200, { bodyFlags: 0, holdFlags: 2 })), toHex(Z), '33 t03Record reproduces Z byte-exact with opts');
+  // behaviorSetOps preserves meta from prevRecs when opts omit flags
+  const set: BehaviorSet = { tap: 0x1d, hold: 0x1b, double: null, taphold: null };
+  const kept = behaviorSetOps(0x30, set, 0, 'z', [{ kk: 0x30, rec: Z }]);
+  eq(kept.records.length, 1, '33 T03 set = 1 record');
+  eq(toHex(kept.records[0]), toHex(Z), '33 set preserves Z flags through rewrite');
+  const over = behaviorSetOps(0x30, set, 0, 'z', [{ kk: 0x30, rec: Z }], { bodyFlags: 1 });
+  eq(over.records[0][5], 1, '33 explicit bodyFlags override wins');
+  // t10Primary opts wiring (term/body/hold slots)
+  const p = t10Primary(0x22, 0x1b, 0x1d, 200, 250, { bodyFlags: 1, holdFlags: 2 });
+  eq(p[8], 1, '33 t10 bodyFlags byte');
+  eq(p[14], 2, '33 t10 holdFlags byte');
+  eq(p[9] | (p[10] << 8), 250, '33 t10 termDouble LE');
+  // flavor byte mapping (cross-source; 3 = inferred)
+  eq(FLAVOR_BYTES['hold-preferred'], 0, '33 flavor hp=0');
+  eq(FLAVOR_BYTES['balanced'], 1, '33 flavor bal=1');
+  eq(FLAVOR_BYTES['tap-preferred'], 2, '33 flavor tp=2');
+  eq(FLAVOR_BYTES['tap-unless-interrupted'], 3, '33 flavor tui=3');
+  eq(flavorOfByte(FLAVOR_BYTES['tap-preferred']), 'tap-preferred', '33 flavor roundtrip');
+  eq(flavorOfByte(0x7f), 'hold-preferred', '33 unknown flavor byte -> hp');
+  // NONE-type filler (type 07; legacy 00 = zero-length bluetooth record)
+  eq(toHex(fillerRecord(0x82)), '82 07 00', '33 filler is [kk, 07, 00]');
+  // status-byte decode
+  eq(describeStatus(0x16), 'nothing stored', '33 status 16');
+  eq(describeStatus(0xea), 'value refused', '33 status ea');
+  eq(describeStatus(0x2a), 'status 0x2a', '33 unknown status');
+  // 30 s floor: 0 = off allowed, sub-30s refused
+  eq(timeoutsPayload(0, 30000, 30000)[4], 0, '33 zero idle allowed');
+  eq(toHex(timeoutsPayload(30000, 30000, 30000)).length > 0, true, '33 exactly 30s allowed');
+  let threw33 = false;
+  try { timeoutsPayload(5000, 30000, 30000); } catch { threw33 = true; }
+  eq(threw33, true, '33 sub-30s idle rejected');
 }
 
 // §28 version matrix (UHK #14): package.json is part of the version

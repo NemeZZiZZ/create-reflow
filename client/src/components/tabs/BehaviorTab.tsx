@@ -1,12 +1,14 @@
 // Behavior tab: Typing / Power / LED settings form (Task 4.2).
 //
-// Typing: Interrupt Flavor is a UI-only policy select until the S1
-// flavor-diff proves a wire encoding (persisted to localStorage, nothing
-// flashed). Tapping Term is an independent slider (10-1000ms) lifted to App
-// — Task 2.2's queueBehaviorSet call receives it.
-// Power: Idle/Sleep/Deep timeout sliders (0-6000s). Current values load live
-// via fe/100b on mount (left half only); Apply queues one fe/100a op with
-// all three values. (Replaces the old Settings dialog.)
+// Typing: Interrupt Flavor (App-lifted state) rides inside every hold-tap
+// record — written on the next behavior write (queueBehaviorSet → t10
+// builders), never as a standalone op. Tapping Term is an independent
+// slider (10-1000ms) lifted to App — Task 2.2's queueBehaviorSet call
+// receives it.
+// Power: Idle/Sleep/Deep timeout sliders (0-6000s; 0 = off, 30 s device
+// floor enforced by timeoutsPayload). Current values load live via fe/100b
+// on mount (left half only); Apply queues one fe/100a op with all three
+// values. (Replaces the old Settings dialog.)
 // LED: Max Brightness / Scan Mode / Action Override queue ED ops on change.
 // The device reports none of these back — the queue shows what will be sent.
 import { useEffect, useState } from 'react';
@@ -31,18 +33,6 @@ export interface TimeoutVals {
 // Factory timeouts (see timeoutsMs) shown until a live read lands.
 const FACTORY = { idleMs: 90_000, sleepMs: 300_000, deepMs: 30_000 };
 
-const FLAVOR_KEY = 'naya-flavor';
-
-function loadFlavor(): FlavorId {
-  try {
-    const v = window.localStorage.getItem(FLAVOR_KEY);
-    if (flavorById(v ?? '')) return v as FlavorId;
-  } catch {
-    /* ignore */
-  }
-  return 'balanced';
-}
-
 function Row({
   label,
   hint,
@@ -64,6 +54,8 @@ function Row({
 }
 
 export default function BehaviorTab({
+  flavor,
+  onFlavor,
   tappingTerm,
   onTappingTerm,
   leftOn,
@@ -72,6 +64,8 @@ export default function BehaviorTab({
   bumpDraft,
   log,
 }: {
+  flavor: FlavorId;
+  onFlavor: (id: FlavorId) => void;
   tappingTerm: number;
   onTappingTerm: (ms: number) => void;
   leftOn: boolean;
@@ -80,7 +74,6 @@ export default function BehaviorTab({
   bumpDraft: () => void;
   log: LogFn;
 }) {
-  const [flavor, setFlavor] = useState<FlavorId>(loadFlavor);
   const [idleS, setIdleS] = useState(FACTORY.idleMs / 1000);
   const [sleepS, setSleepS] = useState(FACTORY.sleepMs / 1000);
   const [deepS, setDeepS] = useState(FACTORY.deepMs / 1000);
@@ -109,20 +102,22 @@ export default function BehaviorTab({
   const showingLive = leftOn && liveTimeouts;
 
   function pickFlavor(id: FlavorId) {
-    setFlavor(id);
-    try {
-      window.localStorage.setItem(FLAVOR_KEY, id);
-    } catch {
-      /* ignore */
-    }
-    log('inf', `interrupt flavor → ${flavorById(id)?.name} (UI-only until the flavor-diff proves a wire encoding)`);
+    onFlavor(id);
+    log('inf', `interrupt flavor → ${flavorById(id)?.name} (rides inside every hold-tap record — applied on the next behavior write)`);
   }
 
   function applyTimeouts() {
+    let payload: Uint8Array;
+    try {
+      payload = timeoutsPayload(idleS * 1000, sleepS * 1000, deepS * 1000);
+    } catch (e) {
+      log('err', `timeouts: ${e instanceof Error ? e.message : String(e)}`);
+      return;
+    }
     queueSetting(draftRef.current, {
       kind: 'settings',
       path: 'fe/100a',
-      payload: timeoutsPayload(idleS * 1000, sleepS * 1000, deepS * 1000),
+      payload,
       label: `timeouts idle ${idleS}s sleep ${sleepS}s deep ${deepS}s`,
     });
     bumpDraft();
@@ -154,7 +149,9 @@ export default function BehaviorTab({
         <CardContent>
           <div className="py-2">
             <div className="text-sm">Interrupt Flavor</div>
-            <div className="text-xs text-muted-foreground">UI-only policy — nothing is flashed.</div>
+            <div className="text-xs text-muted-foreground">
+              Written into every hold-tap record on the next behavior write.
+            </div>
             <div className="mt-2 grid grid-cols-2 gap-1">
               {FLAVORS.map((f) => (
                 <Button
@@ -195,6 +192,7 @@ export default function BehaviorTab({
           {leftOn && !showingLive && (
             <div className="text-xs text-muted-foreground">Reading timeouts from the device…</div>
           )}
+          <div className="text-xs text-muted-foreground">0 = off; 30 s minimum (device floor).</div>
           <Row label="Idle Timeout" hint={showingLive ? 'Live from the device.' : undefined}>
             <input
               type="range"

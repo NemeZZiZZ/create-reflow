@@ -1,18 +1,38 @@
-// Interrupt Flavor policy dictionary (Task 4.1).
+// Interrupt Flavor policy dictionary.
 //
 // NayaFlow exposes Interrupt Flavor as a 4-way policy: how a hold-tap key
 // resolves when interrupted by another keypress. It is INDEPENDENT of the
 // tapping term (milliseconds, 10-1000 slider).
 //
-// Wire encoding is OPEN (pending S1 flavor-diff: dump the keymap under each
-// flavor in NayaFlow and diff the bytes). Until the verdict lands this file
-// carries display metadata only — no bytes reach the device from here.
+// Wire encoding (cross-source, Create-knowledge-base, measured by typing
+// test 2026-09): the flavor byte is the "body flags" byte inside EVERY
+// hold-tap record — T03 byte 5 / T10 byte 8: 00 = hold-preferred,
+// 01 = balanced, 02 = tap-preferred, 03 = tap-unless-interrupted
+// (03 inferred, not measured). Notably NayaFlow's default "Balanced"
+// writes 00 = hold-preferred. We have not yet re-verified this on our own
+// hardware (flavor-diff pending), so bytes ride only when the user
+// explicitly picks a flavor in the UI.
 
 export type FlavorId =
   | 'balanced'
   | 'hold-preferred'
   | 'tap-preferred'
   | 'tap-unless-interrupted';
+
+/** FlavorId → wire byte (hold-tap body flags). */
+export const FLAVOR_BYTES: Record<FlavorId, number> = {
+  'hold-preferred': 0x00,
+  balanced: 0x01,
+  'tap-preferred': 0x02,
+  'tap-unless-interrupted': 0x03,
+};
+
+/** Wire byte → FlavorId; unknown bytes map to hold-preferred (stock 00). */
+export function flavorOfByte(b: number): FlavorId {
+  return (Object.keys(FLAVOR_BYTES) as FlavorId[]).find(
+    (k) => FLAVOR_BYTES[k] === b,
+  ) ?? 'hold-preferred';
+}
 
 export interface Flavor {
   id: FlavorId;

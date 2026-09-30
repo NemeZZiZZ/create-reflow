@@ -92,21 +92,28 @@ export function queueSetting(draft: Draft, op: SettingsOp): void {
 }
 
 /** Queue a full T10/T03 behavior set for one key (device stores truth per
- * set — editing any behavior rewrites all slots). `tappingTerm` stays an
- * independent setting (default 200ms); flavor policy is UI-only until the
- * S1 flavor-diff proves a wire encoding. A tap-only result downgrades to the
- * plain T01 record (plus shadow cleanup when the old set was a T10). */
+ * set — editing any behavior rewrites all slots). `tappingTerm` rides
+ * inside the records (default 200 ms); `flavorByte` (0-3, cross-source
+ * measured encoding) is written ONLY when the user explicitly picked a
+ * flavor — otherwise preserved from the live record via behaviorMetaOf.
+ * A tap-only result downgrades to the plain T01 record (plus shadow
+ * cleanup when the old set was a T10). */
 export function queueBehaviorSet(
   draft: Draft,
   layer: number,
   kk: number,
   set: BehaviorSet,
-  _tappingTerm: number,
+  tappingTerm: number,
   label: string,
   prevRecs?: KeyRec[],
+  flavorByte?: number,
 ): { queued: boolean; error?: string } {
   try {
-    const op = behaviorSetOps(kk, set, layer, label, prevRecs);
+    const op = behaviorSetOps(kk, set, layer, label, prevRecs, {
+      termHold: tappingTerm,
+      termDouble: tappingTerm,
+      ...(flavorByte != null ? { bodyFlags: flavorByte } : {}),
+    });
     if (!op) {
       if (set.tap == null)
         return { queued: false, error: 'behavior chain: Tap is required first' };

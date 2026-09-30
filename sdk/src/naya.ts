@@ -873,12 +873,41 @@ export function timeoutsPayload(
   sleepMs: number,
   deepMs: number,
 ): Uint8Array {
+  // The device refuses any non-zero timeout below 30 s with status ea
+  // (cross-source measured); 0 = off. Guard host-side so the queue never
+  // carries an op the device will bounce.
+  for (const [name, ms] of [
+    ['idle', idleMs],
+    ['sleep', sleepMs],
+    ['deep', deepMs],
+  ] as const) {
+    if (ms < 0 || (ms > 0 && ms < 30000))
+      throw new Error(
+        `${name} timeout ${ms} ms is below the 30 s device floor (0 = off)`,
+      );
+  }
   const u = new Uint8Array(13);
   const dv = new DataView(u.buffer);
   dv.setUint32(1, idleMs >>> 0, true);
   dv.setUint32(5, sleepMs >>> 0, true);
   dv.setUint32(9, deepMs >>> 0, true);
   return u;
+}
+
+/** Device status/error bytes seen in non-ACK replies (cross-source
+ * measured table; keys are the raw byte values). */
+export const STATUS_BYTES: Record<number, string> = {
+  0x11: 'not implemented',
+  0x16: 'nothing stored',
+  0x18: 'continuation (multipart)',
+  0x19: 'index/record missing',
+  0xea: 'value refused',
+  0xff: 'no data',
+};
+
+/** Human-readable decode of a status byte (falls back to hex). */
+export function describeStatus(b: number): string {
+  return STATUS_BYTES[b] ?? `status 0x${b.toString(16)}`;
 }
 
 export function ledCss(h: number, s: number): string {

@@ -7,7 +7,7 @@ import { toast } from 'sonner';
 import { saveAutoBackup, listAutoBackups } from '@create-reflow/sdk';
 import { opSummary } from '@create-reflow/sdk';
 import type { Draft } from '@create-reflow/sdk';
-import { concat, isWriteAck, sleep, toHex } from '@create-reflow/sdk';
+import { concat, describeStatus, isWriteAck, sleep, toHex } from '@create-reflow/sdk';
 import type { KeyRec, LedRec, NayaSession, Side } from '@create-reflow/sdk';
 import { parseCmdPath } from '@create-reflow/sdk';
 import type { LayerDump } from './useLayers';
@@ -102,17 +102,21 @@ export function useFlash({
         if (o.kind === 'key') {
           const ack = await ses.writeKey(o.record, o.layer);
           if (!isWriteAck(ack, o.layer))
-            throw new Error(`key write NACK: ${toHex(ack)}`);
+            throw new Error(
+              `key write NACK (${describeStatus(ack[0] ?? 0)}): ${toHex(ack)}`,
+            );
         } else if (o.kind === 'led') {
           const ack = await ses.writeLed(o.kk, o.h, o.s, o.layer);
           if (!isWriteAck(ack, o.layer))
-            throw new Error(`led write NACK: ${toHex(ack)}`);
+            throw new Error(
+              `led write NACK (${describeStatus(ack[0] ?? 0)}): ${toHex(ack)}`,
+            );
         } else if (o.kind === 'keyset') {
           for (const rec of o.records) {
             const ack = await ses.writeKey(rec, o.layer);
             if (!isWriteAck(ack, o.layer))
               throw new Error(
-                `keyset write NACK @0x${rec[0].toString(16)}: ${toHex(ack)}`,
+                `keyset write NACK @0x${rec[0].toString(16)} (${describeStatus(ack[0] ?? 0)}): ${toHex(ack)}`,
               );
           }
         } else if (o.kind === 'settings') {
@@ -132,7 +136,9 @@ export function useFlash({
             concat([new Uint8Array([0, o.layer]), o.payload]),
           );
           if (!isWriteAck(f.payload, o.layer))
-            throw new Error(`module write NACK: ${toHex(f.payload)}`);
+            throw new Error(
+              `module write NACK (${describeStatus(f.payload[0] ?? 0)}): ${toHex(f.payload)}`,
+            );
           d.removeAt(d.ops.indexOf(o)); // no GET — ACK is the only verification
         } else {
           throw new Error('unknown op kind');

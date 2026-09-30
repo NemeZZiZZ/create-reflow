@@ -34,6 +34,7 @@ import { useFlash } from "./hooks/useFlash";
 import { useCustomColors } from "./hooks/useCustomColors";
 import { useKbFit } from "./hooks/useKbFit";
 import { queueAction, queueBehaviorSet, queueColor, queueFillLayer, type SelKey } from '@create-reflow/sdk';
+import { FLAVOR_BYTES, flavorById, type FlavorId } from '@create-reflow/sdk';
 import { buildKeymapExport, buildLedmapExport } from '@create-reflow/sdk';
 import { saveJson } from './lib/save';
 import { diffSnapshotToDraft, parseSnapshotFile } from '@create-reflow/sdk';
@@ -88,6 +89,28 @@ export default function App() {
   const [ledMode, setLedMode] = useState(false);
   const [panelColor, setPanelColor] = useState({ h: 180, s: 100 });
   const [tappingTerm, setTappingTerm] = useState(200);
+  // Interrupt Flavor: rides inside every hold-tap record (byte 0-3,
+  // cross-source measured). Written ONLY after an explicit user pick —
+  // before that we preserve whatever the device record carries.
+  const [flavorId, setFlavorId] = useState<FlavorId>(() => {
+    try {
+      const v = window.localStorage.getItem("naya-flavor");
+      if (flavorById(v ?? "")) return v as FlavorId;
+    } catch {
+      /* ignore */
+    }
+    return "hold-preferred";
+  });
+  const flavorDirty = useRef(false);
+  function pickFlavor(id: FlavorId) {
+    flavorDirty.current = true;
+    setFlavorId(id);
+    try {
+      window.localStorage.setItem("naya-flavor", id);
+    } catch {
+      /* ignore */
+    }
+  }
   const [colorDlg, setColorDlg] = useState(false);
   const [dlgColor, setDlgColor] = useState({ h: 180, s: 100 });
   const [flashOpen, setFlashOpen] = useState(false);
@@ -381,11 +404,17 @@ export default function App() {
     label: string,
     prevRecs?: KeyRec[],
   ) {
+    const flavorByte = flavorDirty.current ? FLAVOR_BYTES[flavorId] : undefined;
     const r = queueBehaviorSet(
-      draftRef.current, layer, kk, set, tappingTerm, label, prevRecs,
+      draftRef.current, layer, kk, set, tappingTerm, label, prevRecs, flavorByte,
     );
     bumpDraft();
-    if (r.queued) log("inf", `queued behavior set L${layer} KK ${kk} → ${label}`);
+    if (r.queued)
+      log(
+        "inf",
+        `queued behavior set L${layer} KK ${kk} → ${label}` +
+          (flavorByte != null ? ` (flavor byte ${flavorByte})` : ""),
+      );
     else {
       log("err", `behavior set not queued: ${r.error}`);
       toast.error(r.error ?? "behavior set not queued");
@@ -550,6 +579,8 @@ export default function App() {
 
           {tab === "behavior" && (
             <BehaviorTab
+              flavor={flavorId}
+              onFlavor={pickFlavor}
               tappingTerm={tappingTerm}
               onTappingTerm={setTappingTerm}
               leftOn={leftOn}

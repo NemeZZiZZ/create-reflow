@@ -48,7 +48,7 @@ function pickNotes(
   return Object.keys(out).length ? out : undefined;
 }
 
-function hexToBytes(hex: string): Uint8Array | null {
+export function hexToBytes(hex: string): Uint8Array | null {
   // Our own exports store spaced hex ('toHex' joins with spaces); strip all
   // whitespace first — parseInt silently tolerates stray spaces and turns
   // them into garbage bytes instead of failing.
