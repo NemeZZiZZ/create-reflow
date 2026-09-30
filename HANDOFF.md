@@ -8,8 +8,8 @@ repo. Read top to bottom before touching anything.
 A web-based configurator for the **Naya Create** split keyboard, talking to
 the device directly over **Web Serial** (USB CDC). Extracted 2026-09-30 from
 the research repo `~/Repository/naya-reflow` (which remains the RE lab:
-toolkit, protocol docs, dumps). Two commits of history so far — clean start
-by design; the full engineering history lives in naya-reflow.
+toolkit, protocol docs, dumps). Clean start by design; the full engineering
+history lives in naya-reflow.
 
 - License: MIT. Owner: NemeZZiZZ. Pushes to GitHub only on explicit order
   (initial push done 2026-10-01 by owner's order).
@@ -40,13 +40,59 @@ Client-only libs stayed in `client/src/lib/`: `kb-data.ts`,
 `key-icon-map.ts`, `key-icons.ts` (?raw SVGs, 860 glyphs vendored from
 NayaFlow), `utils.ts` (cn), `save.ts` (saveJson).
 
+## Continuing development — start here
+
+Reading order for a new agent (each item assumes the previous):
+
+1. This file, top to bottom.
+2. `sdk/src/naya.ts` — protocol core (frames, `NayaSession`, multipart reads,
+   `partMatcher`, status decode). ~1000 lines, heavily commented.
+3. `~/Repository/naya-reflow/docs/cdc-protocol.md` — wire ground truth.
+4. `client/src/App.tsx` — composition root; header comment explains the
+   dual-half model. State lives in `client/src/hooks/`, views in
+   `client/src/components/` (tabs in `components/tabs/`).
+5. `client/scripts/smoke.tsx` — the executable spec (below).
+
+### Architecture in one screen
+
+- **Client**: `App.tsx` only wires. State hooks: `useSessions` (Web Serial
+  ports; left half = data plane, right = status-only), `useLayers` (read
+  keymap/LED maps), `useDraft` (pending edits as ops), `useFlash` (apply +
+  readback verify), `useSelection`/`useUrlSync` (`?tab&view&layer&key`,
+  Back closes the selection), `useAuxPolling` (per-half telemetry),
+  `useCustomColors`, `useLog`. `KeyActionMenu` is reused as popover AND
+  panel.
+- **SDK**: pure TS, source-dist — no build output; `pnpm --filter
+  @create-reflow/sdk build` is typecheck-only (`tsc --noEmit`); the client
+  imports it from source via the workspace. Edit model: UI mutation → op in
+  `Draft` (`draft.ts`: sections/dedup/stats) → FlashDialog → `queue.ts`
+  turns ops into wire writes (`30/1004` …) → readback verify. **No
+  `fe/100a` commit is ever sent.** Snapshots: `importers`/`exporters`
+  schema v2; `backups.ts` auto-saves to localStorage; `troubleshooting/` =
+  recipe engine + `assertWireAllowed` guard.
+
+### Adding a feature end-to-end
+
+1. **SDK first**: pure function/type in the owning module (queue logic →
+   `queue.ts`, records → `t10.ts`, settings → `settings.ts` …). New file ⇒
+   export it from `src/index.ts`.
+2. **Client**: logic in a hook, markup in a component; keep `App.tsx`
+   wiring-only. UI copy in English; footgun hints over modals.
+3. **Smoke**: append a numbered section (`// §N name`, next free N) to
+   `client/scripts/smoke.tsx`; helpers are block-scoped inside their
+   §-block. Wire-format features get byte-exact asserts — most commands
+   already have live-proven vectors, extend them rather than forking.
+4. **Gate + commit**: all commands below green, stage explicit paths,
+   local commit (push only on owner's order).
+
 ## Commands / gates (run from `client/`)
 
 ```sh
 pnpm build                                                  # tsc -b && vite build
 ./node_modules/.bin/rolldown --config scripts/rolldown.smoke.mjs   # MUST exit 0
-node /tmp/smoke.cjs                                         # 426/426 ok, 0 FAIL
-./node_modules/.bin/oxlint <touched files>
+node /tmp/smoke.cjs                                         # 426 ok / 0 FAIL today; grows with §-sections — trust 0 FAIL
+./node_modules/.bin/oxlint <touched client files>           # client files (from client/)
+pnpm --filter @create-reflow/sdk lint                       # sdk files (oxlint src, in-package — avoids the .. rule)
 pnpm --filter @create-reflow/sdk build                      # tsc --noEmit
 ```
 
@@ -67,7 +113,11 @@ exit codes (`cmd | tail; echo $?` shows tail's) — redirect to a file instead.
   `ee/10ae`, `clear_bonds`, `mcuboot_reset`. Safe reset: `ee/10ce`.
   `30/10ca` (factory format) only by explicit owner decision — it also wipes
   the layer-list store (hold-to-layer dies until a stock NayaFlow flash).
-  The SDK's `assertWireAllowed` already blocks these at runtime.
+  Runtime enforcement: `assertWireAllowed` (`sdk/src/troubleshooting/
+  wire-guard.ts`) throws on ANY `fa/*` verb, `ee/10be`/`ee/10ae`, and
+  `30/10ca`; it wraps the troubleshooting recipes' `ctx.send` chokepoint
+  (App.tsx). Regular flash traffic bypasses it — safe by construction,
+  since `NayaSession` implements only whitelisted verbs.
 - Keymap write form: `30/1004` params `[00, layer] + record`. Records
   `[KK, T, LEN, payload]`. Shadow slot = KK+0x52, filler `[KK,07,00]` (NONE;
   legacy `00 00` also reconciles). Hold-tap records carry term (u16 LE,
@@ -75,8 +125,13 @@ exit codes (`cmd | tail; echo $?` shows tail's) — redirect to a file instead.
   2=tap-preferred, 3=tap-unless-interrupted — cross-source measured,
   NayaFlow's "Balanced" writes 00), and unknown flag bytes —
   `behaviorMetaOf` preserves them; NEVER zero them.
-- Timeouts `fe/100a`: 3×u32 LE ms; 0 = off; 0<v<30000 refused by device
-  (SDK throws early). Animation `ed/1011 [layer, effect]`.
+- Timeouts `fe/100a` = SET ACTIVITY TIMEOUTS: params 13B = status `00` +
+  3×u32 LE ms; 0 = off; 0<v<30000 refused by device (SDK throws early).
+  Sending fresh values is the stock, proven path. The "**no `fe/100a`
+  commit**" rule means: keymap writes apply instantly and persist — there
+  is no legitimate commit verb, and REPLAYING captured `fe/100a` bytes
+  commit-style wedges the state machine (`naya.ts` setTimeouts note).
+  Animation `ed/1011 [layer, effect]`.
 
 ## Device & live-testing rules
 
@@ -89,7 +144,9 @@ exit codes (`cmd | tail; echo $?` shows tail's) — redirect to a file instead.
   port). The agent must NOT start its own vite. Web Serial grants are
   origin+port-scoped: the first open on a new origin needs a one-time manual
   port pick by the owner (the agent cannot click the browser picker).
-- Right half never answers `30/1001`; left port proxies dst 0x51.
+- Right half never answers `30/1001` — it holds no keymap data to read
+  back (the LEFT half owns all keymap/LED maps); the left port proxies
+  dst 0x51 for right-half status/telemetry.
 
 ## Process rules
 
