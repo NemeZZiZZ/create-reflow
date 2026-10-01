@@ -2,6 +2,8 @@
 
 Open-source web configurator for the [Naya Create](https://github.com/create-collective) split keyboard — a community successor to NayaFlow, talking to the keyboard directly over USB CDC (Web Serial), no host bridge required.
 
+**Live: https://nemezzizz.github.io/create-reflow/** (GitHub Pages, auto-deployed from `main` by `.github/workflows/pages.yml`).
+
 Monorepo (pnpm workspace):
 
 - **`sdk/`** — `@create-reflow/sdk`: pure TypeScript protocol + state core. Wire protocol (CDC frames, keymap T-records, LED map, settings, modules), draft/queue model, snapshot import/export with schema migrations, auto-backup store, troubleshooting recipe engine with a runtime wire-guard. No React, no DOM — runs in browser and Node.
