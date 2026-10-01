@@ -1,7 +1,8 @@
 /* Runtime never-send guard for troubleshooting wire traffic.
  * Mirrors the AGENTS.md danger list: fa/* (format/erase), ee/10be + ee/10ae
  * (DFU/MCUBoot resets), 30/10ca (factory format — wipes the layer-list
- * store; stays a text-only recipe, never a button). */
+ * store; stays a text-only recipe, never a button), be/1004 (UNPAIR ALL —
+ * drops every Bluetooth bond including computers; text-only repair). */
 
 const hex = (n: number) => n.toString(16).padStart(2, "0");
 
@@ -18,5 +19,9 @@ export function assertWireAllowed(t: number, c0: number, c1: number): void {
   if (t === 0x30 && c1 === 0xca)
     throw new Error(
       `refused ${path}: factory format wipes the layer-list store — text-only recipe, never a button`,
+    );
+  if (t === 0xbe && c1 === 0x04)
+    throw new Error(
+      `refused ${path}: UNPAIR ALL drops every bond (computers included) — text-only repair, never a button`,
     );
 }

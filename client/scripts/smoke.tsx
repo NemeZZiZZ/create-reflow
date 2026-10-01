@@ -1178,7 +1178,7 @@ import { queueAction } from '@create-reflow/sdk';
       return true;
     }
   };
-  eq(TROUBLES.length >= 10, true, '30 at least 10 entries');
+  eq(TROUBLES.length >= 20, true, '30 at least 20 entries');
   eq(
     new Set(TROUBLES.map((t) => t.id)).size === TROUBLES.length,
     true,
@@ -1244,6 +1244,29 @@ import { queueAction } from '@create-reflow/sdk';
   eq(throws(() => assertWireAllowed(0xee, 0x10, 0xce)), false, '30 guard allows ee/10ce');
   eq(throws(() => assertWireAllowed(0xfe, 0x10, 0x0a)), false, '30 guard allows fe/100a');
   eq(throws(() => assertWireAllowed(0x30, 0x10, 0x04)), false, '30 guard allows 30/1004');
+  // KB update 2026-10: right-half undark is a single ceiling write (the
+  // 9-step ff-ladder parked the right render once, 2026-09-22)
+  const undarkRight = dark?.actions?.find((a) => a.side === 'right');
+  eq(undarkRight?.steps?.length, 1, '30 dark-half RIGHT = 1 ceiling step');
+  eq(
+    undarkRight?.steps?.[0]
+      ? `${undarkRight.steps[0].t.toString(16)}/${undarkRight.steps[0].c0.toString(16)}${undarkRight.steps[0].c1.toString(16)} ${JSON.stringify(undarkRight.steps[0].params)}`
+      : '',
+    'ed/1013 [255,100]',
+    '30 dark-half RIGHT step = ed/1013 [0xff,100]',
+  );
+  eq(!!undarkRight?.confirm, true, '30 dark-half RIGHT confirmed');
+  // R5 echo-back: lights-wrong entry carries a scripted left-side action
+  const lwf = TROUBLES.find((t) => t.id === 'lights-wrong-after-flash');
+  const lwfAct = lwf?.actions?.[0];
+  eq(
+    !!lwfAct && lwfAct.side === 'left' && !lwfAct.steps && !!lwfAct.run && !!lwfAct.confirm,
+    true,
+    '30 lights-wrong: left scripted action, confirmed',
+  );
+  // guard: UNPAIR ALL banned, layer-list rewrite allowed
+  eq(throws(() => assertWireAllowed(0xbe, 0x10, 0x04)), true, '30 guard blocks be/1004');
+  eq(throws(() => assertWireAllowed(0x30, 0x10, 0x02)), false, '30 guard allows 30/1002');
 }
 
 // §31 palette physical rows + custom HID escape hatch (UHK #7)

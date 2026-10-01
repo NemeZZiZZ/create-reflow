@@ -8,6 +8,7 @@ export default {
     "Keys still type and commands still ACK, but there is no backlight. Known firmware wedge.",
   details: [
     "The LED state wedges in the LittleFS data partition: ED writes parse-ACK without applying, and the wedge survives reflashes.",
+    "How the wedge forms: there is no ED READ verb — an empty or short ED payload is a zero-fill WRITE. One botched settings write zeroes the LED state.",
     "Modules can stay lit — they run their own LED channel.",
     "Ultimate cure is the 30/10ca factory format — but it also wipes the layer-list store (hold-to-layer dies), which is why it is NOT a button here.",
   ],
@@ -25,11 +26,20 @@ export default {
       steps: undarkSteps,
     },
     {
-      label: "Run undark on RIGHT",
+      label: "Ceiling write on RIGHT",
       side: "right",
       confirm:
-        "Send the undark ladder to the RIGHT half? Caution: a right-side ff-ladder parked the right render dark once (2026-09-22) — if it goes dark, use a true cold boot.",
-      steps: undarkSteps,
+        "Send a single max-brightness ceiling write (ed/1013 = 100) to the RIGHT half? Measured safe. The full 9-step ff-ladder is NOT repeated here — a right-side ladder parked the right render dark once (2026-09-22); if a half stays dark, use a true cold boot.",
+      steps: [
+        {
+          t: 0xed,
+          c0: 0x10,
+          c1: 0x13,
+          params: [0xff, 100],
+          tolerateNoReply: true,
+          note: "MAXBRT=100 (1013)",
+        },
+      ],
     },
   ],
 } satisfies TroubleEntry;
