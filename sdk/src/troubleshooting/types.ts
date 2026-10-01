@@ -29,6 +29,13 @@ export interface TroubleCtx {
   dump(): Promise<void>;
   refreshAux(): Promise<void>;
   reboot(): Promise<void>;
+  /**
+   * Read the layer list (30/1001 handshake) on the LEFT half and echo the
+   * same entries back via 30/1002. Restores wedged runtime lighting on both
+   * halves without changing anything stored (measured, 2026-09). Validates
+   * the reply shape and refuses odd replies instead of writing garbage.
+   */
+  rewriteLayerList(): Promise<void>;
 }
 
 export interface TroubleAction {

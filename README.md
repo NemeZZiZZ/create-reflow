@@ -17,7 +17,7 @@ pnpm dev        # client dev server
 pnpm build      # typecheck sdk + build client
 ```
 
-Smoke tests (426 asserts, no hardware needed):
+Smoke tests (no hardware needed; the gate is 0 FAIL — the assert count grows with each new §-section):
 
 ```sh
 cd client

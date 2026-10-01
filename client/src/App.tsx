@@ -290,6 +290,37 @@ export default function App() {
         toast.info("Safe reboot sent — reconnects in ~30 s");
         log("cdc", "trouble: ee/10ce safe reboot sent");
       },
+      // R5 echo-back: read the layer list, echo the same entries back.
+      // Restores wedged runtime lighting on both halves (measured 2026-09,
+      // third-party); changes nothing stored. Shape-validated: an odd reply
+      // aborts instead of echoing garbage into 30/1002.
+      rewriteLayerList: async () => {
+        const left = sesRef.current.get("left");
+        if (!left) throw new Error("Connect the LEFT half first");
+        const f = await left.handshake();
+        const p = f.payload;
+        if (
+          p.length < 20 ||
+          p[2] !== 0x00 ||
+          p[3] !== 0x10 ||
+          (p.length - 4) % 16 !== 0
+        )
+          throw new Error(
+            `layer-list reply has an unexpected shape (${p.length} B) — refusing to echo it back`,
+          );
+        assertWireAllowed(0x30, 0x10, 0x02);
+        await left.cmd(
+          0x30,
+          0x10,
+          0x02,
+          Uint8Array.from([0, 0, ...p.slice(4)]),
+        );
+        const n = (p.length - 4) / 16;
+        log(
+          "inf",
+          `trouble: layer list rewritten (${n} entr${n === 1 ? "y" : "ies"} echoed back unchanged)`,
+        );
+      },
     };
     try {
       if (a.steps) {
