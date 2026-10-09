@@ -14,4 +14,5 @@ export * from './importers';
 export * from './exporters';
 export * from './backups';
 export * from './troubleshooting';
+export * from './host-table';
 export * from './utils';

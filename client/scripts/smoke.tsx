@@ -34,6 +34,7 @@ import { customHidAction, groupKeyboardCategory, parseCustomHid } from '@create-
 import { buildKeymapExport, buildLedmapExport } from '@create-reflow/sdk';
 import { migrateSnapshot } from '@create-reflow/sdk';
 import { SNAPSHOT_VERSION } from '@create-reflow/sdk';
+import { nameToUsage, usageToName, HOST_TABLE_SIZE } from '@create-reflow/sdk';
 
 let n = 0;
 function eq(a: unknown, b: unknown, name: string) {
@@ -1299,6 +1300,24 @@ import { queueAction } from '@create-reflow/sdk';
     ACTIONS.find((a) => a.label === 'Caps Lock')!.body().join(),
     '31 custom 0x39 == Caps Lock bytes',
   );
+}
+
+// §47 OpenFlow core: host table (vendored from naya-reflow research)
+{
+  eq(HOST_TABLE_SIZE >= 282, true, '47 table size');
+  eq(
+    nameToUsage('A')?.page === 0x0007 && nameToUsage('A')?.usage === 0x04,
+    true,
+    '47 A',
+  );
+  eq(
+    nameToUsage('SYS_PWR')?.usage === 0x81 && nameToUsage('SYSTEM_POWER')?.page === 0x0001,
+    true,
+    '47 alias',
+  );
+  eq(usageToName(0x0007, 0x04), 'A', '47 reverse A');
+  eq(nameToUsage('NO_SUCH_KEY'), null, '47 unknown null');
+  eq(usageToName(0x0007, 0xff), null, '47 reverse unknown null');
 }
 
 void main();
