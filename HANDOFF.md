@@ -160,6 +160,14 @@ exit codes (`cmd | tail; echo $?` shows tail's) — redirect to a file instead.
 
 ## ROADMAP (owner-set priorities, 2026-10-01)
 
+> 2026-10-10: полный инвентарь механик, которых нет у нас, но есть у
+> OpenFlow v0.7.0 (конкурент/community-приёмник NayaFlow) —
+> `docs/research/2026-10-10-openflow-gap-analysis.md` (локальный клон
+> `~/Repository/openflow`). Важное из него: Naya B.V. закрылась,
+> NayaFlow не поддерживается; прошивка ACK-ает и выбрасывает запись
+> макросов (макросы — только host-side, навсегда); их схемы
+> `.openflow-profile.json` — ground truth для пункта 1.
+
 1. **Native OpenFlow JSON format** (owner decision: "лучше просто
    использовать этот формат изначально" — adopt it as the native
    save/import/export format instead of our own snapshot schema).
