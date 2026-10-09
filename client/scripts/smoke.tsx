@@ -35,6 +35,7 @@ import { buildKeymapExport, buildLedmapExport } from '@create-reflow/sdk';
 import { migrateSnapshot } from '@create-reflow/sdk';
 import { SNAPSHOT_VERSION } from '@create-reflow/sdk';
 import { nameToUsage, usageToName, HOST_TABLE_SIZE } from '@create-reflow/sdk';
+import { parseOpenFlowLayer, OF_LAYER_UUIDS, buildOpenFlowLayer } from '@create-reflow/sdk';
 
 let n = 0;
 function eq(a: unknown, b: unknown, name: string) {
@@ -603,7 +604,7 @@ import {
   t03Record, t10Primary, t10ShadowMini, t10ShadowFull,
   behaviorSetOf, behaviorSetOps, withSlot, hidPairOf,
   plainRecord, hasT10Shadow, cascadeClear,
-  behaviorMetaOf, fillerRecord,
+  behaviorMetaOf, fillerRecord, TAIL_T10,
 } from '@create-reflow/sdk';
 import type { BehaviorSet } from '@create-reflow/sdk';
 import {
@@ -1318,6 +1319,290 @@ import { queueAction } from '@create-reflow/sdk';
   eq(usageToName(0x0007, 0x04), 'A', '47 reverse A');
   eq(nameToUsage('NO_SUCH_KEY'), null, '47 unknown null');
   eq(usageToName(0x0007, 0xff), null, '47 reverse unknown null');
+}
+
+// §48 OpenFlow import: parse layer doc
+{
+  const OF_TEST_UUID1 = '6e726600-0000-4000-8000-0000000000a1';
+  const OF_TEST_UUID2 = '6e726600-0000-4000-8000-0000000000b2';
+  const OF_TEST_UUID3 = '6e726600-0000-4000-8000-0000000000c3'; // absent from layerRefs
+  const bind = (behavior: string, actionType: string, actionCode: string) => ({
+    behavior,
+    actionType,
+    actionCode,
+    context: null,
+  });
+  const doc = {
+    version: 1,
+    kind: 'layer',
+    layer: {
+      srcId: OF_TEST_UUID1,
+      name: 'Layer 1',
+      orderId: 1,
+      iconId: null,
+      animationId: 'breathe',
+      keys: [
+        { positionId: 0, colorHex: null, bindings: [bind('press', 'key', 'A')] },
+        { positionId: 7, colorHex: null, bindings: [bind('press', 'key', 'A'), bind('hold', 'key', 'B')] },
+        { positionId: 9, colorHex: null, bindings: [bind('tap', 'key', 'C'), bind('hold', 'key', 'D'), bind('double_tap', 'key', 'E')] },
+        { positionId: 12, colorHex: null, bindings: [bind('tap', 'key', 'C'), bind('hold', 'key', 'D'), bind('double_tap', 'key', 'E'), bind('tap_hold', 'key', 'F')] },
+        { positionId: 20, colorHex: null, bindings: [bind('press', 'key', 'G'), bind('double_tap', 'key', 'H')] },
+        { positionId: 25, colorHex: null, bindings: [bind('press', 'layer_polite_hold', 'MO_LAYER_' + OF_TEST_UUID1)] },
+        { positionId: 30, colorHex: null, bindings: [bind('press', 'layer_polite_hold', 'TOGGLE_LAYER_' + OF_TEST_UUID1)] },
+        { positionId: 31, colorHex: null, bindings: [bind('press', 'layer_polite_hold', 'MO_LAYER_' + OF_TEST_UUID3)] },
+        { positionId: 35, colorHex: null, bindings: [bind('press', 'key', 'NO_SUCH_KEY')] },
+        { positionId: 40, colorHex: null, bindings: [bind('press', 'key', 'A'), bind('tap', 'key', 'C')] },
+        { positionId: 97, colorHex: null, bindings: [bind('press', 'key', 'A')] },
+        { positionId: 2, colorHex: null, bindings: [bind('press', 'key', 'A')] },
+        { positionId: 2, colorHex: null, bindings: [bind('press', 'key', 'B')] },
+        { positionId: 74, colorHex: '#ff0000', bindings: [] },
+        { positionId: 88, colorHex: '#xxxxxx', bindings: [] },
+        { positionId: 1, colorHex: '#3366ff', bindings: [] },
+      ],
+    },
+    macros: [{ any: 1 }],
+    layerRefs: { [OF_TEST_UUID1]: 1, [OF_TEST_UUID2]: 2 },
+  };
+  eq(
+    OF_LAYER_UUIDS.join(','),
+    '6e726600-0000-4000-8000-000000000000,6e726600-0000-4000-8000-000000000001,6e726600-0000-4000-8000-000000000002',
+    '48 layer uuids deterministic',
+  );
+  const r = parseOpenFlowLayer(doc);
+  eq('error' in r ? 'err' : 'ok', 'ok', '48 layer doc parses');
+  if (!('error' in r)) {
+    const k1 = r.maps.keys[1];
+    const at = (kk: number) => k1.find((x) => x.kk === kk);
+    eq(r.maps.layers.join(','), '1', '48 doc layer is 1');
+    eq(r.maps.notes, undefined, '48 parser never sets notes');
+    eq(toHex(at(0)!.rec), '00 01 04 04 00 07 00', '48 press → T01');
+    eq(at(0)!.t, 1, '48 KeyRec.t = record type byte');
+    eq(
+      toHex(at(7)!.rec),
+      '07 03 15 01 01 00 c8 00 05 00 07 00 00 00 00 00 04 00 07 00 00 00 00 00',
+      '48 press+hold → T03',
+    );
+    eq(
+      toHex(at(9)!.rec),
+      '09 10 18 c8 00 03 01 01 00 c8 00 07 00 07 00 00 00 00 00 06 00 07 00 00 00 00 00',
+      '48 tap/hold/double → T10 primary',
+    );
+    eq(toHex(at(0x5b)!.rec), '5b 10 07 c8 00 01 08 00 07 00', '48 shadow mini at kk+0x52');
+    eq(
+      toHex(at(12)!.rec),
+      '0c 10 18 c8 00 03 01 01 00 c8 00 07 00 07 00 00 00 00 00 06 00 07 00 00 00 00 00',
+      '48 four-slot → T10 primary',
+    );
+    eq(
+      toHex(at(0x5e)!.rec),
+      '5e 10 18 c8 00 03 01 01 00 c8 00 09 00 07 00 00 00 00 00 08 00 07 00 00 00 00 00',
+      '48 shadow full at kk+0x52',
+    );
+    eq(at(0x4b) !== undefined ? toHex(at(0x4b)!.rec) : 'missing', '4b 02 00', '48 T10 tail record');
+    eq(toHex(at(20)!.rec), '14 01 04 0a 00 07 00', '48 clamp keeps press, drops double');
+    eq(toHex(at(25)!.rec), '19 05 04 01 00 00 00', '48 MO_LAYER_ → T05 order 1');
+    eq(at(30), undefined, '48 TOGGLE_LAYER_ skipped');
+    eq(at(31), undefined, '48 unlisted layer ref skipped');
+    eq(at(35), undefined, '48 unknown actionCode skipped');
+    eq(toHex(at(40)!.rec), '28 01 04 06 00 07 00', '48 tap set wins over press');
+    eq(at(97), undefined, '48 positionId 97 skipped');
+    eq(toHex(at(2)!.rec), '02 01 04 05 00 07 00', '48 duplicate positionId last wins');
+    const led1 = r.maps.leds[1].find((x) => x.kk === 1);
+    const wantHs = hexToHs('#3366ff')!;
+    eq(led1 !== undefined && led1.h === wantHs.h && led1.s === wantHs.s, true, '48 colorHex → led h/s');
+    eq(r.maps.leds[1].length, 1, '48 strips/bays produce no led records');
+    eq(r.anim, 1, '48 animationId breathe → anim 1');
+    const w = r.warnings.join('\n');
+    eq(/Double Tap dropped/.test(w), true, '48 clamp warning');
+    eq(/press dropped/.test(w), true, '48 press-vs-tap warning');
+    eq(/TOGGLE_LAYER_/.test(w), true, '48 TOGGLE warning names the prefix');
+    eq(/not in layerRefs/.test(w), true, '48 unlisted ref warning');
+    eq(/NO_SUCH_KEY/.test(w), true, '48 unknown actionCode warning');
+    eq(/out of range/.test(w), true, '48 positionId range warning');
+    eq(/duplicated/.test(w), true, '48 duplicate positionId warning');
+    eq(/skipped 1 LED strip/.test(w), true, '48 strip count warning');
+    eq(/skipped 1 module bay/.test(w), true, '48 bay count warning');
+    eq(/1 macro/.test(w), true, '48 macros count warning');
+  }
+  const rNull = parseOpenFlowLayer({ ...doc, layer: { ...doc.layer, animationId: null } });
+  eq(!('error' in rNull) && rNull.anim === null, true, '48 null animationId → anim null');
+  const eV2 = parseOpenFlowLayer({ ...doc, version: 2 });
+  eq('error' in eV2 && /version 2 is newer/.test(eV2.error), true, '48 version 2 rejected as newer');
+  const eV3 = parseOpenFlowLayer({ ...doc, version: 3 });
+  eq('error' in eV3 && /version 3 is newer/.test(eV3.error), true, '48 version 3 rejected as newer');
+  const eKind = parseOpenFlowLayer({ ...doc, kind: 'profile' });
+  eq('error' in eKind && /unsupported kind/.test(eKind.error), true, '48 kind profile rejected');
+  const eOrder = parseOpenFlowLayer({ ...doc, layer: { ...doc.layer, orderId: 3 } });
+  eq('error' in eOrder && /orderId/.test(eOrder.error), true, '48 orderId 3 rejected');
+  const eKeys = parseOpenFlowLayer({ version: 1, kind: 'layer', layer: { orderId: 1 } });
+  eq('error' in eKeys && /keys/.test(eKeys.error), true, '48 missing keys rejected');
+}
+
+// §49 OpenFlow export + roundtrip
+{
+  /* eslint-disable @typescript-eslint/no-explicit-any */
+  const recs: KeyRec[] = [];
+  const push = (kk: number, rec: Uint8Array) =>
+    recs.push({ kk, t: rec[1], rec, offset: recs.length });
+  push(0, plainRecord(0, 0x04)); // T01 A
+  push(7, t03Record(7, 0x05, 0x04)); // T03 hold B / tap A
+  push(9, t10Primary(9, 0x07, 0x06)); // T10 hold D / tap C
+  push(0x5b, t10ShadowMini(9, 0x08)); // double E
+  push(0x4b, new Uint8Array(TAIL_T10));
+  push(12, t10Primary(12, 0x07, 0x06)); // T10 hold D / tap C
+  push(0x5e, t10ShadowFull(12, 0x09, 0x08)); // taphold F / double E
+  push(25, buildRecord(25, findAction('special:1')!.body())); // MO layer
+  push(30, buildRecord(30, findAction('bt:1')!.body())); // BT family → dropped
+  push(40, plainRecord(40, 0xe1)); // modifier (Left Shift)
+  const leds49: LedRec[] = [{ kk: 1, h: 30, s: 100, offset: 0 }];
+
+  const r = buildOpenFlowLayer(recs, leds49, 1, 'swirl');
+  eq(r.fileName, 'Layer_1.openflow-layer.json', '49 fileName');
+  const doc = r.data as any;
+  const keys49 = doc.layer.keys as any[];
+  eq(doc.version === 1 && doc.kind === 'layer', true, '49 version/kind');
+  eq(
+    doc.layer.srcId === OF_LAYER_UUIDS[1] &&
+      doc.layer.name === 'Layer 1' &&
+      doc.layer.orderId === 1 &&
+      doc.layer.iconId === null,
+    true,
+    '49 layer header',
+  );
+  eq(doc.layer.animationId, 'swirl', '49 animationId passthrough');
+  eq(keys49.length, 97, '49 97 key entries');
+  eq(
+    keys49.every((k: any, i: number) => k.positionId === i),
+    true,
+    '49 entries ordered by positionId',
+  );
+  eq(
+    JSON.stringify(doc.layerRefs),
+    JSON.stringify({ [OF_LAYER_UUIDS[1]]: 1, [OF_LAYER_UUIDS[2]]: 2 }),
+    '49 layerRefs deterministic',
+  );
+  eq(Array.isArray(doc.macros) && doc.macros.length === 0, true, '49 macros empty');
+  const jb = (k: any) => JSON.stringify(k.bindings);
+  eq(
+    jb(keys49[0]),
+    JSON.stringify([{ behavior: 'press', actionType: 'key', actionCode: 'A', context: null }]),
+    '49 T01 → press key',
+  );
+  eq(
+    jb(keys49[7]),
+    JSON.stringify([
+      { behavior: 'press', actionType: 'key', actionCode: 'A', context: null },
+      { behavior: 'hold', actionType: 'key', actionCode: 'B', context: null },
+    ]),
+    '49 T03 → press+hold',
+  );
+  eq(
+    jb(keys49[9]),
+    JSON.stringify([
+      { behavior: 'tap', actionType: 'key', actionCode: 'C', context: null },
+      { behavior: 'hold', actionType: 'key', actionCode: 'D', context: null },
+      { behavior: 'double_tap', actionType: 'key', actionCode: 'E', context: null },
+    ]),
+    '49 T10 mini → tap/hold/double_tap',
+  );
+  eq(
+    jb(keys49[12]),
+    JSON.stringify([
+      { behavior: 'tap', actionType: 'key', actionCode: 'C', context: null },
+      { behavior: 'hold', actionType: 'key', actionCode: 'D', context: null },
+      { behavior: 'double_tap', actionType: 'key', actionCode: 'E', context: null },
+      { behavior: 'tap_hold', actionType: 'key', actionCode: 'F', context: null },
+    ]),
+    '49 T10 full → all four slots',
+  );
+  eq(
+    jb(keys49[40]),
+    JSON.stringify([
+      {
+        behavior: 'press',
+        actionType: 'modifier',
+        actionCode: usageToName(0x0007, 0xe1),
+        context: null,
+      },
+    ]),
+    '49 usage 0xe1 → modifier',
+  );
+  eq(
+    jb(keys49[25]),
+    JSON.stringify([
+      {
+        behavior: 'press',
+        actionType: 'layer_polite_hold',
+        actionCode: 'MO_LAYER_' + OF_LAYER_UUIDS[1],
+        context: null,
+      },
+    ]),
+    '49 special ORDER 1 → MO ref',
+  );
+  eq(jb(keys49[30]), '[]', '49 BT record → empty bindings');
+  eq(
+    'colorHex' in keys49[74] === false && keys49[74].bindings.length === 0,
+    true,
+    '49 strip 74: no colorHex, empty bindings',
+  );
+  eq(
+    'colorHex' in keys49[88] === false && keys49[88].bindings.length === 0,
+    true,
+    '49 bay 88: no colorHex, empty bindings',
+  );
+  eq('colorHex' in keys49[96] === false, true, '49 bay 96: no colorHex');
+  eq(keys49[1].colorHex, hsToHex(30, 100), '49 led → colorHex');
+  eq('colorHex' in keys49[0], false, '49 no led → no colorHex field');
+  eq(r.counts.keys, 6, '49 counts.keys');
+  eq(r.counts.leds, 1, '49 counts.leds');
+  eq(r.counts.unknown, 1, '49 counts.unknown (BT dropped)');
+  const rNullAnim = buildOpenFlowLayer(recs, leds49, 1, null);
+  eq(
+    (rNullAnim.data as any).layer.animationId,
+    'solid',
+    '49 null animId → solid',
+  );
+  eq(
+    JSON.stringify(buildOpenFlowLayer(recs, leds49, 1, 'swirl').data),
+    JSON.stringify(r.data),
+    '49 deterministic: two builds deep-equal',
+  );
+  const rEmpty = buildOpenFlowLayer([], [], 2, null);
+  eq(
+    (rEmpty.data as any).layer.keys.length === 97 &&
+      (rEmpty.data as any).layer.orderId === 2,
+    true,
+    '49 empty caches → valid 97-key doc',
+  );
+  eq(
+    rEmpty.counts.keys === 0 && rEmpty.counts.leds === 0 && rEmpty.counts.unknown === 0,
+    true,
+    '49 empty caches → zero counts',
+  );
+  // Roundtrip: export → parse → byte-equal records (BT record unrepresentable).
+  const p = parseOpenFlowLayer(JSON.parse(JSON.stringify(r.data)));
+  eq('error' in p ? 'err' : 'ok', 'ok', '49 export re-parses');
+  if (!('error' in p)) {
+    const k1 = p.maps.keys[1];
+    const at = (kk: number) => k1.find((x) => x.kk === kk);
+    eq(
+      recs
+        .filter((x) => x.kk !== 30)
+        .every((x) => {
+          const got = at(x.kk);
+          return got !== undefined && toHex(got.rec) === toHex(x.rec);
+        }),
+      true,
+      '49 roundtrip record bytes equal',
+    );
+    eq(at(30), undefined, '49 roundtrip drops BT record');
+    const led1 = p.maps.leds[1].find((x) => x.kk === 1);
+    eq(led1 !== undefined && led1.h === 30 && led1.s === 100, true, '49 roundtrip led h/s');
+    eq(p.anim, 2, '49 roundtrip anim swirl → 2');
+  }
+  const pNull = parseOpenFlowLayer(JSON.parse(JSON.stringify(rNullAnim.data)));
+  eq(!('error' in pNull) && pNull.anim === 0, true, '49 null anim → solid → anim 0');
+  /* eslint-enable @typescript-eslint/no-explicit-any */
 }
 
 void main();
