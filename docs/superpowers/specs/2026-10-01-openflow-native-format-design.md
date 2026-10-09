@@ -1,7 +1,9 @@
 # OpenFlow JSON as the native format — design
 
-Date: 2026-10-01
-Status: awaiting owner review
+Date: 2026-10-01 (verified against OpenFlow v0.7.0 source 2026-10-10)
+Status: awaiting owner review (cross-checked against
+`~/Repository/openflow` backend — 3 corrections folded in, one former
+loss eliminated)
 Source spec: HANDOFF.md ROADMAP item 1 + owner decisions 2026-10-01.
 
 ## 0. Owner decisions (settled in chat)
@@ -43,8 +45,16 @@ Source spec: HANDOFF.md ROADMAP item 1 + owner decisions 2026-10-01.
 ```
 
 - positionId 0–73 = keys (KK 1:1); 74–87 = LED strips; 88–96 = module bays.
-- Behaviors observed in the wild: `press`, `hold`, `tap`, `double_tap`.
-  Our T10 4th slot (`taphold`) has no observed OpenFlow counterpart — see §3.
+- Behavior vocabulary (confirmed against OpenFlow v0.7.0 source 2026-10-10,
+  `backend/…/actions_catalog.py:48` + `keymap_read.py:263`
+  `SECOND_BANK_BEHAVIOR = {"press": "double_tap", "hold": "tap_hold"}`):
+  `press`, `tap`, `hold`, `double_tap`, `tap_hold`.
+  **Our T10 4th slot (`taphold`) DOES have an OpenFlow counterpart: `tap_hold`**
+  — the 2026-10-01 sample simply contained none.
+- Layer-switch actionCode prefixes seen in their source (`profiles.py:21`):
+  `MO_LAYER_`, `TO_LAYER_`, `TOGGLE_LAYER_`, `STICKY_LAYER_` (+ uuid).
+  `layerRefs` values are the target layer's `orderId` (= device layer index) —
+  exactly our T05 ORDER semantics (`profiles.py:322-340`).
 
 ## 2. Import: OpenFlow → draft ops
 
@@ -64,12 +74,21 @@ Module `sdk/src/openflow.ts` (new; exported from the barrel):
     op builders:
     - single `press` → T01 (`plainRecord`)
     - `press`+`hold` → T03
-    - `tap`+`hold`… → T10 set (shadow mini/full as today)
+    - `tap`+`hold`… → T10 set (shadow mini/full as today);
+      `double_tap` → double slot, `tap_hold` → taphold slot (T10 full
+      shadow — direct counterpart, no loss)
     - `press`+`double_tap` without `hold` → **clamp**: keep press, drop
       double_tap, `warnings.push('key N: Double Tap dropped — device
       requires Hold first')`
-    - unknown `actionType`/`actionCode` → key skipped + warning (never a
-      hard error: partial restore is the point of subset imports).
+    - `TO_LAYER_`/`TOGGLE_LAYER_`/`STICKY_LAYER_` prefixes and any other
+      unknown `actionType`/`actionCode` → key skipped + specific warning
+      (never a hard error: partial restore is the point of subset imports).
+      TO/TOGGLE/STICKY wire forms are not in our verified protocol
+      knowledge (special family ORDER 1=MO, 2=hold-layer2 only).
+    - `animationId: null` tolerated → no anim op (DB column is nullable
+      in OpenFlow, `profiles.py:_new_layer`).
+    - non-empty `macros[]` → skipped with count (macros are host-side
+      only in every app: firmware ACKs and discards 30/1005/1006).
 - Action dictionary: vendored from
   `~/Repository/naya-reflow/research/keymap-host-table.txt` (282 names,
   `NAME = 0xPPPPUUUU`). New `sdk/src/host-table.ts`: `nameToUsage` +
@@ -94,9 +113,8 @@ Module `sdk/src/openflow.ts` (new; exported from the barrel):
   - T01 usage → `[{behavior:'press', actionType, actionCode}]`
   - usage 0xe0–0xe7 → `actionType 'modifier'`, name from `usageToName`
   - T03 → `press`+`hold`; T10 → `tap`+`hold`(+`double_tap`); T10 full
-    shadow (`taphold` set) → emit `tap`+`hold`+`double_tap` and **drop
-    `taphold` with a count in `counts`** (no OpenFlow counterpart
-    observed; documented loss, symmetric with import clamping).
+    shadow (`taphold` set) → emit `tap`+`hold`+`double_tap`+`tap_hold`
+    (verified counterpart, no loss — see §1).
   - T05 ORDER n → `press layer_polite_hold MO_LAYER_<uuid-n>`.
   - Records that decode to no catalog action → key emitted with empty
     `bindings: []` + count (never guessed).
@@ -141,10 +159,12 @@ Module `sdk/src/openflow.ts` (new; exported from the barrel):
 ## 5. Testing (smoke, node-runnable)
 
 - New §-sections: fixture (inline, reduced: all binding shapes incl. the
-  `press`+`double_tap` conflict and `MO_LAYER` refs) → byte-exact asserts
-  on the built records; export→import roundtrip; uuid stability; hsv
-  converters; host-table lookups both directions; clamp warnings; unknown
-  kind/version/opcode errors; strips/bays skip counts.
+  `press`+`double_tap` conflict, `tap_hold` (T10 full), and `MO_LAYER_`
+  refs) → byte-exact asserts on the built records; export→import
+  roundtrip; uuid stability; hsv converters; host-table lookups both
+  directions; clamp warnings; unknown kind/version/opcode errors (incl.
+  `TOGGLE_LAYER_`-prefix warning); strips/bays skip counts; null
+  `animationId`; non-empty macros skip.
 - Reworked existing sections: §27 (snapshot guards) and §32 (backup
   round-trip + notes carry) move to the new formats; the "future version
   guard" test now targets OF `version > 1` and backup container v>1.
@@ -163,12 +183,17 @@ Module `sdk/src/openflow.ts` (new; exported from the barrel):
 
 ## 7. Risks / open notes
 
-- `taphold` (T10 full shadow) has no OpenFlow form — dropped on export
-  (counted), clamped on import conflicts. Accept until the author
-  documents more behaviors.
+- ~~`taphold` has no OpenFlow form~~ **Resolved 2026-10-10**: the form is
+  `tap_hold` (OpenFlow `actions_catalog.py` + `keymap_read.py` second-bank
+  mapping) — round-trips losslessly both directions.
 - Modifier encoding assumption (usage form) — see §2; revisited when an
   OpenFlow-written dump exists.
 - Strips (74–87) colors do not round-trip through our app yet (import
   skips, export placeholder) — blocked on the LED-stores RE backlog.
 - `version:1`-only: a future OF `version:2` file must fail with an
   actionable message (peek guard, same UHK pattern as before).
+- Full-profile `kind:'profile'` shape is now KNOWN from their source
+  (`profiles.py:_profile_payload`: `{profile:{name,iconId}, layers[],
+  macros[], modules:{configBindings, configs}}`) — no Discord sample
+  needed; extending import/export to it is straightforward future work
+  once module configs get a device model (ROADMAP E).
