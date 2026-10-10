@@ -1,19 +1,24 @@
 /* Auto-backups: rolling pre-flash snapshots kept in localStorage (UHK
  * Agent pattern — the compensation half for a device with no staging
  * buffer: every flash starts from a known-good restore point).
- * Storage-swappable so the node smoke can drive it with a Map-backed
- * fake; a missing storage (node, private mode, quota) degrades to
- * skipped, never throws into the flash path. */
+ * The container is an internal envelope around OpenFlow layer docs
+ * (host-side only, never shared — so it may carry our per-key notes,
+ * which OpenFlow files themselves do not). Storage-swappable so the node
+ * smoke can drive it with a Map-backed fake; a missing storage (node,
+ * private mode, quota) degrades to skipped, never throws into the flash
+ * path. */
 
-import { buildKeymapExport, buildLedmapExport } from './exporters';
-import { parseSnapshotFile } from './importers';
+import { buildOpenFlowLayer, parseOpenFlowLayer } from './openflow';
+import type { ParseFileResult } from './openflow';
 import type { SnapMaps } from './importers';
 import type { KeyRec, LedRec } from './naya';
-import { SNAPSHOT_VERSION } from './utils';
 
-export const BACKUP_KIND = 'naya-full-backup';
+/** Internal backup container kind (device layer docs are kind:'layer'). */
+export const BACKUP_KIND = 'backup';
 const STORAGE_KEY = 'naya-auto-backups';
 const MAX_BACKUPS = 20;
+const CONTAINER_TOOL = 'create-reflow';
+const CONTAINER_VERSION = 1;
 
 export interface BackupMeta {
   id: string;
@@ -31,6 +36,10 @@ export interface StorageLike {
 interface StoredBackup {
   meta: BackupMeta;
   doc: Record<string, unknown>;
+}
+
+function isObj(v: unknown): v is Record<string, unknown> {
+  return typeof v === 'object' && v !== null;
 }
 
 function defaultStorage(): StorageLike | null {
@@ -53,7 +62,18 @@ function readAll(st: StorageLike | null): StoredBackup[] {
   try {
     const raw = st.getItem(STORAGE_KEY);
     const v = raw ? JSON.parse(raw) : [];
-    return Array.isArray(v) ? (v as StoredBackup[]) : [];
+    if (!Array.isArray(v) || v.length === 0) return [];
+    // One-time wipe: content written by the pre-OpenFlow builds carries a
+    // different container (tool 'naya-reflow', naya-full-backup, …) that
+    // nothing here can read anymore. Treat the whole store as empty —
+    // list shows nothing and the next save overwrites it.
+    const first = v[0] as unknown;
+    const doc =
+      isObj(first) && isObj((first as { doc?: unknown }).doc)
+        ? ((first as { doc: unknown }).doc as Record<string, unknown>)
+        : null;
+    if (!doc || doc.tool !== CONTAINER_TOOL) return [];
+    return v as StoredBackup[];
   } catch {
     return [];
   }
@@ -80,26 +100,30 @@ export function saveAutoBackup(
   blobLeds: number[],
   notes?: Record<string, string>,
   storage?: StorageLike,
+  anims?: Record<number, string>,
 ): SaveBackupResult {
-  const kExp = buildKeymapExport(keys, blobKeys, 0, true, notes);
-  const lExp = buildLedmapExport(leds, blobLeds, 0, true);
-  if (!kExp || !lExp) return { status: 'skipped', reason: 'empty' };
+  // One OpenFlow layer doc per non-empty layer cache (keys or leds —
+  // either alone is restorable state); empty caches contribute nothing.
+  const layers: unknown[] = [];
+  for (let L = 0; L < 3; L++) {
+    const k = keys[L] ?? [];
+    const l = leds[L] ?? [];
+    if (k.length === 0 && l.length === 0) continue;
+    layers.push(buildOpenFlowLayer(k, l, L, anims?.[L] ?? null).data);
+  }
+  if (layers.length === 0) return { status: 'skipped', reason: 'empty' };
   const doc = {
-    tool: 'naya-reflow',
+    tool: CONTAINER_TOOL,
     kind: BACKUP_KIND,
-    v: SNAPSHOT_VERSION,
+    v: CONTAINER_VERSION,
     exportedAt: new Date().toISOString(),
-    keys: kExp.data,
-    leds: lExp.data,
+    layers,
+    notes: notes ?? {},
   } as unknown as Record<string, unknown>;
-  // Content hash only — exportedAt must NOT participate (top-level AND the
-  // nested export docs each carry one), or every save looks changed and
-  // the dedupe never fires.
-  const stripTs = (d: unknown): Record<string, unknown> => ({
-    ...(d as Record<string, unknown>),
-    exportedAt: '',
-  });
-  const hash = hashStr(JSON.stringify({ ...stripTs(doc), keys: stripTs(doc.keys), leds: stripTs(doc.leds) }));
+  // Content hash only — exportedAt must NOT participate, or every save
+  // looks changed and the dedupe never fires. The nested OF layer docs
+  // are timestamp-free by construction (deterministic builders).
+  const hash = hashStr(JSON.stringify({ ...doc, exportedAt: '' }));
   const st = storage ?? defaultStorage();
   const all = readAll(st);
   if (all[0] && all[0].meta.hash === hash) return { status: 'skipped', reason: 'unchanged' };
@@ -123,11 +147,38 @@ export function listAutoBackups(storage?: StorageLike): BackupMeta[] {
 export function loadAutoBackup(
   id: string,
   storage?: StorageLike,
-): SnapMaps | { error: string } {
+): ParseFileResult {
   const all = readAll(storage ?? defaultStorage());
   const e = all.find((b) => b.meta.id === id);
   if (!e) return { error: `no backup with id ${id}` };
-  return parseSnapshotFile(e.doc);
+  const doc = e.doc;
+  if (!isObj(doc)) return { error: `backup entry ${id} is unreadable` };
+  // Peek version BEFORE the shape checks (same order as the OF parser):
+  // containers from a newer app must fail with an actionable message.
+  if (typeof doc.v === 'number' && doc.v > 1)
+    return {
+      error: `backup container version ${doc.v} is newer than this app supports (v1) — update the app`,
+    };
+  if (!Array.isArray(doc.layers)) return { error: `backup entry ${id} is unreadable` };
+  const keys: KeyRec[][] = [[], [], []];
+  const leds: LedRec[][] = [[], [], []];
+  const layers: number[] = [];
+  const anims: Record<number, number> = {};
+  const warnings: string[] = [];
+  for (const layerDoc of doc.layers) {
+    const r = parseOpenFlowLayer(layerDoc);
+    if ('error' in r) return { error: `backup entry ${id} is unreadable` };
+    const L = r.maps.layers[0];
+    keys[L] = r.maps.keys[L];
+    leds[L] = r.maps.leds[L];
+    if (!layers.includes(L)) layers.push(L);
+    if (r.anim !== null) anims[L] = r.anim;
+    for (const w of r.warnings) warnings.push(`layer ${L}: ${w}`);
+  }
+  layers.sort((a, b) => a - b);
+  const maps: SnapMaps = { keys, leds, layers };
+  if (isObj(doc.notes)) maps.notes = doc.notes as Record<string, string>;
+  return { maps, anims, warnings };
 }
 
 export function deleteAutoBackup(id: string, storage?: StorageLike): boolean {

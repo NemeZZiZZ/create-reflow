@@ -31,9 +31,6 @@ import {
 import type { StorageLike } from '@create-reflow/sdk';
 import { TROUBLES, UNDARK_LADDER, assertWireAllowed } from '@create-reflow/sdk';
 import { customHidAction, groupKeyboardCategory, parseCustomHid } from '@create-reflow/sdk';
-import { buildKeymapExport, buildLedmapExport } from '@create-reflow/sdk';
-import { migrateSnapshot } from '@create-reflow/sdk';
-import { SNAPSHOT_VERSION } from '@create-reflow/sdk';
 import { nameToUsage, usageToName, HOST_TABLE_SIZE } from '@create-reflow/sdk';
 import { parseOpenFlowLayer, OF_LAYER_UUIDS, buildOpenFlowLayer } from '@create-reflow/sdk';
 
@@ -427,66 +424,64 @@ eq(timeoutsMs(new Uint8Array([1, 2, 3])), null, 'timeoutsMs rejects short');
 // 18. snapshot import (restore-from-file)
 {
   const rec7 = new Uint8Array([0x1e, 0x01, 0x04, 0x73, 0x00, 0x07, 0x00]);
-  const led4 = new Uint8Array([0x1e, 0xb4, 0x00, 0x64]);
-  const hx = (b: Uint8Array) => [...b].map((x) => x.toString(16).padStart(2, '0')).join('');
-  const snap = parseSnapshotFile({
-    tool: 'naya-backup', version: 1,
-    keymap: { '0': hx(rec7) }, ledmap: { '0': hx(led4) }, info: {},
-  });
-  eq('error' in snap ? 'err' : snap.layers.join(','), '0', 'backup snapshot parses');
-  if (!('error' in snap)) {
-    const liveKeys: KeyRec[][] = [[{ kk: 0x1e, t: 1, rec: rec7, offset: 0 }], [], []];
-    const liveLeds: LedRec[][] = [[{ kk: 0x1e, h: 180, s: 100, offset: 0 }], [], []];
-    const d0 = new Draft();
-    const r0 = diffSnapshotToDraft(d0, snap, liveKeys, liveLeds);
-    eq(r0.keysQueued + r0.ledsQueued + d0.size, 0, 'identical snapshot queues nothing');
-    const rec7b = new Uint8Array([0x1e, 0x01, 0x04, 0x73, 0x00, 0x08, 0x00]);
-    const snap2 = parseSnapshotFile({
-      tool: 'naya-backup', version: 1,
-      keymap: { '0': hx(rec7b) }, ledmap: { '0': hx(new Uint8Array([0x1e, 0xb4, 0x00, 0x63])) }, info: {},
-    });
-    const d1 = new Draft();
-    const r1 = diffSnapshotToDraft(d1, snap2 as SnapMaps, liveKeys, liveLeds);
-    eq(r1.keysQueued === 1 && r1.ledsQueued === 1 && d1.size === 2 ? 'ok' : 'bad', 'ok', 'changed key+led queued');
-    const snap3 = parseSnapshotFile({
-      tool: 'naya-reflow', kind: 'keymap-layer',
-      layers: { '1': { totalBytes: 11, records: [{ kk: 5, kkHex: '0x05', t: 1, rec: hx(new Uint8Array([5, 1, 4, 1, 2, 3, 4])), meaning: 'x' }] } },
-    });
-    eq('error' in snap3 ? 'err' : (snap3 as SnapMaps).layers.join(','), '1', 'web keymap export parses');
-    const d2 = new Draft();
-    const r2 = diffSnapshotToDraft(d2, snap3 as SnapMaps, [[], [], []], [[], [], []]);
-    eq(r2.skippedMissing, 1, 'no live counterpart skipped');
-    const snap4 = parseSnapshotFile({
-      tool: 'naya-reflow', kind: 'ledmap-layer',
-      layers: { '0': { totalBytes: 4, leds: [{ kk: 9, kkHex: '0x09', hue: 10, sat: 20 }] } },
-    }) as SnapMaps;
-    const d3 = new Draft();
-    const rec11 = new Uint8Array([9, 1, 8, 1, 2, 3, 4, 5, 6, 7, 8]);
-    const r3 = diffSnapshotToDraft(d3, {
-      keys: [[{ kk: 9, t: 1, rec: rec7, offset: 0 }], [], []],
-      leds: snap4.leds, layers: [0],
-    }, [[{ kk: 9, t: 1, rec: rec11, offset: 0 }], [], []], [[{ kk: 9, h: 10, s: 20, offset: 0 }], [], []]);
-    eq(r3.keysQueued === 1 && d3.size === 1 && d3.ops[0].kind === 'key' ? 'ok' : 'bad',
-       'ok', 'plain length change queues a key op (S1: writes apply)');
-    eq(d3.ops[0].kind === 'key' && toHex(d3.ops[0].record), toHex(rec7), 'queued record is the snapshot one');
-    // live T10 primary + shadow, snapshot plain → keyset downgrade with filler
-    const t10p = new Uint8Array(27); t10p[0] = 9; t10p[1] = 0x10; t10p[2] = 0x18;
-    const t10s = new Uint8Array(27); t10s[0] = 9 + 0x52; t10s[1] = 0x10; t10s[2] = 0x18;
-    const d3b = new Draft();
-    const r3b = diffSnapshotToDraft(d3b, {
-      keys: [[{ kk: 9, t: 0x10, rec: rec7, offset: 0 }], [], []],
-      leds: [[], [], []], layers: [0],
-    }, [[{ kk: 9, t: 0x10, rec: t10p, offset: 0 }, { kk: 9 + 0x52, t: 0x10, rec: t10s, offset: 0 }], [], []],
-       [[], [], []]);
-    eq(r3b.keysQueued === 1 && d3b.size === 1 && d3b.ops[0].kind === 'keyset' ? 'ok' : 'bad',
-       'ok', 'T10 live + plain snapshot downgrades via keyset');
-    if (d3b.ops[0].kind === 'keyset') {
-      eq(d3b.ops[0].records.length, 2, 'downgrade writes primary + shadow filler');
-      eq(toHex(d3b.ops[0].records[0]), toHex(rec7), 'primary is the snapshot record');
-      eq(toHex(d3b.ops[0].records[1]), '5b 07 00', 'filler clears the shadow slot (NONE type)');
-    }
-    eq('error' in parseSnapshotFile({ tool: 'nope' }) ? 'err' : 'ok', 'err', 'unknown tool rejected');
+  // TODO(task5/task6): rework — the legacy naya-backup / naya-reflow import
+  // formats were removed (clean break, 2026-10), so the two parse asserts
+  // ('backup snapshot parses', 'web keymap export parses') are gone. The
+  // diffSnapshotToDraft coverage below is unchanged and now runs on literal
+  // SnapMaps; OpenFlow parse coverage lives in §48/§50.
+  const liveKeys: KeyRec[][] = [[{ kk: 0x1e, t: 1, rec: rec7, offset: 0 }], [], []];
+  const liveLeds: LedRec[][] = [[{ kk: 0x1e, h: 180, s: 100, offset: 0 }], [], []];
+  const d0 = new Draft();
+  const snap0: SnapMaps = {
+    keys: [[{ kk: 0x1e, t: 1, rec: rec7, offset: 0 }]],
+    leds: [[{ kk: 0x1e, h: 180, s: 100, offset: 0 }]],
+    layers: [0],
+  };
+  const r0 = diffSnapshotToDraft(d0, snap0, liveKeys, liveLeds);
+  eq(r0.keysQueued + r0.ledsQueued + d0.size, 0, 'identical snapshot queues nothing');
+  const rec7b = new Uint8Array([0x1e, 0x01, 0x04, 0x73, 0x00, 0x08, 0x00]);
+  const snap2: SnapMaps = {
+    keys: [[{ kk: 0x1e, t: 1, rec: rec7b, offset: 0 }]],
+    leds: [[{ kk: 0x1e, h: 180, s: 99, offset: 0 }]],
+    layers: [0],
+  };
+  const d1 = new Draft();
+  const r1 = diffSnapshotToDraft(d1, snap2, liveKeys, liveLeds);
+  eq(r1.keysQueued === 1 && r1.ledsQueued === 1 && d1.size === 2 ? 'ok' : 'bad', 'ok', 'changed key+led queued');
+  const snap3: SnapMaps = {
+    keys: [[], [{ kk: 5, t: 1, rec: new Uint8Array([5, 1, 4, 1, 2, 3, 4]), offset: -1 }], []],
+    leds: [[], [], []],
+    layers: [1],
+  };
+  const d2 = new Draft();
+  const r2 = diffSnapshotToDraft(d2, snap3, [[], [], []], [[], [], []]);
+  eq(r2.skippedMissing, 1, 'no live counterpart skipped');
+  const d3 = new Draft();
+  const rec11 = new Uint8Array([9, 1, 8, 1, 2, 3, 4, 5, 6, 7, 8]);
+  const r3 = diffSnapshotToDraft(d3, {
+    keys: [[{ kk: 9, t: 1, rec: rec7, offset: 0 }], [], []],
+    leds: [[{ kk: 9, h: 10, s: 20, offset: -1 }], [], []], layers: [0],
+  }, [[{ kk: 9, t: 1, rec: rec11, offset: 0 }], [], []], [[{ kk: 9, h: 10, s: 20, offset: 0 }], [], []]);
+  eq(r3.keysQueued === 1 && d3.size === 1 && d3.ops[0].kind === 'key' ? 'ok' : 'bad',
+     'ok', 'plain length change queues a key op (S1: writes apply)');
+  eq(d3.ops[0].kind === 'key' && toHex(d3.ops[0].record), toHex(rec7), 'queued record is the snapshot one');
+  // live T10 primary + shadow, snapshot plain → keyset downgrade with filler
+  const t10p = new Uint8Array(27); t10p[0] = 9; t10p[1] = 0x10; t10p[2] = 0x18;
+  const t10s = new Uint8Array(27); t10s[0] = 9 + 0x52; t10s[1] = 0x10; t10s[2] = 0x18;
+  const d3b = new Draft();
+  const r3b = diffSnapshotToDraft(d3b, {
+    keys: [[{ kk: 9, t: 0x10, rec: rec7, offset: 0 }], [], []],
+    leds: [[], [], []], layers: [0],
+  }, [[{ kk: 9, t: 0x10, rec: t10p, offset: 0 }, { kk: 9 + 0x52, t: 0x10, rec: t10s, offset: 0 }], [], []],
+     [[], [], []]);
+  eq(r3b.keysQueued === 1 && d3b.size === 1 && d3b.ops[0].kind === 'keyset' ? 'ok' : 'bad',
+     'ok', 'T10 live + plain snapshot downgrades via keyset');
+  if (d3b.ops[0].kind === 'keyset') {
+    eq(d3b.ops[0].records.length, 2, 'downgrade writes primary + shadow filler');
+    eq(toHex(d3b.ops[0].records[0]), toHex(rec7), 'primary is the snapshot record');
+    eq(toHex(d3b.ops[0].records[1]), '5b 07 00', 'filler clears the shadow slot (NONE type)');
   }
+  eq('error' in parseSnapshotFile({ tool: 'nope' }) ? 'err' : 'ok', 'err', 'unknown tool rejected');
 }
 
 // 19. draft op model v2 — sections, dedup, stats
@@ -914,21 +909,29 @@ import { queueAction } from '@create-reflow/sdk';
     rec: Uint8Array.from(bytes),
     offset: -1,
   });
+  // Records are canonical builder output so the save→load round-trip is
+  // byte-identical (parse rebuilds the same builders); cache order mirrors
+  // parse emission (a chain's records stay together, tail last).
   const keys: KeyRec[][] = [
     [
-      mkRec(0x30, [0x30, 0x01, 0x04, 0x1d, 0x00, 0x07, 0x00]),
-      mkRec(0x31, [0x31, 0x03, 0x07, 0x00, 0x1d, 0x00, 0x1b, 0x00, 0x00, 0x00, 0x00]),
+      mkRec(0x30, [0x30, 0x01, 0x04, 0x1d, 0x00, 0x07, 0x00]), // T01 Z
+      mkRec(0x31, Array.from(t03Record(0x31, 0x1b, 0x1d))), // T03 hold X / tap Z
+      mkRec(0x32, Array.from(t10Primary(0x32, 0x1b, 0x1d))), // T10 hold X / tap Z
+      mkRec(0x84, Array.from(t10ShadowMini(0x32, 0x14))), // double T (@+0x52)
+      mkRec(0x4b, Array.from(TAIL_T10)), // chain tail rides the cache
     ],
-    [mkRec(0x2e, [0x2e, 0x00, 0x08, 0x03, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00])],
-    [mkRec(0x1e, [0x1e, 0x01, 0x04, 0x73, 0x00, 0x07, 0x00])],
+    [], // layer 1: LED-only cache (either cache alone is restorable state)
+    [mkRec(0x1e, [0x1e, 0x01, 0x04, 0x73, 0x00, 0x07, 0x00])], // T01 F24
   ];
+  // LED values are hsToHex/hexToHs-exact (8-bit quantization is lossy for
+  // some hues) so colors round-trip faithfully.
   const leds: LedRec[][] = [
     [
-      { kk: 0x30, h: 243, s: 100, offset: -1 },
-      { kk: 0x31, h: 30, s: 150, offset: -1 },
+      { kk: 0x30, h: 240, s: 100, offset: -1 },
+      { kk: 0x31, h: 30, s: 100, offset: -1 },
     ],
     [{ kk: 0x2e, h: 0, s: 0, offset: -1 }],
-    [{ kk: 0x1e, h: 511, s: 255, offset: -1 }],
+    [{ kk: 0x1e, h: 300, s: 70, offset: -1 }],
   ];
   const blobKeys = keys.map((l) => l.reduce((a, r) => a + r.rec.length, 0));
   const blobLeds = leds.map((l) => l.length * 4);
@@ -950,59 +953,47 @@ import { queueAction } from '@create-reflow/sdk';
   eq(metas.length, 2, '27 list 2, newest first');
   eq(metas[0].hash !== metas[1].hash, true, '27 hashes differ');
 
+  // save → load round-trip: the container holds per-layer OpenFlow docs,
+  // load merges them back into whole-file maps (records byte-identical —
+  // the fixture records are canonical builder output; the OF-doc-level
+  // round-trip itself lives in §49).
   const snap = loadAutoBackup(metas[0].id, st);
   eq('error' in snap ? 'err' : 'ok', 'ok', '27 load parses');
   if (!('error' in snap)) {
-    eq(String(snap.layers), '0,1,2', '27 backup layers');
-    eq(toHex(snap.keys[0][0].rec), '30 01 04 14 00 07 00', '27 backup rec is the CHANGED one (newest)');
-    eq(snap.leds[0][1].h, 30, '27 backup led hue');
-  }
-
-  // golden round-trip: parsed maps -> rebuild export -> parse -> identical
-  if (!('error' in snap)) {
-    const reExp = buildKeymapExport(snap.keys, blobKeys, 0, true);
-    const reSnap = reExp ? parseSnapshotFile(reExp.data) : { error: 'null' };
-    eq('error' in reSnap ? 'err' : 'ok', 'ok', '27 re-export parses');
-    if (!('error' in reSnap)) {
-      const a = snap.keys.map((l) => l.map((r) => toHex(r.rec)).join(','));
-      const b = reSnap.keys.map((l) => l.map((r) => toHex(r.rec)).join(','));
-      eq(JSON.stringify(a) === JSON.stringify(b), true, '27 key round-trip byte-identical');
-    }
-    const reLed = buildLedmapExport(snap.leds, blobLeds, 0, true);
-    eq(reLed !== null, true, '27 led export builds');
-    if (reLed) {
-      const reLedSnap = parseSnapshotFile(reLed.data);
-      eq('error' in reLedSnap ? 'err' : 'ok', 'ok', '27 re-led parses');
-      if (!('error' in reLedSnap)) {
-        const c = snap.leds.map((l) => l.map((r) => `${r.h}/${r.s}`).join(','));
-        const d = reLedSnap.leds.map((l) => l.map((r) => `${r.h}/${r.s}`).join(','));
-        eq(JSON.stringify(c) === JSON.stringify(d), true, '27 led round-trip identical');
-      }
-    }
+    eq(String(snap.maps.layers), '0,1,2', '27 backup layers');
+    eq(toHex(snap.maps.keys[0][0].rec), '30 01 04 14 00 07 00', '27 backup rec is the CHANGED one (newest)');
+    eq(snap.maps.leds[0][1].h, 30, '27 backup led hue');
+    eq(
+      snap.maps.keys[0].map((r) => `${r.kk}:${toHex(r.rec)}`).join('|'),
+      keys[0].map((r) => `${r.kk}:${toHex(r.rec)}`).join('|'),
+      '27 layer-0 recs round-trip byte-identical (T01+T03+T10 chain+tail)',
+    );
+    eq(
+      snap.maps.leds[0].map((l) => `${l.kk}:${l.h}/${l.s}`).join('|'),
+      '48:240/100|49:30/100',
+      '27 layer-0 leds round-trip',
+    );
+    eq(toHex(snap.maps.keys[2][0].rec), '1e 01 04 73 00 07 00', '27 layer-2 rec round-trips');
+    eq(snap.maps.leds[2][0].h, 300, '27 layer-2 led hue');
+    eq(snap.warnings.length > 0, true, '27 parse warnings surface');
+    eq(snap.warnings.every((w) => /^layer [0-2]: /.test(w)), true, '27 warnings carry the layer prefix');
   }
   eq(deleteAutoBackup(metas[0].id, st), true, '27 delete works');
   eq(deleteAutoBackup(metas[0].id, st), false, '27 delete idempotent-false');
   eq('error' in loadAutoBackup(metas[0].id, st), true, '27 deleted id errors');
 
-  // schema version peek-guard
-  const exp = buildKeymapExport(keys, blobKeys, 0, true);
-  if (exp) {
-    const doc = exp.data as Record<string, unknown>;
-    eq(doc.v, SNAPSHOT_VERSION, '27 exports carry current schema v');
-    doc.v = SNAPSHOT_VERSION + 1;
-    const g = parseSnapshotFile(doc);
-    eq('error' in g && g.error.includes('newer') ? 'newer' : 'other', 'newer', '27 future version rejected');
-    delete doc.v;
-    eq('error' in parseSnapshotFile(doc) ? 'err' : 'ok', 'ok', '27 missing v treated as v1');
-    const migrated = migrateSnapshot(doc) as Record<string, unknown>;
-    eq(migrated === doc, true, '27 migrate mutates in place');
-    eq(migrated.v, 2, '27 migrate v1 -> v2');
-    eq(
-      typeof migrated.notes === 'object' && migrated.notes !== null,
-      true,
-      '27 migrate adds notes {}',
+  // backup container version peek-guard (the OF doc version>1 guard is §50)
+  const stV = mkStorage();
+  const inject = (id: string, doc: Record<string, unknown>) =>
+    stV.setItem(
+      'naya-auto-backups',
+      JSON.stringify([{ meta: { id, ts: '', hash: '', bytes: 0 }, doc }]),
     );
-  }
+  inject('v2', { tool: 'create-reflow', kind: 'backup', v: 2, exportedAt: '', layers: [] });
+  const g = loadAutoBackup('v2', stV);
+  eq('error' in g && g.error.includes('newer') ? 'newer' : 'other', 'newer', '27 future container version rejected');
+  inject('nov', { tool: 'create-reflow', kind: 'backup', exportedAt: '', layers: [] });
+  eq('error' in loadAutoBackup('nov', stV) ? 'err' : 'ok', 'ok', '27 container missing v treated as v1');
 
   // node without storage arg: localStorage undefined -> storage-skip
   const rn = saveAutoBackup(keys, leds, blobKeys, blobLeds);
@@ -1012,10 +1003,70 @@ import { queueAction } from '@create-reflow/sdk';
   eq(hashStr('abc') === hashStr('abc'), true, '27 hash deterministic');
   eq(hashStr('abc') !== hashStr('abd'), true, '27 hash separates input');
   eq(/^[0-9a-f]{8}$/.test(hashStr('x')), true, '27 hash 8 hex chars');
+
+  // anims: the param lands as animationId in the stored docs, comes back
+  // via load's anims (index into ANIM_NAMES)
+  const stA = mkStorage();
+  saveAutoBackup(keys, leds, blobKeys, blobLeds, undefined, stA, { 0: 'breathe' });
+  const rawA = JSON.parse(stA.getItem('naya-auto-backups') ?? '[]') as Array<{
+    meta: { id: string };
+    doc: { layers?: Array<{ layer?: { animationId?: string } }> };
+  }>;
+  eq(rawA[0]?.doc?.layers?.[0]?.layer?.animationId, 'breathe', '27 anims land as animationId');
+  eq(rawA[0]?.doc?.layers?.[1]?.layer?.animationId, 'solid', '27 missing anim falls back to solid');
+  const snapA = loadAutoBackup(rawA[0]?.meta?.id ?? 'missing', stA);
+  eq(!('error' in snapA) && snapA.anims[0], 1, '27 anim byte comes back via load');
+  eq(!('error' in snapA) && snapA.anims[1], 0, '27 solid comes back as anim byte 0');
+
+  // notes ride only in the container (OF layer docs carry none) and load back
+  const stN = mkStorage();
+  saveAutoBackup(keys, leds, blobKeys, blobLeds, { '0:48': 'hello' }, stN);
+  const rawN = JSON.parse(stN.getItem('naya-auto-backups') ?? '[]') as Array<{
+    meta: { id: string };
+    doc: { notes?: Record<string, string> };
+  }>;
+  eq(rawN[0]?.doc?.notes?.['0:48'], 'hello', '27 notes land in the container');
+  const snapN = loadAutoBackup(rawN[0]?.meta?.id ?? 'missing', stN);
+  eq(!('error' in snapN) && snapN.maps.notes?.['0:48'], 'hello', '27 notes come back via load');
+
+  // wipe-once: legacy stored content reads as empty; the next save overwrites
+  const stL = mkStorage();
+  stL.setItem(
+    'naya-auto-backups',
+    JSON.stringify([
+      {
+        meta: { id: 'legacy', ts: '', hash: '', bytes: 0 },
+        doc: { tool: 'naya-reflow', kind: 'naya-full-backup', v: 2 },
+      },
+    ]),
+  );
+  eq(listAutoBackups(stL).length, 0, '27 legacy store reads as empty');
+  eq(saveAutoBackup(keys, leds, blobKeys, blobLeds, undefined, stL).status, 'saved', '27 save after legacy wipe succeeds');
+  eq(listAutoBackups(stL).length, 1, '27 next save overwrites the legacy store');
+
+  // empty layer caches contribute no doc; an all-empty save skips entirely
+  const stE = mkStorage();
+  eq(
+    saveAutoBackup([[], [keys[0][0]], []], [[], [leds[0][0]], []], [0, blobKeys[0], 0], [0, 4, 0], undefined, stE)
+      .status,
+    'saved',
+    '27 single-layer backup saved',
+  );
+  const rawE = JSON.parse(stE.getItem('naya-auto-backups') ?? '[]') as Array<{
+    doc: { layers?: unknown[] };
+  }>;
+  eq(rawE[0]?.doc?.layers?.length, 1, '27 empty layer caches skipped in container');
+  const st0 = mkStorage();
+  eq(
+    saveAutoBackup([[], [], []], [[], [], []], [0, 0, 0], [0, 0, 0], undefined, st0).status,
+    'skipped',
+    '27 all-empty backup skipped',
+  );
 }
 
-// §32 per-key notes (UHK #8): schema v2 — export carries them, import
-// filters to the exported layers, backups round-trip them, dedupe sees them.
+// §32 per-key notes (UHK #8): notes ride ONLY in the backup container —
+// OpenFlow layer docs carry no notes field anywhere (assert both facts);
+// backups round-trip them and the content hash sees them.
 {
   const mkNoteRec = (kk: number): KeyRec => ({
     kk,
@@ -1037,34 +1088,16 @@ import { queueAction } from '@create-reflow/sdk';
   const blobLeds = leds.map((l) => l.length * 4);
   const notes: Record<string, string> = { '0:48': 'x', '2:48': 'y' };
 
-  const all = buildKeymapExport(keys, blobKeys, 0, true, notes);
-  eq(all !== null, true, '32 export with notes builds');
-  if (all) {
-    const snap = parseSnapshotFile(all.data);
-    eq('error' in snap ? 'err' : 'ok', 'ok', '32 all-layers parse');
-    if (!('error' in snap)) {
-      eq(snap.notes?.['0:48'], 'x', '32 note 0:48 survives');
-      eq(snap.notes?.['2:48'], 'y', '32 note 2:48 survives');
-    }
-  }
-  const one = buildKeymapExport(keys, blobKeys, 0, false, notes);
-  eq(one !== null, true, '32 single-layer export builds');
-  if (one) {
-    const snap = parseSnapshotFile(one.data);
-    eq('error' in snap ? 'err' : 'ok', 'ok', '32 single-layer parse');
-    if (!('error' in snap)) {
-      eq(snap.notes?.['0:48'], 'x', '32 in-layer note kept');
-      eq(snap.notes?.['2:48'], undefined, '32 out-of-layer note dropped');
-    }
-  }
-  // note-less v2 doc: doc.notes = {} -> parse yields notes undefined
-  const bare = buildKeymapExport(keys, blobKeys, 0, true);
-  if (bare) {
-    const snap = parseSnapshotFile(bare.data);
-    eq('error' in snap ? 'err' : 'ok', 'ok', '32 note-less v2 parses');
-    if (!('error' in snap)) eq(snap.notes, undefined, '32 no notes -> undefined');
-  }
-  // backups: notes ride along and join the content hash
+  // OF layer export: no notes field — not at the top level, not nested.
+  const ofDoc = buildOpenFlowLayer(keys[0], leds[0], 0, null).data as Record<string, unknown>;
+  eq('notes' in ofDoc, false, '32 OF layer export carries no notes field');
+  eq(JSON.stringify(ofDoc).includes('"notes"'), false, '32 OF layer doc has no notes nested either');
+  const back = parseSnapshotFile(ofDoc);
+  eq('error' in back ? 'err' : 'ok', 'ok', '32 OF export reparses');
+  if (!('error' in back)) eq(back.maps.notes, undefined, '32 OF parse yields no notes');
+
+  // backups: notes land at container level only — every stored layer doc
+  // stays note-free.
   const mkSt = (): StorageLike => {
     const m = new Map<string, string>();
     return {
@@ -1076,6 +1109,19 @@ import { queueAction } from '@create-reflow/sdk';
   const st = mkSt();
   const b1 = saveAutoBackup(keys, leds, blobKeys, blobLeds, notes, st);
   eq(b1.status, 'saved', '32 backup with notes saved');
+  const raw = JSON.parse(st.getItem('naya-auto-backups') ?? '{}') as Array<{
+    doc: { notes?: Record<string, string>; layers?: unknown[] };
+  }>;
+  eq(raw[0]?.doc?.notes?.['0:48'], 'x', '32 note 0:48 in the container');
+  eq(raw[0]?.doc?.notes?.['2:48'], 'y', '32 out-of-layer note 2:48 in the container');
+  const layerDocs = raw[0]?.doc?.layers;
+  eq(
+    Array.isArray(layerDocs) &&
+      layerDocs.every((l) => !JSON.stringify(l).includes('"notes"')),
+    true,
+    '32 stored layer docs stay note-free',
+  );
+  // notes join the content hash: same notes dedupe, changed notes don't
   const b2 = saveAutoBackup(keys, leds, blobKeys, blobLeds, notes, st);
   eq(b2.status === 'skipped' && b2.reason, 'unchanged', '32 same notes deduped');
   const b3 = saveAutoBackup(keys, leds, blobKeys, blobLeds, { ...notes, '0:48': 'z' }, st);
@@ -1084,7 +1130,7 @@ import { queueAction } from '@create-reflow/sdk';
   const loaded = metas[0] ? loadAutoBackup(metas[0].id, st) : { error: 'none' };
   eq('error' in loaded ? 'err' : 'ok', 'ok', '32 backup load parses');
   if (!('error' in loaded)) {
-    eq(loaded.notes?.['0:48'], 'z', '32 backup note round-trips');
+    eq(loaded.maps.notes?.['0:48'], 'z', '32 backup note round-trips');
   }
 }
 
@@ -1135,20 +1181,16 @@ import { queueAction } from '@create-reflow/sdk';
   eq(threw33, true, '33 sub-30s idle rejected');
 }
 
-// §28 version matrix (UHK #14): package.json is part of the version
-// surface — the gate fails here if it drifts from the code constant.
+// §28 version surface: package.json must stay present and versioned
+// (the legacy naya.snapshotVersion matrix died with the legacy snapshot
+// schema in the OpenFlow clean break).
 {
   const pkg = JSON.parse(
     fs.readFileSync(
       path.join(process.env.SMOKE_ROOT ?? process.cwd(), 'package.json'),
       'utf8',
     ),
-  ) as { naya?: { snapshotVersion?: number }; version?: string };
-  eq(
-    pkg.naya?.snapshotVersion,
-    SNAPSHOT_VERSION,
-    '28 pkg naya.snapshotVersion === SNAPSHOT_VERSION',
-  );
+  ) as { version?: string };
   eq(typeof pkg.version, 'string', '28 pkg version present');
 }
 
@@ -1603,6 +1645,61 @@ import { queueAction } from '@create-reflow/sdk';
   const pNull = parseOpenFlowLayer(JSON.parse(JSON.stringify(rNullAnim.data)));
   eq(!('error' in pNull) && pNull.anim === 0, true, '49 null anim → solid → anim 0');
   /* eslint-enable @typescript-eslint/no-explicit-any */
+}
+
+// §50 import accepts only OpenFlow
+{
+  const bind50 = (behavior: string, actionType: string, actionCode: string) => ({
+    behavior,
+    actionType,
+    actionCode,
+    context: null,
+  });
+  const doc50 = {
+    version: 1,
+    kind: 'layer',
+    layer: {
+      srcId: OF_LAYER_UUIDS[1],
+      name: 'Layer 1',
+      orderId: 1,
+      iconId: null,
+      animationId: 'breathe',
+      keys: [
+        { positionId: 0, colorHex: '#3366ff', bindings: [bind50('press', 'key', 'A')] },
+      ],
+    },
+    macros: [],
+    layerRefs: { [OF_LAYER_UUIDS[1]]: 1, [OF_LAYER_UUIDS[2]]: 2 },
+  };
+  const ok50 = parseSnapshotFile(doc50);
+  eq('error' in ok50 ? 'err' : 'ok', 'ok', '50 OpenFlow layer doc parses');
+  if (!('error' in ok50)) {
+    eq(ok50.maps.layers.join(','), '1', '50 doc layer is 1');
+    eq(toHex(ok50.maps.keys[1][0].rec), '00 01 04 04 00 07 00', '50 press A → T01');
+    eq(ok50.anims[1], 1, '50 anim keyed by the doc layer');
+    eq(
+      ok50.maps.leds[1].length === 1 && ok50.maps.leds[1][0].kk === 0,
+      true,
+      '50 colorHex → led',
+    );
+    eq(Array.isArray(ok50.warnings), true, '50 warnings array present');
+  }
+  const v50 = parseSnapshotFile({ ...doc50, version: 2 });
+  eq('error' in v50 && /newer/.test(v50.error), true, '50 version 2 rejected as newer');
+  const legBk = parseSnapshotFile({ tool: 'naya-backup', version: 1, keymap: {}, ledmap: {} });
+  eq(
+    'error' in legBk && /clean break/.test(legBk.error),
+    true,
+    '50 naya-backup rejected (clean break)',
+  );
+  const legRf = parseSnapshotFile({ tool: 'naya-reflow', kind: 'keymap-layer', layers: {} });
+  eq(
+    'error' in legRf && /clean break/.test(legRf.error),
+    true,
+    '50 naya-reflow export rejected (clean break)',
+  );
+  const prof50 = parseSnapshotFile({ version: 1, kind: 'profile' });
+  eq('error' in prof50 && /unsupported kind/.test(prof50.error), true, '50 kind profile rejected');
 }
 
 void main();

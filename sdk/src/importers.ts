@@ -1,14 +1,17 @@
-/* Import: parse a snapshot file back into draft ops (restore-from-file).
- * Pure — no device access, no React — fully smoke-testable. Accepts toolkit
- * naya-backup snapshots ({tool:'naya-backup', keymap/ledmap hex blobs}) and
- * our own export formats (keymap/ledmap kinds with per-record hex / hue-sat).
- * Caller diffs against the live caches and flashes via the normal queue. */
+/* Import: parse a file back into draft ops (restore-from-file).
+ * Pure — no device access, no React — fully smoke-testable. OpenFlow-only
+ * (clean break, 2026-10): the only importable file is a kind:"layer"
+ * OpenFlow doc; every legacy snapshot format (naya-backup toolkit dumps,
+ * naya-reflow keymap/ledmap exports, naya-full-backup containers) is
+ * rejected up front with an actionable error. Caller diffs the maps
+ * against the live caches and flashes via the normal queue. */
 
-import { describeRecord, parseLayer, parseLedmap } from './naya';
+import { describeRecord } from './naya';
 import { fillerRecord, hasT10Shadow, SHADOW_OFF } from './t10';
 import type { Draft } from './draft';
 import type { KeyRec, LedRec } from './naya';
-import { SNAPSHOT_VERSION } from './utils';
+import { parseOpenFlowLayer } from './openflow';
+import type { ParseFileResult } from './openflow';
 
 export interface SnapMaps {
   keys: KeyRec[][];
@@ -18,34 +21,6 @@ export interface SnapMaps {
   /** per-key free-text notes (schema v2+), key "L:kk" — never flashed,
    * carried through exports/backups only */
   notes?: Record<string, string>;
-}
-
-/** Ordered migration chain for our own snapshot schema. Each link:
- * `if ((obj.v ?? 1) < N) { …mutate…; obj.v = N; }`, oldest first.
- * v2: adds `notes` (per-key free-text notes). */
-export function migrateSnapshot(obj: Record<string, unknown>): Record<string, unknown> {
-  const v = typeof obj.v === 'number' ? obj.v : 1;
-  if (v < 2) {
-    if (!isObj(obj.notes)) obj.notes = {};
-    obj.v = 2;
-  }
-  return obj;
-}
-
-/** Keep only well-formed "L:kk" -> non-empty string entries. */
-function pickNotes(
-  v: unknown,
-  layers: number[],
-): Record<string, string> | undefined {
-  if (!isObj(v)) return undefined;
-  const out: Record<string, string> = {};
-  for (const [k, val] of Object.entries(v)) {
-    const m = /^([0-2]):(\d+)$/.exec(k);
-    if (!m || typeof val !== "string" || val.length === 0) continue;
-    if (!layers.includes(Number(m[1]))) continue;
-    out[k] = val;
-  }
-  return Object.keys(out).length ? out : undefined;
 }
 
 export function hexToBytes(hex: string): Uint8Array | null {
@@ -67,109 +42,34 @@ function isObj(v: unknown): v is Record<string, unknown> {
   return typeof v === 'object' && v !== null;
 }
 
-/** Parse one naya-reflow export doc (kind keymap-x / ledmap-x) into maps of
- * the requested mode. Shared by the plain single-kind path and the nested
- * docs inside a full backup. */
-function parseExportLayers(
-  doc: Record<string, unknown>,
-  mode: 'keys' | 'leds',
-): SnapMaps | { error: string } {
-  if (!isObj(doc.layers)) return { error: 'export missing layers' };
-  const keys: KeyRec[][] = [[], [], []];
-  const leds: LedRec[][] = [[], [], []];
-  const layers: number[] = [];
-  for (const L of [0, 1, 2]) {
-    const lay = (doc.layers as Record<string, unknown>)[String(L)];
-    if (lay === undefined) continue;
-    if (!isObj(lay)) return { error: `layer ${L}: bad shape` };
-    if (mode === 'keys') {
-      if (!Array.isArray(lay.records))
-        return { error: `layer ${L}: missing records` };
-      for (const r of lay.records as unknown[]) {
-        if (!isObj(r) || typeof r.kk !== 'number' || typeof r.rec !== 'string')
-          return { error: `layer ${L}: bad record` };
-        const bytes = hexToBytes(r.rec);
-        if (!bytes || bytes.length < 3)
-          return { error: `layer ${L} KK ${r.kk}: bad rec hex` };
-        keys[L].push({ kk: r.kk, t: bytes[1], rec: bytes, offset: -1 });
-      }
-    } else {
-      if (!Array.isArray(lay.leds)) return { error: `layer ${L}: missing leds` };
-      for (const r of lay.leds as unknown[]) {
-        if (
-          !isObj(r) ||
-          typeof r.kk !== 'number' ||
-          typeof r.hue !== 'number' ||
-          typeof r.sat !== 'number'
-        )
-          return { error: `layer ${L}: bad led entry` };
-        leds[L].push({ kk: r.kk, h: r.hue, s: r.sat, offset: -1 });
-      }
-    }
-    layers.push(L);
-  }
-  if (layers.length === 0) return { error: 'export holds no layers' };
-  const notes = mode === 'keys' ? pickNotes(doc.notes, layers) : undefined;
-  return notes ? { keys, leds, layers, notes } : { keys, leds, layers };
-}
-
-/** Parse an unknown JSON value into per-layer key/LED maps, or an error. */
-export function parseSnapshotFile(obj: unknown): SnapMaps | { error: string } {
+/** Parse an unknown JSON value into per-layer key/LED maps + per-layer
+ * animation indices, or an error. Peek guards run BEFORE the deep parse
+ * (UHK pattern), most actionable first:
+ * 1. a future OpenFlow file version → tell the user to update the app;
+ * 2. legacy snapshot markers → clean-break error naming the re-export path;
+ * 3. any kind other than "layer" → unsupported.
+ * A doc passing all three is delegated to parseOpenFlowLayer; its single
+ * anim index is re-keyed by the doc's layer for the whole-file shape. */
+export function parseSnapshotFile(obj: unknown): ParseFileResult {
   if (!isObj(obj)) return { error: 'not a JSON object' };
-  if (obj.tool === 'naya-backup') {
-    if (!isObj(obj.keymap) || !isObj(obj.ledmap))
-      return { error: 'naya-backup snapshot missing keymap/ledmap' };
-    const keys: KeyRec[][] = [[], [], []];
-    const leds: LedRec[][] = [[], [], []];
-    const layers: number[] = [];
-    for (const L of [0, 1, 2]) {
-      const kh = obj.keymap[String(L)];
-      const lh = obj.ledmap[String(L)];
-      if (kh === undefined && lh === undefined) continue;
-      if (typeof kh !== 'string' || typeof lh !== 'string')
-        return { error: `layer ${L}: keymap/ledmap must both be hex strings` };
-      const kb = hexToBytes(kh);
-      const lb = hexToBytes(lh);
-      if (!kb || !lb) return { error: `layer ${L}: bad hex` };
-      keys[L] = parseLayer(kb).recs;
-      leds[L] = parseLedmap(lb).recs;
-      layers.push(L);
-    }
-    if (layers.length === 0) return { error: 'snapshot holds no layers' };
-    return { keys, leds, layers };
-  }
-  if (obj.tool === 'naya-reflow' && typeof obj.kind === 'string') {
-    // Peek-version guard (UHK pattern): read the version before any deep
-    // parse — files from a newer app fail with an actionable message
-    // instead of a cryptic shape error further down. Old files without a
-    // version field are schema v1.
-    const v = typeof obj.v === 'number' ? obj.v : 1;
-    if (v > SNAPSHOT_VERSION)
-      return {
-        error: `schema v${v} is newer than this app supports (v${SNAPSHOT_VERSION}) — update naya-reflow`,
-      };
-    const doc = (v < SNAPSHOT_VERSION ? migrateSnapshot(obj) : obj) as Record<string, unknown>;
-    if (doc.kind === 'naya-full-backup') {
-      if (!isObj(doc.keys) || !isObj(doc.leds))
-        return { error: 'backup missing keys/leds docs' };
-      const kv = parseExportLayers(doc.keys as Record<string, unknown>, 'keys');
-      if ('error' in kv) return kv;
-      const lv = parseExportLayers(doc.leds as Record<string, unknown>, 'leds');
-      if ('error' in lv) return lv;
-      const layers = [...new Set([...kv.layers, ...lv.layers])].sort((a, b) => a - b);
-      return {
-        keys: kv.keys,
-        leds: lv.leds,
-        layers,
-        ...(kv.notes ? { notes: kv.notes } : {}),
-      };
-    }
-    const isKeys = (doc.kind as string).startsWith('keymap');
-    const isLeds = (doc.kind as string).startsWith('ledmap');
-    if (!isKeys && !isLeds) return { error: `unknown kind '${doc.kind}'` };
-    return parseExportLayers(doc, isKeys ? 'keys' : 'leds');
-  }
-  return { error: `unknown file (tool=${String((obj as Record<string, unknown>).tool)})` };
+  if (typeof obj.version === 'number' && obj.version > 1)
+    return {
+      error: `OpenFlow file version ${obj.version} is newer than this app supports (version 1) — update naya-reflow`,
+    };
+  if (obj.tool === 'naya-backup' || obj.tool === 'naya-reflow' || obj.kind === 'naya-full-backup')
+    return {
+      error:
+        'legacy snapshot format removed (clean break, 2026-10) — re-export the layer as an OpenFlow .openflow-layer.json file or restore an auto-backup',
+    };
+  if (obj.kind !== 'layer')
+    return { error: 'unsupported kind — this app reads kind:"layer" files only' };
+  const r = parseOpenFlowLayer(obj);
+  if ('error' in r) return r;
+  return {
+    maps: r.maps,
+    anims: r.anim === null ? {} : { [r.maps.layers[0]]: r.anim },
+    warnings: r.warnings,
+  };
 }
 
 export interface DiffResult {

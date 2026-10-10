@@ -325,9 +325,10 @@ export function parseOpenFlowLayer(
 
 /* ---- Export: one layer's caches → OpenFlow layer doc (spec §3) ---- */
 
-/** Whole-file export envelope. Moved here from exporters.ts (its old home is
- * deleted in a later task); counts keys are 'keys' (non-empty binding keys),
- * 'leds' (colorHex emitted), 'unknown' (records dropped as unexportable). */
+/** Whole-file export envelope. Moved here from exporters.ts (deleted in
+ * the legacy-snapshot clean break); counts keys are 'keys' (non-empty
+ * binding keys), 'leds' (colorHex emitted), 'unknown' (records dropped
+ * as unexportable). */
 export interface ExportResult {
   fileName: string;
   data: unknown;
