@@ -24,12 +24,12 @@ import { ANIM_NAMES } from './settings';
 import type { SnapMaps } from './importers';
 
 /** Deterministic per-layer UUIDs (ours): layer L uses index L. Fixed so
- * exports are stable and layerRefs always resolve without any storage. */
-export const OF_LAYER_UUIDS = [
-  '6e726600-0000-4000-8000-000000000000',
-  '6e726600-0000-4000-8000-000000000001',
-  '6e726600-0000-4000-8000-000000000002',
-] as const;
+ * exports are stable and layerRefs always resolve without any storage.
+ * 8 entries — the app's layer window (the board stores layers 0..7). */
+export const OF_LAYER_UUIDS: string[] = Array.from(
+  { length: 8 },
+  (_, L) => '6e726600-0000-4000-8000-00000000000' + L,
+);
 
 /** Whole-file result shape consumed by the importers/backups wrappers
  * (anims keyed by layer index). Defined here so later tasks share one type. */
@@ -107,9 +107,9 @@ function resolveBinding(
         warnings.push(`key ${pos}: MO_LAYER_ ref ${uuid} not in layerRefs — binding skipped`);
         return null;
       }
-      if (target !== 1 && target !== 2) {
+      if (target < 1 || target > 7) {
         warnings.push(
-          `key ${pos}: MO_LAYER_ target layer ${target} invalid (0 = self; only layers 1 and 2 are writable targets) — binding skipped`,
+          `key ${pos}: MO_LAYER_ target layer ${target} invalid (0 = self; writable targets are 1-7) — binding skipped`,
         );
         return null;
       }
@@ -211,8 +211,8 @@ export function parseOpenFlowLayer(
   if (!isObj(obj.layer)) return { error: 'OpenFlow layer doc missing the layer object' };
   const layer = obj.layer;
   const L = layer.orderId;
-  if (typeof L !== 'number' || !Number.isInteger(L) || L < 0 || L > 2)
-    return { error: `orderId ${String(L)} out of range — device layers are 0..2` };
+  if (typeof L !== 'number' || !Number.isInteger(L) || L < 0 || L > 7)
+    return { error: `layer index ${String(L)} is outside this app's window (0-7)` };
   if (!Array.isArray(layer.keys)) return { error: 'layer.keys missing or not an array' };
   if (obj.layerRefs !== undefined && obj.layerRefs !== null && !isObj(obj.layerRefs))
     return { error: 'layerRefs malformed (expected an object mapping uuid → layer index)' };
@@ -326,8 +326,8 @@ export function parseOpenFlowLayer(
   if (Array.isArray(obj.macros) && obj.macros.length > 0)
     warnings.push(`skipped ${obj.macros.length} macro(s) — host-side only, firmware discards macro writes`);
 
-  const keys: KeyRec[][] = [[], [], []];
-  const leds: LedRec[][] = [[], [], []];
+  const keys: KeyRec[][] = Array.from({ length: 8 }, () => [] as KeyRec[]);
+  const leds: LedRec[][] = Array.from({ length: 8 }, () => [] as LedRec[]);
   for (const item of parsed) {
     for (const rec of item.records)
       keys[L].push({ kk: rec[0], t: rec[1], rec, offset: keys[L].length });
@@ -428,13 +428,17 @@ function bindingsFor(recs: KeyRec[], kk: number, counts: Record<string, number>)
  * timestamps — two calls with equal inputs are deep-equal. Keys array is
  * exactly 97 entries ordered by positionId; strips (74–87) and bays (88–96)
  * are emitted with empty bindings and NO colorHex field (parse ignores
- * colorHex there, so no placeholder is written). */
+ * colorHex there, so no placeholder is written). Throws when layer is
+ * outside the app's window 0..7 — an out-of-window srcId would produce a
+ * doc no import can ever resolve. */
 export function buildOpenFlowLayer(
   keys: KeyRec[],
   leds: LedRec[],
   layer: number,
   animId: string | null,
 ): ExportResult {
+  if (!Number.isInteger(layer) || layer < 0 || layer > 7)
+    throw new Error(`layer index ${layer} is outside this app's window (0-7)`);
   const counts: Record<string, number> = { keys: 0, leds: 0, unknown: 0 };
   const ledByKk = new Map<number, LedRec>();
   for (const l of leds) if (!ledByKk.has(l.kk)) ledByKk.set(l.kk, l);

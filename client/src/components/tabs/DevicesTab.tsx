@@ -13,6 +13,7 @@ const SECTION_LABEL: Record<Section, string> = {
   led: "LED map",
   modules: "Modules",
   behavior: "Behavior",
+  layers: "Layers",
 };
 
 export default function DevicesTab({

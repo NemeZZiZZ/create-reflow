@@ -22,7 +22,7 @@ export interface LedOp {
   s: number;
 }
 
-export type Section = 'bindings' | 'led' | 'modules' | 'behavior';
+export type Section = 'bindings' | 'led' | 'modules' | 'behavior' | 'layers';
 
 export interface KeySetOp {
   kind: 'keyset';
@@ -44,7 +44,17 @@ export interface ModuleOp {
   payload: Uint8Array; // full record incl. slot byte
   label: string;
 }
-export type Op = KeyOp | LedOp | KeySetOp | SettingsOp | ModuleOp;
+export interface LayerListOp {
+  kind: 'layers';
+  payload: Uint8Array; // frame params from encodeLayerListAdd/encodeLayerListDelete
+  label: string; // entry counts ride in the label set at queue time
+}
+export type Op = KeyOp | LedOp | KeySetOp | SettingsOp | ModuleOp | LayerListOp;
+
+/** Lowercase hex without spaces — compact stable form of a payload for opKey. */
+function payloadHex(u8: Uint8Array): string {
+  return Array.from(u8, (b) => b.toString(16).padStart(2, '0')).join('');
+}
 
 export function opKey(o: Op): string {
   switch (o.kind) {
@@ -63,15 +73,21 @@ export function opKey(o: Op): string {
       return `settings:${o.path}:${o.payload[0] ?? 0}`;
     case 'module':
       return `module:${o.layer}:${o.slot}:${toHex(o.payload)}`;
+    case 'layers':
+      // Payload-addressed: an identical wire payload is the same edit
+      // (latest wins); different payloads (add vs delete, two adds)
+      // coexist as separate frames sent in queue order.
+      return `layers:${payloadHex(o.payload)}`;
   }
 }
 
-export const SECTIONS: Section[] = ['bindings', 'led', 'modules', 'behavior'];
+export const SECTIONS: Section[] = ['bindings', 'led', 'modules', 'behavior', 'layers'];
 export const SECTION_LABELS: Record<Section, string> = {
   bindings: 'Bindings',
   led: 'LED Map',
   modules: 'Modules',
   behavior: 'Behavior',
+  layers: 'Layers',
 };
 
 export function opSection(o: Op): Section {
@@ -85,6 +101,8 @@ export function opSection(o: Op): Section {
       return 'modules';
     case 'settings':
       return o.path === 'ed/1011' ? 'led' : 'behavior';
+    case 'layers':
+      return 'layers';
   }
 }
 
@@ -169,7 +187,7 @@ export class Draft {
         if (!cur) return true;
         return !(cur.h === o.h && cur.s === o.s);
       }
-      return true; // settings/module: no readback — kept until flash ACKs
+      return true; // settings/module/layers: no readback — kept until flash ACKs
     });
     return before - this.ops.length;
   }
@@ -192,6 +210,9 @@ export class Draft {
           frames += 1;
         }
       } else if (o.kind === 'settings') {
+        bytes += 10 + o.payload.length;
+        frames += 1;
+      } else if (o.kind === 'layers') {
         bytes += 10 + o.payload.length;
         frames += 1;
       } else {
@@ -224,5 +245,8 @@ export function opSummary(o: Op): string {
       return `${o.path} → ${o.label}`;
     case 'module':
       return `L${o.layer} slot ${o.slot} → ${o.label}`;
+    case 'layers':
+      // Entry counts ride in the label (set at queue time).
+      return o.label;
   }
 }

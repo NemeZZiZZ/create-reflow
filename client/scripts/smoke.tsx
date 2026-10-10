@@ -14,8 +14,8 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { keyIconName, shortLabel } from '../src/lib/key-icon-map';
 import { ACTIONS, buildRecord, findAction, matchAction } from '@create-reflow/sdk';
-import { Draft, opKey, opSection, opSummary } from '@create-reflow/sdk';
-import type { KeySetOp } from '@create-reflow/sdk';
+import { Draft, opKey, opSection, opSummary, SECTIONS, SECTION_LABELS } from '@create-reflow/sdk';
+import type { KeySetOp, LayerListOp } from '@create-reflow/sdk';
 import type { KeyRec, LedRec } from '@create-reflow/sdk';
 import { parseSnapshotFile, diffSnapshotToDraft, hexToBytes } from '@create-reflow/sdk';
 import type { SnapMaps } from '@create-reflow/sdk';
@@ -39,6 +39,7 @@ import {
   uuidToBytes, bytesToUuid, mintLayerUuid,
 } from '@create-reflow/sdk';
 import type { LayerEntry } from '@create-reflow/sdk';
+import { queueLayerAdd, queueLayerDelete } from '@create-reflow/sdk';
 
 let n = 0;
 function eq(a: unknown, b: unknown, name: string) {
@@ -1413,7 +1414,10 @@ import { queueAction } from '@create-reflow/sdk';
   };
   eq(
     OF_LAYER_UUIDS.join(','),
-    '6e726600-0000-4000-8000-000000000000,6e726600-0000-4000-8000-000000000001,6e726600-0000-4000-8000-000000000002',
+    '6e726600-0000-4000-8000-000000000000,6e726600-0000-4000-8000-000000000001,' +
+      '6e726600-0000-4000-8000-000000000002,6e726600-0000-4000-8000-000000000003,' +
+      '6e726600-0000-4000-8000-000000000004,6e726600-0000-4000-8000-000000000005,' +
+      '6e726600-0000-4000-8000-000000000006,6e726600-0000-4000-8000-000000000007',
     '48 layer uuids deterministic',
   );
   const r = parseOpenFlowLayer(doc);
@@ -1480,8 +1484,8 @@ import { queueAction } from '@create-reflow/sdk';
   eq('error' in eV3 && /version 3 is newer/.test(eV3.error), true, '48 version 3 rejected as newer');
   const eKind = parseOpenFlowLayer({ ...doc, kind: 'profile' });
   eq('error' in eKind && /unsupported kind/.test(eKind.error), true, '48 kind profile rejected');
-  const eOrder = parseOpenFlowLayer({ ...doc, layer: { ...doc.layer, orderId: 3 } });
-  eq('error' in eOrder && /orderId/.test(eOrder.error), true, '48 orderId 3 rejected');
+  const eOrder = parseOpenFlowLayer({ ...doc, layer: { ...doc.layer, orderId: 8 } });
+  eq('error' in eOrder && /window/.test(eOrder.error), true, '48 orderId 8 rejected (window 0-7)');
   const eKeys = parseOpenFlowLayer({ version: 1, kind: 'layer', layer: { orderId: 1 } });
   eq('error' in eKeys && /keys/.test(eKeys.error), true, '48 missing keys rejected');
   // Final-review regression: a consumer-page base used to be embedded into
@@ -1909,6 +1913,348 @@ import { queueAction } from '@create-reflow/sdk';
   const m51b = mintLayerUuid();
   eq(/^[0-9a-f]{32}$/.test(m51a), true, '51 mint uuid shape');
   eq(m51a !== m51b, true, '51 mint uuid unique');
+  // Draft op kind 'layers': carries a pre-encoded payload from the layer
+  // encoders; keyed by payload hex so identical edits dedup while add and
+  // delete (different payloads) coexist in one flash plan.
+  const pAdd51 = encodeLayerListAdd(add51);
+  const pDel51 = encodeLayerListDelete([3, 4]);
+  const d51 = new Draft();
+  d51.add({ kind: 'layers', payload: pAdd51, label: 'Add 2 layers' });
+  d51.add({ kind: 'layers', payload: pDel51, label: 'Delete 2 layers' });
+  eq(d51.size, 2, '51 layer add + delete coexist');
+  eq(
+    opKey(d51.ops[0]),
+    'layers:' + Array.from(pAdd51, (b) => b.toString(16).padStart(2, '0')).join(''),
+    '51 opKey layers:<hex payload>',
+  );
+  d51.add({ kind: 'layers', payload: pAdd51, label: 'Add 2 layers (again)' });
+  eq(d51.size, 2, '51 identical layer payload dedups');
+  eq(d51.ops[0].label, 'Add 2 layers (again)', '51 layer dedup keeps latest');
+  eq(opSection(d51.ops[0]) === 'layers', true, '51 opSection → layers');
+  const st51 = d51.stats();
+  eq(st51.frames, 2, '51 stats frames count layer ops');
+  eq(st51.bytes, 20 + pAdd51.length + pDel51.length, '51 stats bytes = 10 + payload per op');
+  eq(opSummary(d51.ops[1]), 'Delete 2 layers', '51 opSummary prints label');
+  // No readback path for layer lists — reconcile leaves them alone; the
+  // flash executor drops them right after ACK (like settings/module).
+  const d51r = new Draft();
+  d51r.add({ kind: 'layers', payload: pAdd51, label: 'Add 2 layers' });
+  eq(d51r.reconcile([[], [], []], [[], [], []]), 0, '51 reconcile drops nothing for layers');
+  eq(d51r.size, 1, '51 layer op survives reconcile');
+  eq(SECTIONS.includes('layers'), true, '51 SECTIONS includes layers');
+  eq(SECTION_LABELS.layers, 'Layers', '51 SECTION_LABELS.layers = Layers');
+}
+
+// §52 OpenFlow layer window 0..7 (Phase 2: the board stores 8 layer slots)
+{
+  const bind52 = (behavior: string, actionType: string, actionCode: string) => ({
+    behavior,
+    actionType,
+    actionCode,
+    context: null,
+  });
+  const doc52 = (
+    orderId: number,
+    keys: { positionId: number; colorHex: null; bindings: ReturnType<typeof bind52>[] }[],
+    layerRefs: Record<string, number>,
+  ) => ({
+    version: 1,
+    kind: 'layer',
+    layer: {
+      srcId: OF_LAYER_UUIDS[orderId] ?? 'unset',
+      name: 'Layer ' + orderId,
+      orderId,
+      iconId: null,
+      animationId: 'solid',
+      keys,
+    },
+    macros: [] as unknown[],
+    layerRefs,
+  });
+
+  // 8 deterministic uuids — same pattern as Phase 1, now ...000 through ...007.
+  eq(
+    OF_LAYER_UUIDS.join(','),
+    '6e726600-0000-4000-8000-000000000000,6e726600-0000-4000-8000-000000000001,' +
+      '6e726600-0000-4000-8000-000000000002,6e726600-0000-4000-8000-000000000003,' +
+      '6e726600-0000-4000-8000-000000000004,6e726600-0000-4000-8000-000000000005,' +
+      '6e726600-0000-4000-8000-000000000006,6e726600-0000-4000-8000-000000000007',
+    '52 8 layer uuids, pattern 000..007',
+  );
+  // Window widened: orderId 5 parses, records land in keys[5].
+  const r52 = parseOpenFlowLayer(
+    doc52(5, [{ positionId: 0, colorHex: null, bindings: [bind52('press', 'key', 'A')] }], {}),
+  );
+  eq(
+    !('error' in r52) &&
+      r52.maps.layers.join(',') === '5' &&
+      r52.maps.keys[5].length === 1 &&
+      toHex(r52.maps.keys[5][0].rec) === '00 01 04 04 00 07 00',
+    true,
+    '52 orderId 5 parses → layers [5], keys[5]',
+  );
+  // Window edge: orderId 7 still parses.
+  const r7 = parseOpenFlowLayer(doc52(7, [], {}));
+  eq(!('error' in r7) && r7.maps.layers[0] === 7, true, '52 orderId 7 parses (window edge)');
+  // Beyond the window: actionable error naming the app's window.
+  const e8 = parseOpenFlowLayer(doc52(8, [], {}));
+  eq(
+    'error' in e8 && /layer index 8 is outside this app's window \(0-7\)/.test(e8.error),
+    true,
+    '52 orderId 8 rejected with window error',
+  );
+  const eNeg = parseOpenFlowLayer(doc52(-1, [], {}));
+  eq('error' in eNeg && /window \(0-7\)/.test(eNeg.error), true, '52 orderId -1 rejected');
+  // Build side: a layer-5 doc carries the pattern uuid as srcId.
+  const b5 = buildOpenFlowLayer([], [], 5, null);
+  const b5d = b5.data as { layer: { srcId: string; orderId: number } };
+  eq(
+    b5.fileName === 'Layer_5.openflow-layer.json' &&
+      b5d.layer.srcId === '6e726600-0000-4000-8000-000000000005' &&
+      b5d.layer.orderId === 5,
+    true,
+    '52 build layer 5 → srcId ...005 pattern',
+  );
+  // layerRefs {uuid: 5} resolves a MO_LAYER_ ref to special ORDER 5.
+  const mo5 = parseOpenFlowLayer(
+    doc52(
+      0,
+      [
+        {
+          positionId: 3,
+          colorHex: null,
+          bindings: [bind52('press', 'layer_polite_hold', 'MO_LAYER_' + OF_LAYER_UUIDS[5])],
+        },
+      ],
+      { [OF_LAYER_UUIDS[5]]: 5 },
+    ),
+  );
+  eq(
+    !('error' in mo5) &&
+      mo5.maps.keys[0].length === 1 &&
+      toHex(mo5.maps.keys[0][0].rec) === '03 05 04 05 00 00 00',
+    true,
+    '52 layerRefs {uuid5:5} → MO resolves to T05 ORDER 5',
+  );
+  // Targets outside 1..7 stay skipped (0 = self; 8+ beyond the window) with
+  // a named warning.
+  const moBad = parseOpenFlowLayer(
+    doc52(
+      0,
+      [
+        {
+          positionId: 3,
+          colorHex: null,
+          bindings: [bind52('press', 'layer_polite_hold', 'MO_LAYER_' + OF_LAYER_UUIDS[3])],
+        },
+        {
+          positionId: 4,
+          colorHex: null,
+          bindings: [bind52('press', 'layer_polite_hold', 'MO_LAYER_' + OF_LAYER_UUIDS[4])],
+        },
+      ],
+      { [OF_LAYER_UUIDS[3]]: 8, [OF_LAYER_UUIDS[4]]: 0 },
+    ),
+  );
+  const wBad = 'error' in moBad ? '' : moBad.warnings.join('\n');
+  eq(
+    !('error' in moBad) &&
+      moBad.maps.keys[0].length === 0 &&
+      /target layer 8 invalid/.test(wBad) &&
+      /target layer 0 invalid/.test(wBad) &&
+      /writable targets are 1-7/.test(wBad),
+    true,
+    '52 MO targets 8 and 0 → skipped, window warning',
+  );
+  // Build refuses beyond the window explicitly (closes the Phase-1 minor).
+  let msg52: string | null = null;
+  try {
+    buildOpenFlowLayer([], [], 8, null);
+  } catch (e) {
+    msg52 = e instanceof Error ? e.message : String(e);
+  }
+  eq(
+    msg52 !== null && /layer index 8 is outside this app's window \(0-7\)/.test(msg52),
+    true,
+    '52 build layer 8 throws window error',
+  );
+  // Roundtrip at layer 4: build → parse is byte-equal (records, led, anim).
+  const recs52: KeyRec[] = [];
+  const push52 = (kk: number, rec: Uint8Array) =>
+    recs52.push({ kk, t: rec[1], rec, offset: recs52.length });
+  push52(0, plainRecord(0, 0x04)); // T01 A
+  push52(7, t03Record(7, 0x05, 0x04)); // T03 hold B / tap A
+  push52(9, t10Primary(9, 0x07, 0x06)); // T10 hold D / tap C
+  push52(0x5b, t10ShadowMini(9, 0x08)); // double E
+  push52(0x4b, new Uint8Array(TAIL_T10));
+  const leds52: LedRec[] = [{ kk: 1, h: 30, s: 100, offset: 0 }];
+  const b4 = buildOpenFlowLayer(recs52, leds52, 4, 'breathe');
+  const p4 = parseOpenFlowLayer(JSON.parse(JSON.stringify(b4.data)));
+  eq(
+    !('error' in p4) && p4.maps.layers.join(',') === '4',
+    true,
+    '52 layer-4 roundtrip parses → layers [4]',
+  );
+  eq(
+    !('error' in p4) &&
+      recs52.every((x) => {
+        const got = p4.maps.keys[4].find((k) => k.kk === x.kk);
+        return got !== undefined && toHex(got.rec) === toHex(x.rec);
+      }),
+    true,
+    '52 layer-4 roundtrip records byte-equal',
+  );
+  eq(
+    !('error' in p4) &&
+      p4.maps.leds[4].length === 1 &&
+      p4.maps.leds[4][0].h === 30 &&
+      p4.maps.leds[4][0].s === 100 &&
+      p4.anim === 1,
+    true,
+    '52 layer-4 roundtrip led + anim',
+  );
+  // Layer 0 (self-doc layer) is inside the window on both directions.
+  const b0 = buildOpenFlowLayer([], [], 0, null);
+  const p0 = parseOpenFlowLayer(JSON.parse(JSON.stringify(b0.data)));
+  eq(
+    (b0.data as { layer: { srcId: string } }).layer.srcId ===
+      '6e726600-0000-4000-8000-000000000000' &&
+      !('error' in p0) &&
+      p0.maps.layers[0] === 0,
+    true,
+    '52 build layer 0 works + reparses',
+  );
+}
+
+// §53 layer add/delete queue helpers
+{
+  const u53 = '878610a4c7434723a59932655479dee2';
+  // Add: ONE layers op, payload = single-entry encodeLayerListAdd.
+  const d53 = new Draft();
+  const a53 = queueLayerAdd(d53, 3, u53);
+  eq(a53.queued, true, '53 add queued');
+  eq(d53.size, 1, '53 add → exactly one op');
+  eq(d53.ops[0].kind === 'layers', true, '53 add op kind layers');
+  const lop53 = d53.ops[0] as LayerListOp;
+  eq(
+    toHex(lop53.payload),
+    toHex(encodeLayerListAdd([{ idx: 3, uuid: u53, animStored: 0 }])),
+    '53 add payload = single-entry encode',
+  );
+  eq(lop53.label, 'add layer 3 (Solid)', '53 add label default Solid');
+  // Anim name resolves through storedAnimOf.
+  const d53b = new Draft();
+  queueLayerAdd(d53b, 4, u53, 'Breathe');
+  eq(
+    toHex((d53b.ops[0] as LayerListOp).payload),
+    toHex(encodeLayerListAdd([{ idx: 4, uuid: u53, animStored: 1 }])),
+    '53 Breathe → anim byte 1',
+  );
+  eq((d53b.ops[0] as LayerListOp).label, 'add layer 4 (Breathe)', '53 Breathe label');
+  // Unknown anim name: refused, nothing queued (no byte-255 garbage).
+  const d53c = new Draft();
+  const badAnim53 = queueLayerAdd(d53c, 4, u53, 'Nope');
+  eq(badAnim53.queued === false && !!badAnim53.error, true, '53 unknown anim refused');
+  eq(d53c.size, 0, '53 unknown anim queues nothing');
+  // Window guard: idx must sit in 0..7 (same wording as the OpenFlow window).
+  const d53d = new Draft();
+  const g853 = queueLayerAdd(d53d, 8, u53);
+  eq(
+    g853.queued === false && /window \(0-7\)/.test(g853.error ?? ''),
+    true,
+    '53 add idx 8 → window error',
+  );
+  eq(queueLayerAdd(d53d, -1, u53).queued, false, '53 add idx -1 refused');
+  eq(d53d.size, 0, '53 add guard queues nothing');
+  // Two adds with different uuids → different payloads → coexist.
+  const d53e = new Draft();
+  queueLayerAdd(d53e, 3, u53);
+  queueLayerAdd(d53e, 4, '05a59817d3a442df9b959d5f85067603');
+  eq(d53e.size, 2, '53 two adds coexist');
+  // Delete: the layers op goes FIRST, then the layer's keymap span is
+  // blanked via ONE keyset op of [pos][07][00] fillers (absent-satisfied
+  // in reconcile), then h0 s0 per known LED kk — a re-add can't inherit
+  // ghosts (OF F:888-896 semantics).
+  const keys53: KeyRec[] = [];
+  for (let kk = 0; kk < 74; kk++)
+    keys53.push({ kk, t: 1, rec: plainRecord(kk, 0x04), offset: kk });
+  const leds53: LedRec[] = [
+    { kk: 1, h: 30, s: 100, offset: 0 },
+    { kk: 5, h: 0, s: 0, offset: 1 },
+    { kk: 9, h: 200, s: 50, offset: 2 },
+  ];
+  const d53f = new Draft();
+  const del53 = queueLayerDelete(d53f, 2, keys53, leds53, 156, 3);
+  eq(del53.queued, true, '53 delete queued');
+  eq(
+    del53.frames,
+    1 + 156 + 3,
+    '53 delete frames = 1 layers + 156 filler recs + 3 leds',
+  );
+  eq(d53f.ops[0].kind === 'layers', true, '53 delete layers op comes first');
+  const dlop53 = d53f.ops[0] as LayerListOp;
+  eq(
+    toHex(dlop53.payload),
+    toHex(encodeLayerListDelete([2])),
+    '53 delete payload = encodeLayerListDelete([2])',
+  );
+  eq(dlop53.label, 'delete layer 2', '53 delete label');
+  eq(
+    dlop53.payload.length === 9 && dlop53.payload[1] === 2 && dlop53.payload[5] === 2,
+    true,
+    '53 delete ×2 repeat pattern present',
+  );
+  const ks53 = d53f.ops.find((o): o is KeySetOp => o.kind === 'keyset');
+  eq(ks53 !== undefined, true, '53 blank keyset op present');
+  eq(ks53?.layer, 2, '53 blank keyset on deleted layer');
+  // Record count from the op itself (each filler is 3 bytes) — NOT
+  // draft.stats frames, which count per-record frames.
+  eq(ks53?.records.length, 156, '53 blank covers totalKeys slots (156 > 150)');
+  eq(
+    ks53?.records.every((r) => r.length === 3 && r[1] === 0x07 && r[2] === 0x00),
+    true,
+    '53 blanks are [pos][07][00] fillers',
+  );
+  eq(
+    keys53.every((k) => ks53?.records.some((r) => r[0] === k.kk) ?? false),
+    true,
+    '53 every known key kk blanked',
+  );
+  const w53 = d53f.ops.filter((o) => o.kind === 'led');
+  eq(w53.length, 3, '53 led wipe count = leds.length');
+  eq(
+    w53.every((o) => o.kind === 'led' && o.layer === 2 && o.h === 0 && o.s === 0),
+    true,
+    '53 led wipe h0 s0 on layer 2',
+  );
+  eq(
+    leds53.every((l) => w53.some((o) => o.kind === 'led' && o.kk === l.kk)),
+    true,
+    '53 led wipe per known kk',
+  );
+  // Only-layer guard: fires only when the caller passes layerCount.
+  const d53g = new Draft();
+  const one53 = queueLayerDelete(d53g, 0, keys53, leds53, 156, 1);
+  eq(
+    one53.queued === false &&
+      one53.error === 'cannot delete the only layer' &&
+      one53.frames === 0,
+    true,
+    '53 only-layer guard fires',
+  );
+  eq(d53g.size, 0, '53 only-layer guard queues nothing');
+  const d53h = new Draft();
+  eq(queueLayerDelete(d53h, 0, [], [], 156).queued, true, '53 guard only when layerCount given');
+  // Add + delete coexist in one draft (payload-addressed ops).
+  const d53i = new Draft();
+  queueLayerAdd(d53i, 5, u53);
+  queueLayerDelete(d53i, 2, keys53, leds53, 156, 3);
+  eq(
+    d53i.ops[0].kind === 'layers' && (d53i.ops[1] as LayerListOp).label === 'delete layer 2',
+    true,
+    '53 coexist: both layers ops kept',
+  );
+  eq(d53i.size, 6, '53 coexist total ops = 2 layers + 1 keyset + 3 leds');
 }
 
 void main();
