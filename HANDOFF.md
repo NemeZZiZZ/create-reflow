@@ -24,9 +24,12 @@ pnpm workspace (pnpm 10.33.0), two packages:
   T01/T03/T05/T10 + `behaviorMetaOf` unknown-byte preservation), `actions.ts`
   (action catalog), `draft.ts` (op queue + reconcile), `queue.ts` (selection
   → ops), `settings.ts` (ED settings ops), `modules.ts` (30/100c gestures),
-  `flavors.ts` (flavor byte map), `importers/exporters` (snapshot schema
-  **v2**, `SNAPSHOT_VERSION`, migrations, peek-guards), `backups.ts`
-  (localStorage auto-backups, max 20, content-hash dedupe), `aux.ts`
+  `flavors.ts` (flavor byte map), `openflow.ts` (OpenFlow layer-doc
+  parse/build, host-table name resolution), `importers.ts` (OpenFlow-only
+  file parse with peek-guards; legacy snapshot formats rejected — clean
+  break 2026-10, no schema migrations), `backups.ts`
+  (localStorage auto-backups, max 20, content-hash dedupe, internal
+  container around OpenFlow layer docs), `aux.ts`
   (per-half telemetry), `palette-groups.ts`, `troubleshooting/` (12 recipes,
   hybrid `steps|run(ctx)` plugins + `assertWireAllowed` runtime guard).
   Barrel: `src/index.ts`. Source-dist (no build step).
@@ -67,8 +70,9 @@ Reading order for a new agent (each item assumes the previous):
   imports it from source via the workspace. Edit model: UI mutation → op in
   `Draft` (`draft.ts`: sections/dedup/stats) → FlashDialog → `queue.ts`
   turns ops into wire writes (`30/1004` …) → readback verify. **No
-  `fe/100a` commit is ever sent.** Snapshots: `importers`/`exporters`
-  schema v2; `backups.ts` auto-saves to localStorage; `troubleshooting/` =
+  `fe/100a` commit is ever sent.** Snapshots: OpenFlow layer docs
+  (`openflow.ts`/`importers.ts`, clean break 2026-10); `backups.ts`
+  auto-saves to localStorage; `troubleshooting/` =
   recipe engine + `assertWireAllowed` guard.
 
 ### Adding a feature end-to-end
@@ -90,7 +94,7 @@ Reading order for a new agent (each item assumes the previous):
 ```sh
 pnpm build                                                  # tsc -b && vite build
 ./node_modules/.bin/rolldown --config scripts/rolldown.smoke.mjs   # MUST exit 0
-node /tmp/smoke.cjs                                         # 426 ok / 0 FAIL today; grows with §-sections — trust 0 FAIL
+node /tmp/smoke.cjs                                         # assert count grows with §-sections — the gate is 0 FAIL
 ./node_modules/.bin/oxlint <touched client files>           # client files (from client/)
 pnpm --filter @create-reflow/sdk lint                       # sdk files (oxlint src, in-package — avoids the .. rule)
 pnpm --filter @create-reflow/sdk build                      # tsc --noEmit
@@ -152,11 +156,43 @@ exit codes (`cmd | tail; echo $?` shows tail's) — redirect to a file instead.
 
 - Commits are LOCAL until the owner orders a push. Stage EXPLICIT paths
   (never `git add -A` — the checkout may contain owner's untracked files).
-- Smoke is the SDK's public-API test (426 asserts; §-numbered). New features
+- Smoke is the SDK's public-API test (assert count grows with §-sections;
+  §-numbered). New features
   get new §-sections; helpers inside a §-block are block-scoped.
 - UX language of the app is English. UI copy: calm, footgun hints preferred
   over modals. Existing patterns: shadcn-style `ui/`, structural selectors
   for tests, `KeyActionMenu` reused for popover AND panel.
+
+## Native format — OpenFlow JSON (since 2026-10-10)
+
+Save, Import, and auto-backups all speak the OpenFlow layer format
+(`version: 1`, `kind: 'layer'`, `.openflow-layer.json`) — the in-house
+snapshot schema is gone (clean break). Core: `sdk/src/openflow.ts` (parse +
+build, host-table name resolution); file gate: `sdk/src/importers.ts`
+(`parseSnapshotFile` peek-guards); backup container: `sdk/src/backups.ts`.
+
+- **Save**: per-layer `Layer N (.openflow-layer.json)` items + `All layers`
+  (SaveMenu); one doc carries keys AND colors; the doc's `animationId` comes
+  from last-known `animByLayer` state, defaulting to `'solid'`.
+- **Import / restore**: OpenFlow layer docs and auto-backups only. Legacy
+  formats (naya-backup, naya-reflow v1/v2, naya-full-backup) are rejected up
+  front with a clean-break error naming the re-export path. Import diffs
+  against the live caches and queues only the changes; when the doc's
+  `animationId` differs from last-known, `ed/1011` anim ops are queued too.
+  Warnings are logged verbatim — partial restore is the point of a subset
+  import (LED strips/bays entries are colors-only, informational).
+- **Auto-backups**: internal container `{tool: 'create-reflow',
+  kind: 'backup', v: 1, layers: [OpenFlow docs], notes}`. Per-key notes ride
+  ONLY there — OpenFlow files never carry them. Legacy localStorage content
+  is wiped once on upgrade; pre-flash backups preserve last-known
+  `animationId`.
+
+Known limitation (binding shape): OpenFlow bindings are
+`{behavior, actionType, actionCode, context: null}` — there is no slot for
+behavior parameters, so term ≠ 200 ms and non-zero unknown flag bytes do NOT
+survive an export→import round-trip; they reset to defaults on import. Also:
+backups created before ff58f42 baked a `'solid'` `animationId` into every
+layer doc.
 
 ## ROADMAP (owner-set priorities, 2026-10-01)
 
@@ -168,9 +204,11 @@ exit codes (`cmd | tail; echo $?` shows tail's) — redirect to a file instead.
 > макросов (макросы — только host-side, навсегда); их схемы
 > `.openflow-profile.json` — ground truth для пункта 1.
 
-1. **Native OpenFlow JSON format** (owner decision: "лучше просто
+1. **Native OpenFlow JSON format** — ✅ DONE 2026-10-10 (commits
+   9678e91..ff58f42 + the docs commit marking this; see "Native format"
+   section above). Owner decision: "лучше просто
    использовать этот формат изначально" — adopt it as the native
-   save/import/export format instead of our own snapshot schema).
+   save/import/export format instead of our own snapshot schema.
    Decoded format (analysis 2026-09-29, sample Layer_0.openflow-layer.json):
    `{version:1, kind:'layer', layer:{srcId, name, orderId, iconId,
    animationId, keys:[{positionId, colorHex, bindings:[{behavior,
@@ -217,5 +255,6 @@ file — owner is choosing (CC BY-SA 4.0 recommended by the previous agent).
   (local-only).
 - Device-state handoff for the right-half agent:
   `~/Repository/naya-reflow/research/HANDOFF-device-state-2026-09-22.md`.
-- Prior art in-repo: `sdk/src/importers.ts` (peek-version guard +
-  migration chain pattern to reuse for any schema v3).
+- Prior art in-repo: `sdk/src/importers.ts` (peek-guard ordering pattern —
+  most actionable error first; the legacy schema-migration chain was removed
+  in the OpenFlow clean break).
