@@ -2776,6 +2776,7 @@ import { queueAction } from '@create-reflow/sdk';
   eq(cs56([0x16, 0x00]), 'ok', '56 chunkStatus 2-byte body is data, not status → ok');
   eq(cs56([0x55]), 'unknown:0x55', '56 chunkStatus bare 0x55 → unknown:0x55');
   eq(cs56([0x2a]), 'unknown:0x2a', '56 chunkStatus bare 0x2a → unknown:0x2a');
+  eq(cs56([0x00]), 'unknown:0x00', '56 chunkStatus bare 0x00 → unknown:0x00 (two-digit pad)');
 }
 
 // End-to-end: drive readMultipart through a scripted device (duplexFake's
@@ -2866,6 +2867,22 @@ void (async () => {
   const unk56 = await ses56.readLedmap(0);
   eq(unk56.blob.length === 0 && unk56.status === 'unknown:0x2a', true,
     '56 bare 0x2a ledmap read → {0B, unknown:0x2a} no throw');
+
+  // Body-less terminal ONLY ([0x00, layer] with zero data bytes): the
+  // stitched blob is 0B — must classify 'empty' (OF parity: body-less
+  // terminal = empty), never surface as an 'ok' 0B blob that trips the
+  // callers' parse-shape tripwires (recs !== 156 / total !== 544).
+  respond56 = (rq) => Uint8Array.from([0x00, rq.payload[1] ?? 0]);
+  const term56 = await ses56.readLayer(2);
+  eq(term56.blob.length === 0 && term56.status === 'empty', true,
+    '56 body-less terminal-only multipart → {0B, empty}');
+
+  // Padding end-to-end: a single bare [0x00] reply reports the status
+  // string exactly 'unknown:0x00' (two hex digits, OF {flag:02x} parity).
+  respond56 = () => Uint8Array.from([0x00]);
+  const pad56 = await ses56.readLayer(3);
+  eq(pad56.status, 'unknown:0x00', '56 bare 0x00 read → status exactly unknown:0x00');
+  eq(pad56.blob.length, 0, '56 bare 0x00 read → 0-byte blob');
 
   await ses56.close();
 

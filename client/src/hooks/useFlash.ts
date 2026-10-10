@@ -291,7 +291,11 @@ export function useFlash({
           .sort((a, b) => a[0] - b[0])
           .map(([L, s]) => `layer ${L} read returned ${s}`)
           .join(', ');
-        const msg = `Flash complete — ${n} op(s) could not be verified (${detail})`;
+        // Fold T3: the layersNack + unverified combo is reachable now that
+        // non-'ok' statuses survive the dump — surface the same note the
+        // partial branch uses instead of dropping it.
+        const note = layersNack ? ' — layer-list write not acked' : '';
+        const msg = `Flash complete — ${n} op(s) could not be verified (${detail})${note}`;
         toast.warning('Flash could not be fully verified', {
           description: msg,
         });

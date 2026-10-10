@@ -22,10 +22,13 @@ export interface LayerDump {
   keys: KeyRec[][];
   leds: LedRec[][];
   /** Read-status taxonomy per layer idx (only layers the inventory loop
-   * visited): 'ok' | 'empty' | 'unsupported' | 'unknown:0x..'. 'empty' =
-   * nothing stored on that layer — a legitimate empty slot, NOT a broken
-   * read; the first non-'ok' classification across that layer's keymap /
-   * LED map read wins so the anomaly stays visible. */
+   * visited): 'ok' | 'empty' | 'unsupported' | 'unknown:0x..' (two hex
+   * digits). 'empty' = nothing stored on that layer — a legitimate empty
+   * slot, NOT a broken read; the first non-'ok' classification across that
+   * layer's keymap / LED map read wins so the anomaly stays visible. A
+   * non-'ok' layer reads as sparse (keys/leds [] at that idx) and never
+   * fails the dump — the status map is how callers (flash verdict) see
+   * it. */
   status: Record<number, string>;
 }
 
@@ -96,10 +99,23 @@ export function useLayers({
           // Multipart reads can desync on a lost frame (parts share the same
           // cmd id): a short blob ends mid-record. parseLayer's invariant is
           // consumed === total, parseLedmap's is a fixed 544B/layer. Anything
-          // else → one full re-read of that layer.
-          const readKeyLayer = async () => {
+          // else → one full re-read of that layer (retry ladder below).
+          // Non-'ok' read statuses never reach those tripwires: the status
+          // IS the layer's answer (blob is 0B), so it is recorded and the
+          // parse is skipped — keys[L]/leds[L] stay [] (sparse) and the
+          // loop CONTINUES, keeping the dump and its status map alive so
+          // the flash verdict can act on it (cannot-verify taxonomy).
+          const readKeyLayer = async ():
+            Promise<ReturnType<typeof parseLayer> | null> => {
             const read = await ses.readLayer(L);
             statusByLayer[L] = read.status;
+            if (read.status !== 'ok') {
+              log(
+                'inf',
+                `layer ${L}: keymap read '${read.status}' — parse skipped, slot stays empty`,
+              );
+              return null;
+            }
             const p = parseLayer(read.blob);
             if (p.consumed !== p.total)
               throw new Error(`keymap ${L} truncated (${p.consumed}/${p.total}B)`);
@@ -113,9 +129,20 @@ export function useLayers({
               );
             return p;
           };
-          const readLedLayer = async () => {
+          const readLedLayer = async ():
+            Promise<ReturnType<typeof parseLedmap> | null> => {
             const lread = await ses.readLedmap(L);
+            // Seeding rule: the LED map read only overwrites an 'ok', so
+            // the FIRST non-'ok' classification across the layer's two
+            // reads wins and the anomaly stays visible.
             if (statusByLayer[L] === 'ok') statusByLayer[L] = lread.status;
+            if (lread.status !== 'ok') {
+              log(
+                'inf',
+                `ledmap ${L}: read '${lread.status}' — parse skipped, LEDs stay empty`,
+              );
+              return null;
+            }
             const lp = parseLedmap(lread.blob);
             if (lp.total !== 544 || lp.total % 4 !== 0)
               throw new Error(`ledmap ${L} bad size (${lp.total}B, want 544)`);
@@ -151,19 +178,25 @@ export function useLayers({
             throw lastErr;
           };
           const p = await withRetry(`layer ${L}`, readKeyLayer);
-          const { recs, consumed, total } = p;
-          keys[L] = recs;
-          keyTotals[L] = total;
-          nKeys += recs.length;
-          log(
-            'inf',
-            `layer ${L}: ${total}B, ${recs.length} records (${consumed}/${total})`,
-          );
+          // null = non-'ok' taxonomy (recorded in statusByLayer, parse
+          // skipped): leave keys[L] sparse and continue with the LED read.
+          if (p) {
+            const { recs, consumed, total } = p;
+            keys[L] = recs;
+            keyTotals[L] = total;
+            nKeys += recs.length;
+            log(
+              'inf',
+              `layer ${L}: ${total}B, ${recs.length} records (${consumed}/${total})`,
+            );
+          }
           const lparsed = await withRetry(`ledmap ${L}`, readLedLayer);
-          leds[L] = lparsed.recs;
-          ledTotals[L] = lparsed.total;
-          nLeds += lparsed.recs.length;
-          log('inf', `ledmap ${L}: ${lparsed.total}B, ${lparsed.recs.length} LEDs`);
+          if (lparsed) {
+            leds[L] = lparsed.recs;
+            ledTotals[L] = lparsed.total;
+            nLeds += lparsed.recs.length;
+            log('inf', `ledmap ${L}: ${lparsed.total}B, ${lparsed.recs.length} LEDs`);
+          }
         }
         setKeysByLayer(keys);
         setLedsByLayer(leds);

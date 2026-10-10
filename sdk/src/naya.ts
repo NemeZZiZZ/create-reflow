@@ -334,7 +334,11 @@ export class NayaSession {
   // read immediately with an empty blob instead of stalling the staleness
   // matcher into 'sync lost' or walking into the 'runaway parts' throw.
   // "Unreadable" therefore never masquerades as data; healthy multi-byte
-  // payloads classify 'ok' and stream exactly as before.
+  // payloads classify 'ok' and stream exactly as before. A stitched blob of
+  // 0B (a body-less LAST/MORE terminal — [0x00, layer] with no data bytes)
+  // is re-classified 'empty' too (OF parity): a healthy multipart read
+  // always carries at least one part body before the terminator, so 'ok'
+  // always hands the caller a non-empty blob.
   private async readMultipart(
     c1: number,
     layer: number,
@@ -381,7 +385,14 @@ export class NayaSession {
       throw e;
     }
     this.streamDirtyC1 = null;
-    return { blob: concat(parts), status: 'ok' };
+    const blob = concat(parts);
+    // Body-less terminal ([0x00, layer], zero data bytes) → 0B stitch. A
+    // healthy multipart read always carries ≥1 part body before the
+    // terminator, so an 'ok'-classified empty stitch means the stream had
+    // nothing stored — re-classify 'empty' (OF parity: body-less terminal
+    // = empty) instead of handing callers an 'ok' 0B blob that would trip
+    // their parse-shape invariants (recs !== 156 / total !== 544).
+    return { blob, status: blob.length === 0 ? 'empty' : 'ok' };
   }
 
   constructor(
@@ -578,7 +589,9 @@ export class NayaSession {
   ): Promise<{ blob: Uint8Array; status: string }> {
     // Multipart: response payload = [MORE, LAYER, DATA...], loop until MORE=0.
     // {blob, status} — 'empty' = nothing stored on this layer (a legitimate
-    // empty slot, NOT a broken read); blob is 0B whenever status ≠ 'ok'.
+    // empty slot, NOT a broken read — includes a body-less terminal frame);
+    // blob is 0B whenever status ≠ 'ok', and status 'ok' always carries a
+    // ≥1B blob.
     return this.readMultipart(0x03, layer);
   }
 
@@ -974,13 +987,15 @@ export type ChunkStatus =
 
 /** Classify one multipart read reply body by its status byte. Any body
  * whose length ≠ 1 carries data → 'ok' (a zero-length body is the
- * caller's contract — readMultipart always holds a reply frame). */
+ * caller's contract — readMultipart always holds a reply frame). The
+ * unknown fallback pads to two hex digits ('unknown:0x00'), matching
+ * OpenFlow's {flag:02x} formatting. */
 export function chunkStatus(body: Uint8Array): ChunkStatus {
   if (body.length !== 1) return 'ok';
   const b = body[0]!;
   if (b === 0x16 || b === 0x18) return 'empty';
   if (b === 0x11) return 'unsupported';
-  return `unknown:0x${b.toString(16)}`;
+  return `unknown:0x${b.toString(16).padStart(2, '0')}`;
 }
 
 export function ledCss(h: number, s: number): string {
