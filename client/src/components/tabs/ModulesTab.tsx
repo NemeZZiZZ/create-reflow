@@ -95,7 +95,7 @@ export default function ModulesTab({
     const next: Record<string, ModuleConfig | null> = {};
     for (const l of [0, 1, 2]) {
       try {
-        const blob = await left.readModuleConfig(l);
+        const { blob } = await left.readModuleConfig(l);
         const cfg = parseModuleConfig(blob, l);
         next[String(l)] = cfg ? { ...cfg, profile: `Layer ${l}` } : null;
       } catch (e) {

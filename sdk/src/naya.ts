@@ -327,7 +327,18 @@ export class NayaSession {
 
   // Shared multipart loop: drain a dirty family, run the part loop with the
   // staleness matcher, and mark the family dirty again if we abort midway.
-  private async readMultipart(c1: number, layer: number): Promise<Uint8Array> {
+  // Returns the assembled blob plus the read-status taxonomy: the FIRST
+  // reply is classified (chunkStatus) BEFORE the part loop, so a bare
+  // status byte — [0x16] "nothing stored" / bare [0x18] → 'empty', [0x11]
+  // → 'unsupported', any other single byte → 'unknown:0x..' — stops the
+  // read immediately with an empty blob instead of stalling the staleness
+  // matcher into 'sync lost' or walking into the 'runaway parts' throw.
+  // "Unreadable" therefore never masquerades as data; healthy multi-byte
+  // payloads classify 'ok' and stream exactly as before.
+  private async readMultipart(
+    c1: number,
+    layer: number,
+  ): Promise<{ blob: Uint8Array; status: string }> {
     if (this.streamDirtyC1 === c1) {
       await this.drainStream(c1);
       this.streamDirtyC1 = null;
@@ -337,14 +348,30 @@ export class NayaSession {
     let part = 0;
     try {
       for (;;) {
+        // Part 0 also accepts a bare single-byte status payload: the
+        // staleness matcher requires the layer echo and would reject the
+        // reply, so the read would stall into 'sync lost' instead of
+        // reaching the classification below.
+        const accept =
+          part === 0
+            ? (f: Frame): boolean => f.payload.length === 1 || match(f)
+            : match;
         const f = await this.cmd(
           0x30,
           0x10,
           c1,
           new Uint8Array([part, layer]),
           undefined,
-          match,
+          accept,
         );
+        if (part === 0) {
+          const status = chunkStatus(f.payload);
+          if (status !== 'ok') {
+            // Single reply frame, nothing mid-stream: the family stays
+            // clean (no drain needed on the next read of this family).
+            return { blob: new Uint8Array(0), status };
+          }
+        }
         parts.push(f.payload.slice(2));
         if (f.payload[0] === 0) break;
         if (++part >= 16) throw new Error('runaway parts');
@@ -354,7 +381,7 @@ export class NayaSession {
       throw e;
     }
     this.streamDirtyC1 = null;
-    return concat(parts);
+    return { blob: concat(parts), status: 'ok' };
   }
 
   constructor(
@@ -546,8 +573,12 @@ export class NayaSession {
     return this.cmd(0x30, 0x10, 0x02, payload);
   }
 
-  async readLayer(layer: number): Promise<Uint8Array> {
+  async readLayer(
+    layer: number,
+  ): Promise<{ blob: Uint8Array; status: string }> {
     // Multipart: response payload = [MORE, LAYER, DATA...], loop until MORE=0.
+    // {blob, status} — 'empty' = nothing stored on this layer (a legitimate
+    // empty slot, NOT a broken read); blob is 0B whenever status ≠ 'ok'.
     return this.readMultipart(0x03, layer);
   }
 
@@ -567,7 +598,9 @@ export class NayaSession {
     return f.payload;
   }
 
-  async readLedmap(layer: number): Promise<Uint8Array> {    // 30/100d LED MAP: same [part,layer] params + multipart shape as the
+  async readLedmap(
+    layer: number,
+  ): Promise<{ blob: Uint8Array; status: string }> {    // 30/100d LED MAP: same [part,layer] params + multipart shape as the
     // keymap (payload = [MORE, LAYER, DATA...]). 544B/layer =
     // 136 x [KK, Hue_lo, Hue_hi, Sat], KK 0x00..0x87. Per-layer container.
     return this.readMultipart(0x0d, layer);
@@ -589,7 +622,9 @@ export class NayaSession {
     return f.payload;
   }
 
-  async readModuleConfig(layer: number): Promise<Uint8Array> {
+  async readModuleConfig(
+    layer: number,
+  ): Promise<{ blob: Uint8Array; status: string }> {
     // 30/100b MODULE CONFIG DATA: same [part,layer] multipart shape.
     // 40 slots/layer, records [SLOT, FAMILY, LEN, payload].
     return this.readMultipart(0x0b, layer);
@@ -922,6 +957,30 @@ export const STATUS_BYTES: Record<number, string> = {
 /** Human-readable decode of a status byte (falls back to hex). */
 export function describeStatus(b: number): string {
   return STATUS_BYTES[b] ?? `status 0x${b.toString(16)}`;
+}
+
+/** Read-status taxonomy for multipart READ replies (30/1003 keymap,
+ * 30/100d ledmap, 30/100b module config). The first reply either carries
+ * data ([MORE, LAYER, ...] — multi-byte → 'ok') or a bare single-byte
+ * status: 0x16 "nothing stored" and a bare 0x18 mean there is nothing to
+ * read ('empty' — a legitimate empty slot, NOT a broken read); 0x11 "not
+ * implemented" means the read itself is unsupported; any other bare byte
+ * is reported verbatim for the callers to decide. */
+export type ChunkStatus =
+  | 'ok'
+  | 'empty'
+  | 'unsupported'
+  | `unknown:0x${string}`;
+
+/** Classify one multipart read reply body by its status byte. Any body
+ * whose length ≠ 1 carries data → 'ok' (a zero-length body is the
+ * caller's contract — readMultipart always holds a reply frame). */
+export function chunkStatus(body: Uint8Array): ChunkStatus {
+  if (body.length !== 1) return 'ok';
+  const b = body[0]!;
+  if (b === 0x16 || b === 0x18) return 'empty';
+  if (b === 0x11) return 'unsupported';
+  return `unknown:0x${b.toString(16)}`;
 }
 
 export function ledCss(h: number, s: number): string {

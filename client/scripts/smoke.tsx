@@ -41,8 +41,9 @@ import {
 import type { LayerEntry } from '@create-reflow/sdk';
 import { queueLayerAdd, queueLayerDelete, pendingLayerAddIdxs } from '@create-reflow/sdk';
 import { BAY_LED_RANGES, queueBayColor, queueFillLayer } from '@create-reflow/sdk';
-import { probeDraft } from '@create-reflow/sdk';
+import { chunkStatus, probeDraft } from '@create-reflow/sdk';
 import type { DraftDrop, GestureBinding } from '@create-reflow/sdk';
+import type { LayerDump } from '../src/hooks/useLayers';
 
 let n = 0;
 function eq(a: unknown, b: unknown, name: string) {
@@ -2761,5 +2762,132 @@ import { queueAction } from '@create-reflow/sdk';
   const e55b = buildOpenFlowLayer(recs55, [], 1, null);
   eq(e55b.counts.unknown, 1, '55 genuine miss still counts unknown');
 }
+
+// §56 read-status taxonomy: chunkStatus classifies the device's bare status
+// byte so a multipart READ answers {blob, status} — "unreadable" never
+// masquerades as data, and a no-data reply stops cleanly instead of walking
+// into the 'runaway parts' throw.
+{
+  const cs56 = (b: number[]) => chunkStatus(Uint8Array.from(b));
+  eq(cs56([0x16]), 'empty', '56 chunkStatus 0x16 nothing stored → empty');
+  eq(cs56([0x18]), 'empty', '56 chunkStatus bare 0x18 continuation → empty');
+  eq(cs56([0x11]), 'unsupported', '56 chunkStatus 0x11 → unsupported');
+  eq(cs56([0x00, 0x00, 0x10, 0x2a]), 'ok', '56 chunkStatus multi-byte body → ok');
+  eq(cs56([0x16, 0x00]), 'ok', '56 chunkStatus 2-byte body is data, not status → ok');
+  eq(cs56([0x55]), 'unknown:0x55', '56 chunkStatus bare 0x55 → unknown:0x55');
+  eq(cs56([0x2a]), 'unknown:0x2a', '56 chunkStatus bare 0x2a → unknown:0x2a');
+}
+
+// End-to-end: drive readMultipart through a scripted device (duplexFake's
+// wire shape, per-request response body) — the no-data single-frame reply
+// must return {blob: 0B, status} without throwing.
+void (async () => {
+  const scripted56 = (reply: (rq: Frame) => Uint8Array) => {
+    const queue: Uint8Array[] = [];
+    let waiter: (() => void) | null = null;
+    const reader = {
+      async read(): Promise<{ value?: Uint8Array; done?: boolean }> {
+        for (;;) {
+          const c = queue.shift();
+          if (c) return { value: c, done: false };
+          await new Promise<void>((res) => { waiter = res; });
+        }
+      },
+      cancel() { const w = waiter; waiter = null; w?.(); },
+      releaseLock() {},
+    };
+    const writer = {
+      async write(b: Uint8Array) {
+        const rq = verifyFrame(Uint8Array.from(b));
+        const resp = buildFrame(0x50, rq.type, rq.c0, rq.c1, reply(rq));
+        verifyFrame(resp);
+        setTimeout(() => { queue.push(resp); const w = waiter; waiter = null; w?.(); }, 5);
+      },
+      releaseLock() {},
+    };
+    const port = {
+      readable: { locked: false, getReader: () => reader },
+      writable: { getWriter: () => writer },
+      async open() {}, async setSignals() {}, async close() {},
+    };
+    return {
+      session() {
+        const r = port.readable.getReader() as unknown as ReadableStreamDefaultReader<Uint8Array>;
+        const w = port.writable.getWriter() as unknown as WritableStreamDefaultWriter<Uint8Array>;
+        return new NayaSession(
+          port as unknown as SerialPort, 0x50,
+          new FrameReader(r), w, r,
+          async (b) => { await w.write(b); }, null,
+        );
+      },
+    };
+  };
+
+  // Bare [0x16] "nothing stored": {blob: 0B, status: 'empty'} — no throw,
+  // no runaway walk, no 30 s sync-lost stall the old partMatcher produced
+  // on a 1-byte payload.
+  let respond56: (rq: Frame) => Uint8Array = () => Uint8Array.from([0x16]);
+  const dev56 = scripted56((rq) => respond56(rq));
+  const ses56 = dev56.session();
+  let blob56: Uint8Array | null = null;
+  let status56 = '';
+  let err56 = '';
+  try { ({ blob: blob56, status: status56 } = await ses56.readLayer(0)); }
+  catch (e) { err56 = (e as Error).message; }
+  eq(err56, '', '56 bare 0x16 read → no throw (no runaway, no sync lost)');
+  eq(blob56 !== null && blob56.length === 0, true, '56 empty read → 0-byte blob');
+  eq(status56, 'empty', '56 empty read → status empty');
+
+  // Same session, healthy two-part stream next: proves the no-data reply
+  // left the family clean (a wrongly-dirty cursor would drain first and
+  // the part-0/part-1 request count would double).
+  let reqs56 = 0;
+  respond56 = (rq) => {
+    reqs56++;
+    const layer = rq.payload[1] ?? 0;
+    if (rq.payload[0] === 0)
+      return Uint8Array.from([0x01, layer, 0x10, 0x20, 0x30, 0x40]);
+    return Uint8Array.from([0x00, layer, 0x50, 0x60, 0x70, 0x80]);
+  };
+  const ok56 = await ses56.readLayer(0);
+  eq(reqs56, 2, '56 clean family: exactly part 0 + part 1 requested');
+  eq(ok56.status, 'ok', '56 healthy multipart read → status ok');
+  eq(ok56.blob.length, 8, '56 healthy read → 2 parts × 4B body');
+  eq(toHex(ok56.blob), '10 20 30 40 50 60 70 80', '56 healthy blob = part bodies in order');
+
+  // 'unsupported' and 'unknown' classifications also stop clean: empty
+  // blob + verbatim status, callers decide.
+  respond56 = () => Uint8Array.from([0x11]);
+  const uns56 = await ses56.readLayer(1);
+  eq(uns56.blob.length === 0 && uns56.status === 'unsupported', true,
+    '56 bare 0x11 read → {0B, unsupported} no throw');
+
+  respond56 = () => Uint8Array.from([0x2a]);
+  const unk56 = await ses56.readLedmap(0);
+  eq(unk56.blob.length === 0 && unk56.status === 'unknown:0x2a', true,
+    '56 bare 0x2a ledmap read → {0B, unknown:0x2a} no throw');
+
+  await ses56.close();
+
+  // Wrapper shapes: readLayer/readLedmap/readModuleConfig all surface
+  // {blob, status} (compile-time); runtime spot-check on the reads above.
+  const shapes56: [
+    Awaited<ReturnType<NayaSession['readLayer']>>,
+    Awaited<ReturnType<NayaSession['readLedmap']>>,
+    Awaited<ReturnType<NayaSession['readModuleConfig']>>,
+  ] = [ok56, uns56, { blob: new Uint8Array(0), status: 'ok' }];
+  eq(shapes56[0]!.status === 'ok' && shapes56[2]!.blob.length === 0, true,
+    '56 read wrappers carry {blob, status}');
+
+  // LayerDump carries the per-layer read-status map for a synthetic
+  // inventory: healthy layers 'ok', an empty slot honestly 'empty'.
+  const dump56: LayerDump = {
+    keys: [[], [], []],
+    leds: [[], [], []],
+    status: { 0: 'ok', 1: 'empty', 2: 'unsupported' },
+  };
+  eq(dump56.status[0], 'ok', '56 LayerDump.status: healthy layer → ok');
+  eq(dump56.status[1], 'empty', '56 LayerDump.status: empty slot → empty');
+})();
 
 void main();

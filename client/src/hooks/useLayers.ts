@@ -21,6 +21,12 @@ import type { LogFn } from './useLog';
 export interface LayerDump {
   keys: KeyRec[][];
   leds: LedRec[][];
+  /** Read-status taxonomy per layer idx (only layers the inventory loop
+   * visited): 'ok' | 'empty' | 'unsupported' | 'unknown:0x..'. 'empty' =
+   * nothing stored on that layer — a legitimate empty slot, NOT a broken
+   * read; the first non-'ok' classification across that layer's keymap /
+   * LED map read wins so the anomaly stays visible. */
+  status: Record<number, string>;
 }
 
 /** Fresh layer-list inventory: one handshake — its Frame payload IS the
@@ -78,6 +84,10 @@ export function useLayers({
         const width = inv.reduce((m, e) => Math.max(m, e.idx), -1) + 1;
         const keys: KeyRec[][] = Array.from({ length: width }, () => []);
         const leds: LedRec[][] = Array.from({ length: width }, () => []);
+        // Read-status per layer (see LayerDump.status): the keymap read
+        // seeds it, the LED map read only overwrites an 'ok' so the first
+        // non-'ok' classification wins.
+        const statusByLayer: Record<number, string> = {};
         const keyTotals = new Array<number>(width).fill(0);
         const ledTotals = new Array<number>(width).fill(0);
         let nKeys = 0;
@@ -88,8 +98,9 @@ export function useLayers({
           // consumed === total, parseLedmap's is a fixed 544B/layer. Anything
           // else → one full re-read of that layer.
           const readKeyLayer = async () => {
-            const blob = await ses.readLayer(L);
-            const p = parseLayer(blob);
+            const read = await ses.readLayer(L);
+            statusByLayer[L] = read.status;
+            const p = parseLayer(read.blob);
             if (p.consumed !== p.total)
               throw new Error(`keymap ${L} truncated (${p.consumed}/${p.total}B)`);
             // Resume-tail tripwire: an aborted multipart read can later be
@@ -103,8 +114,9 @@ export function useLayers({
             return p;
           };
           const readLedLayer = async () => {
-            const lblob = await ses.readLedmap(L);
-            const lp = parseLedmap(lblob);
+            const lread = await ses.readLedmap(L);
+            if (statusByLayer[L] === 'ok') statusByLayer[L] = lread.status;
+            const lp = parseLedmap(lread.blob);
             if (lp.total !== 544 || lp.total % 4 !== 0)
               throw new Error(`ledmap ${L} bad size (${lp.total}B, want 544)`);
             return lp;
@@ -160,7 +172,7 @@ export function useLayers({
         setDumpStat(`${inv.length} layers, ${nKeys} key records`);
         setLedDumpStat(`${inv.length} layers, ${nLeds} LEDs`);
         log('inf', `dump done: ${inv.length} layers, ${nKeys} keys, ${nLeds} LEDs`);
-        return { keys, leds };
+        return { keys, leds, status: statusByLayer };
       } catch (e) {
         setDumpStat('FAILED: ' + (e as Error).message);
         setLedDumpStat('FAILED: ' + (e as Error).message);
