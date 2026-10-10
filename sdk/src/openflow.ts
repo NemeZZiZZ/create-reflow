@@ -369,10 +369,21 @@ const isModUsage = (u: number) => u >= 0xe0 && u <= 0xe7;
  * and matchAction (special/vendor families) — never re-derives record bytes
  * by hand. Anything unexportable (BT/mouse/LED/out-select/vendor families,
  * hold-layer2, matchAction misses, unmapped usages) drops to bindings []
- * plus counts.unknown++ — never guessed (spec §3). */
+ * plus counts.unknown++ — never guessed (spec §3). Known-empty families
+ * are the exception: a filler [kk,07,00], the legacy [kk,00,00] blank, or
+ * a matchAction hit on the 'empty' catalog action export bindings []
+ * WITHOUT the unknown count — the slot is genuinely cleared on the device,
+ * nothing was unrepresentable. */
 function bindingsFor(recs: KeyRec[], kk: number, counts: Record<string, number>): OfBinding[] {
   const prim = recs.find((r) => r.kk === kk);
   if (!prim) return [];
+  // Deflation: known-empty record families export clean (no unknown++).
+  const rec = prim.rec;
+  if (
+    (rec.length === 3 && (rec[1] === 0x07 || rec[1] === 0x00)) ||
+    matchAction(rec)?.id === 'empty'
+  )
+    return [];
   const set = behaviorSetOf(recs, kk);
   if (set) {
     const out: OfBinding[] = [];

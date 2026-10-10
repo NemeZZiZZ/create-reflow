@@ -24,6 +24,20 @@ export interface LedOp {
 
 export type Section = 'bindings' | 'led' | 'modules' | 'behavior' | 'layers';
 
+/** One refused intent, recorded when the queue refused it (flash
+ * capability model — the flash dialog renders these verbatim). `reason`
+ * is the validator/queue message verbatim; `effect` is the honest domain
+ * sentence for what the keyboard does instead. `at: 'queue'` — every drop
+ * this phase originates at queue time. */
+export interface DraftDrop {
+  layer?: number;
+  kk?: number;
+  opKey?: string;
+  reason: string;
+  effect: string;
+  at: 'queue';
+}
+
 export interface KeySetOp {
   kind: 'keyset';
   layer: number;          // 0|1|2
@@ -108,6 +122,9 @@ export function opSection(o: Op): Section {
 
 export class Draft {
   ops: Op[] = [];
+  /** Queue-time refusal ledger (DraftDrop[]). Refusals never queue ops —
+   * the ledger only explains them, deduped by reason+layer+kk. */
+  drops: DraftDrop[] = [];
 
   get size(): number {
     return this.ops.length;
@@ -121,12 +138,23 @@ export class Draft {
     else this.ops.push(o);
   }
 
+  /** Record a refused intent. Dedup by reason+layer+kk: the same refusal
+   * twice (e.g. a second click on the same refused target) is ONE entry —
+   * the ledger explains capabilities, it doesn't count clicks. */
+  addDrop(drop: Omit<DraftDrop, 'at'>): void {
+    const sig = (d: Pick<DraftDrop, 'reason' | 'layer' | 'kk'>) =>
+      `${d.reason}|${d.layer === undefined ? 'u' : d.layer}|${d.kk === undefined ? 'u' : d.kk}`;
+    if (this.drops.some((d) => sig(d) === sig(drop))) return;
+    this.drops.push({ ...drop, at: 'queue' });
+  }
+
   removeAt(i: number): void {
     this.ops.splice(i, 1);
   }
 
   clear(): void {
     this.ops = [];
+    this.drops = [];
   }
 
   has(kind: 'key' | 'led' | 'keyset', layer: number, kk: number): boolean {
@@ -249,4 +277,73 @@ export function opSummary(o: Op): string {
       // Entry counts ride in the label (set at queue time).
       return o.label;
   }
+}
+
+/** Pure re-validation walk of a queued draft (flash capability model):
+ * re-checks every invariant decidable from the draft ALONE — no live
+ * cache parameter this phase, so 'no live record at this key' style
+ * findings (they need the device dump) are deferred. Per op kind:
+ *   key     — record self-addresses its kk (byte 0 === op kk, min shape);
+ *   keyset  — every record non-empty;
+ *   led     — kk inside the device LED map 0..0x87 (queueColor's gate);
+ *   module  — payload byte 0 re-states the slot (S2 addressing trap);
+ *   layers  — every decoded add entry sits in the app window 0..7.
+ * Never mutates the draft and never writes its drops ledger: two calls
+ * on an unchanged draft return deep-equal arrays. Returns DraftDrop[]
+ * (at:'queue') so the flash dialog can render findings with the same
+ * shape as queue-time refusals. */
+export function probeDraft(d: Draft): DraftDrop[] {
+  const out: DraftDrop[] = [];
+  const push = (o: Op, reason: string, effect: string): void => {
+    const drop: DraftDrop = { reason, effect, at: 'queue', opKey: opKey(o) };
+    if (o.kind === 'key' || o.kind === 'keyset' || o.kind === 'led' || o.kind === 'module') {
+      drop.layer = o.layer;
+      if (o.kind === 'key' || o.kind === 'keyset' || o.kind === 'led') drop.kk = o.kk;
+    }
+    out.push(drop);
+  };
+  for (const o of d.ops) {
+    if (o.kind === 'key') {
+      if (o.record.length < 3 || o.record[0] !== o.kk)
+        push(
+          o,
+          `key record does not address its own kk ${o.kk}`,
+          'this key keeps whatever the keyboard already had on it',
+        );
+    } else if (o.kind === 'keyset') {
+      if (o.records.length === 0 || o.records.some((r) => r.length === 0))
+        push(
+          o,
+          'behavior set carries an empty record',
+          'this key keeps whatever the keyboard already had on it',
+        );
+    } else if (o.kind === 'led') {
+      if (o.kk < 0 || o.kk > 0x87)
+        push(
+          o,
+          `led kk ${o.kk} is outside the device LED map (0-135)`,
+          'this key keeps its current color',
+        );
+    } else if (o.kind === 'module') {
+      if (o.payload.length === 0 || o.payload[0] !== o.slot)
+        push(
+          o,
+          `module payload does not re-state slot ${o.slot}`,
+          'the module bay keeps its current gesture',
+        );
+    } else {
+      // Layers window re-check: same add-entry wire signature
+      // ([idx][idx][anim][0x10]) pendingLayerAddIdxs decodes.
+      const p = o.payload;
+      for (let off = 2; off + 20 <= p.length; off += 20) {
+        if (p[off] === p[off + 1] && p[off + 3] === 0x10 && p[off] > 7)
+          push(
+            o,
+            `layer index ${p[off]} is outside this app's window (0-7)`,
+            'the layer list stays unchanged',
+          );
+      }
+    }
+  }
+  return out;
 }

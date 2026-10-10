@@ -40,6 +40,14 @@ export function queueAction(
     const cur = (keysByLayer[l] ?? []).find((r) => r.kk === kk);
     if (!cur) {
       skipped++;
+      // Ledger drop (return shape unchanged): the skip is a capability
+      // refusal — without a live record the flash can't address the key.
+      draft.addDrop({
+        layer: l,
+        kk,
+        reason: 'no live record at this key',
+        effect: 'this key keeps whatever the keyboard already had on it',
+      });
       continue;
     }
     if (
@@ -151,8 +159,15 @@ export function queueBehaviorSet(
       ...(flavorByte != null ? { bodyFlags: flavorByte } : {}),
     });
     if (!op) {
-      if (set.tap == null)
+      if (set.tap == null) {
+        draft.addDrop({
+          layer,
+          kk,
+          reason: 'behavior chain: Tap is required first',
+          effect: 'this key keeps whatever the keyboard already had on it',
+        });
         return { queued: false, error: 'behavior chain: Tap is required first' };
+      }
       if (hasT10Shadow(prevRecs, kk))
         draft.add({
           kind: 'keyset', layer, kk,
@@ -169,6 +184,12 @@ export function queueBehaviorSet(
     draft.add(op);
     return { queued: true };
   } catch (e) {
+    draft.addDrop({
+      layer,
+      kk,
+      reason: (e as Error).message,
+      effect: 'this key keeps whatever the keyboard already had on it',
+    });
     return { queued: false, error: (e as Error).message };
   }
 }
@@ -196,6 +217,11 @@ export function queueModuleGesture(
     });
     return { queued: true };
   } catch (e) {
+    draft.addDrop({
+      layer,
+      reason: (e as Error).message,
+      effect: 'the module bay keeps its current gesture',
+    });
     return { queued: false, error: (e as Error).message };
   }
 }
@@ -214,14 +240,17 @@ export function queueLayerAdd(
   uuid: string,
   animName?: string,
 ): { queued: boolean; error?: string } {
-  if (idx < 0 || idx > 7)
-    return {
-      queued: false,
-      error: `layer index ${idx} is outside this app's window (0-7)`,
-    };
+  if (idx < 0 || idx > 7) {
+    const error = `layer index ${idx} is outside this app's window (0-7)`;
+    draft.addDrop({ layer: idx, reason: error, effect: 'the layer list stays unchanged' });
+    return { queued: false, error };
+  }
   const animStored = storedAnimOf(animName ?? 'Solid');
-  if (animStored < 0)
-    return { queued: false, error: `unknown stored animation: ${animName}` };
+  if (animStored < 0) {
+    const error = `unknown stored animation: ${animName}`;
+    draft.addDrop({ layer: idx, reason: error, effect: 'the layer list stays unchanged' });
+    return { queued: false, error };
+  }
   draft.add({
     kind: 'layers',
     payload: encodeLayerListAdd([{ idx, uuid, animStored }]),
@@ -250,8 +279,14 @@ export function queueLayerDelete(
   totalKeys: number,
   layerCount?: number,
 ): { queued: boolean; error?: string; frames: number } {
-  if (layerCount != null && layerCount <= 1)
+  if (layerCount != null && layerCount <= 1) {
+    draft.addDrop({
+      layer: idx,
+      reason: 'cannot delete the only layer',
+      effect: 'the layer list stays unchanged',
+    });
     return { queued: false, error: 'cannot delete the only layer', frames: 0 };
+  }
   draft.add({
     kind: 'layers',
     payload: encodeLayerListDelete([idx]),

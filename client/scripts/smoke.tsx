@@ -41,6 +41,8 @@ import {
 import type { LayerEntry } from '@create-reflow/sdk';
 import { queueLayerAdd, queueLayerDelete, pendingLayerAddIdxs } from '@create-reflow/sdk';
 import { BAY_LED_RANGES, queueBayColor, queueFillLayer } from '@create-reflow/sdk';
+import { probeDraft } from '@create-reflow/sdk';
+import type { DraftDrop, GestureBinding } from '@create-reflow/sdk';
 
 let n = 0;
 function eq(a: unknown, b: unknown, name: string) {
@@ -2540,6 +2542,224 @@ import { queueAction } from '@create-reflow/sdk';
     true,
     '54 right ops all layer 2 h200 s50',
   );
+}
+
+// §55 flash capability model: drops ledger + probeDraft + counts.unknown deflation
+{
+  const u55 = '3b19055502e04b298bc9eac0670f1136';
+
+  // --- Queue-time refusal ledger --------------------------------------
+  // Behavior-set chain violation: the {queued:false,error} return is
+  // unchanged AND a drop lands in draft.drops with the validator message
+  // verbatim + an honest effect sentence.
+  const d55 = new Draft();
+  const r55a = queueBehaviorSet(
+    d55, 1, 0x1e,
+    { tap: null, hold: 0x0b, double: null, taphold: null },
+    200, 'bad chain',
+  );
+  eq(r55a.queued, false, '55 chain violation refused');
+  eq(r55a.error, 'behavior chain: Tap is required first', '55 chain error message verbatim');
+  eq(d55.size, 0, '55 chain violation queues nothing');
+  eq(d55.drops.length, 1, '55 chain refusal → one drop');
+  const drop55a: DraftDrop | undefined = d55.drops[0];
+  eq(
+    drop55a?.reason,
+    'behavior chain: Tap is required first',
+    '55 drop reason = chain message verbatim',
+  );
+  eq(drop55a?.at, 'queue', '55 drop at=queue');
+  eq(drop55a?.layer === 1 && drop55a?.kk === 0x1e, true, '55 drop addresses layer+kk');
+  eq(
+    /keeps whatever the keyboard already had/i.test(drop55a?.effect ?? ''),
+    true,
+    '55 drop effect = key keeps current binding',
+  );
+  // Dedup: the same refusal twice is ONE ledger entry…
+  queueBehaviorSet(
+    d55, 1, 0x1e,
+    { tap: null, hold: 0x0b, double: null, taphold: null },
+    200, 'bad chain',
+  );
+  eq(d55.drops.length, 1, '55 same refusal twice dedups to one drop');
+  // …but a DIFFERENT violation coexists.
+  queueBehaviorSet(
+    d55, 2, 0x30,
+    { tap: 0x04, hold: 0x0b, double: null, taphold: 0x06 },
+    200, 'bad chain 2',
+  );
+  eq(
+    d55.drops.length === 2 &&
+      d55.drops[1]!.reason === 'behavior chain: Double Tap required before Tap+Hold',
+    true,
+    '55 distinct refusal reason coexists',
+  );
+
+  // Module gesture refusals (family not proven writable / same-length rule).
+  const d55m = new Draft();
+  const g55: GestureBinding = {
+    slot: 2, gesture: 'press', flashable: false,
+    actionRaw: Uint8Array.from([2, 0x0f, 0x08, 3, 0, 0, 0, 1, 0, 0, 0]),
+  };
+  const r55m = queueModuleGesture(d55m, 0, g55, [3, 0, 0, 0, 1, 0, 0, 0]);
+  eq(
+    r55m.queued === false && /family not proven writable/.test(r55m.error ?? ''),
+    true,
+    '55 module family refusal',
+  );
+  eq(
+    d55m.drops.length === 1 && /family not proven writable/.test(d55m.drops[0]!.reason),
+    true,
+    '55 module family drop recorded',
+  );
+  const g55len: GestureBinding = { ...g55, flashable: true };
+  queueModuleGesture(d55m, 0, g55len, [9, 9]);
+  eq(
+    d55m.drops.length === 2 && /same-length rule/.test(d55m.drops[1]!.reason),
+    true,
+    '55 module length refusal drop',
+  );
+
+  // Layer add/delete refusals: window + anim + only-layer, reasons verbatim.
+  const d55l = new Draft();
+  const r55w = queueLayerAdd(d55l, 8, u55);
+  eq(r55w.queued === false && d55l.size === 0, true, '55 window refusal (existing)');
+  eq(
+    d55l.drops.length === 1 &&
+      d55l.drops[0]!.reason === "layer index 8 is outside this app's window (0-7)",
+    true,
+    '55 window drop reason verbatim',
+  );
+  queueLayerAdd(d55l, 8, u55);
+  eq(d55l.drops.length, 1, '55 window refusal dedups');
+  queueLayerAdd(d55l, 4, u55, 'Nope');
+  eq(
+    d55l.drops.length === 2 && d55l.drops[1]!.reason === 'unknown stored animation: Nope',
+    true,
+    '55 anim refusal drop',
+  );
+  queueLayerDelete(d55l, 0, [], [], 156, 1);
+  eq(
+    d55l.drops.length === 3 &&
+      d55l.drops[2]!.reason === 'cannot delete the only layer' &&
+      d55l.drops[2]!.layer === 0,
+    true,
+    '55 only-layer drop',
+  );
+  eq(d55l.size, 0, '55 layer refusals queue nothing');
+
+  // queueAction no-live-record skip: the {queued,skipped} return shape is
+  // unchanged, plus a ledger drop (controller binding resolution #1) so
+  // the flash dialog can say WHY the key was left alone.
+  const d55s = new Draft();
+  const keys55: KeyRec[][] = [[]];
+  const r55s = queueAction(d55s, [{ layer: 0, kk: 0x1e }], ACTIONS[0]!, keys55);
+  eq(
+    r55s.queued === 0 && r55s.skipped === 1,
+    true,
+    '55 no-live-record skip (return shape unchanged)',
+  );
+  eq(d55s.size, 0, '55 skip queues nothing');
+  eq(
+    d55s.drops.length === 1 && d55s.drops[0]!.layer === 0 && d55s.drops[0]!.kk === 0x1e,
+    true,
+    '55 skip appends drop (binding resolution #1)',
+  );
+  eq(
+    /no live record/i.test(d55s.drops[0]!.reason) &&
+      /keeps whatever the keyboard already had/i.test(d55s.drops[0]!.effect),
+    true,
+    '55 skip drop reason/effect pair',
+  );
+
+  // Draft.clear empties the ledger along with the ops.
+  d55s.clear();
+  eq(d55s.ops.length === 0 && d55s.drops.length === 0, true, '55 clear empties drops too');
+
+  // --- probeDraft: pure re-validation walk ----------------------------
+  const p55 = new Draft();
+  p55.add({ kind: 'key', layer: 0, kk: 0x1e, record: plainRecord(0x1e, 0x04), label: 'A' });
+  p55.add({ kind: 'led', layer: 0, kk: 0x1e, h: 180, s: 100 });
+  p55.add({
+    kind: 'keyset', layer: 1, kk: 0x20,
+    records: [plainRecord(0x20, 0x05), fillerRecord(0x20 + 0x52)], label: 'set',
+  });
+  p55.add({
+    kind: 'module', layer: 0, slot: 3,
+    payload: Uint8Array.from([3, 0x0f, 4, 1, 0, 0, 0]), label: 'g',
+  });
+  p55.add({
+    kind: 'layers', label: 'add',
+    payload: encodeLayerListAdd([{ idx: 3, uuid: u55, animStored: 0 }]),
+  });
+  eq(JSON.stringify(probeDraft(p55)), '[]', '55 probe healthy draft → []');
+
+  const p55b = new Draft();
+  p55b.add({ kind: 'key', layer: 0, kk: 999, record: plainRecord(0x1e, 0x04), label: 'ghost' });
+  const f55a = probeDraft(p55b);
+  eq(
+    f55a.length === 1 && f55a[0]!.layer === 0 && f55a[0]!.kk === 999,
+    true,
+    '55 probe hand-built key op kk 999 → 1 finding',
+  );
+  eq(/kk 999/.test(f55a[0]!.reason), true, '55 probe finding names the op');
+
+  const p55c = new Draft();
+  p55c.add({ kind: 'led', layer: 0, kk: 200, h: 0, s: 0 });
+  const f55b = probeDraft(p55c);
+  eq(
+    f55b.length === 1 && /LED map/.test(f55b[0]!.reason),
+    true,
+    '55 probe led kk 200 → bounds finding',
+  );
+
+  const p55d = new Draft();
+  p55d.add({
+    kind: 'layers', label: 'hand-built',
+    payload: encodeLayerListAdd([{ idx: 9, uuid: u55, animStored: 0 }]),
+  });
+  eq(
+    /window \(0-7\)/.test(probeDraft(p55d)[0]!.reason),
+    true,
+    '55 probe re-checks the layers window',
+  );
+
+  const p55e = new Draft();
+  p55e.add({
+    kind: 'module', layer: 0, slot: 3,
+    payload: Uint8Array.from([7, 0x0f, 4, 1]), label: 'x',
+  });
+  eq(probeDraft(p55e).length === 1, true, '55 probe module payload[0] ≠ slot → finding');
+
+  // Purity: unchanged input → deep-equal output, draft untouched.
+  const f55a2 = probeDraft(p55b);
+  eq(JSON.stringify(f55a) === JSON.stringify(f55a2), true, '55 probe is pure: identical twice');
+  eq(
+    p55b.ops.length === 1 && p55b.drops.length === 0,
+    true,
+    '55 probe never mutates ops or ledger',
+  );
+
+  // --- counts.unknown deflation ---------------------------------------
+  // Filler [kk,07,00], legacy [kk,00,00], and the 'empty' catalog action
+  // are KNOWN-EMPTY slots: they export bindings [] WITHOUT bumping
+  // counts.unknown. A genuine miss (BT record) still counts.
+  const recs55: KeyRec[] = [];
+  const push55 = (kk: number, rec: Uint8Array) =>
+    recs55.push({ kk, t: rec[1], rec, offset: recs55.length });
+  push55(0, fillerRecord(0));
+  push55(1, new Uint8Array([1, 0, 0]));
+  push55(2, buildRecord(2, findAction('empty')!.body()));
+  const e55 = buildOpenFlowLayer(recs55, [], 1, null);
+  eq(e55.counts.unknown, 0, '55 deflation: empty families → unknown stays 0');
+  eq(e55.counts.keys, 0, '55 deflated slots never count as keys');
+  const k55doc = (e55.data as { layer: { keys: { bindings: unknown[] }[] } }).layer.keys;
+  eq(JSON.stringify(k55doc[0].bindings), '[]', '55 filler exports empty bindings');
+  eq(JSON.stringify(k55doc[1].bindings), '[]', '55 legacy blank exports empty bindings');
+  eq(JSON.stringify(k55doc[2].bindings), '[]', '55 empty-action record exports empty bindings');
+  push55(3, buildRecord(3, findAction('bt:1')!.body()));
+  const e55b = buildOpenFlowLayer(recs55, [], 1, null);
+  eq(e55b.counts.unknown, 1, '55 genuine miss still counts unknown');
 }
 
 void main();
