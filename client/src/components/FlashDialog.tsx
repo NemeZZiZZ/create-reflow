@@ -26,10 +26,63 @@ import {
   SECTIONS,
   SECTION_LABELS,
   type Draft,
+  type DraftDrop,
   type Op,
 } from '@create-reflow/sdk';
 import { X } from 'lucide-react';
-import type { FlashState } from '../hooks/useFlash';
+import { collectDrops } from '../hooks/useFlash';
+import type { FlashResult, FlashState } from '../hooks/useFlash';
+
+/** Render guard for drop rows: refused targets may carry a layer outside
+ * the 0..7 window (e.g. a layer-add rejected past the inventory) or a kk
+ * outside the 0..135 LED map — label them as refused operations, never
+ * map them onto board layers/keys. */
+function dropWhere(d: DraftDrop): string {
+  const parts: string[] = [];
+  if (d.layer !== undefined)
+    parts.push(
+      d.layer >= 0 && d.layer <= 7
+        ? `L${d.layer}`
+        : `refused layer ${d.layer}`,
+    );
+  if (d.kk !== undefined)
+    parts.push(
+      d.kk >= 0 && d.kk <= 0x87
+        ? `KK ${d.kk} (0x${d.kk.toString(16)})`
+        : `refused KK ${d.kk}`,
+    );
+  return parts.join(' ');
+}
+
+const DROP_CAP = 6;
+
+/** The warn drop Notice: pre-flash it lists the live queue's refusals,
+ * post-flash the same list is re-rendered in the verdict area. Capped at
+ * 6 rows + overflow; each row shows layer/kk (when present) + reason. */
+function DropNotice({ drops }: { drops: DraftDrop[] }) {
+  return (
+    <div className="rounded-md border border-amber-400/30 bg-amber-400/10 p-3 text-sm">
+      <div className="font-medium text-amber-300">
+        {drops.length} change(s) cannot be written
+      </div>
+      <ul className="mt-1.5 space-y-1 text-muted-foreground">
+        {drops.slice(0, DROP_CAP).map((d, i) => {
+          const where = dropWhere(d);
+          return (
+            <li key={i} className="truncate">
+              {where ? `${where} — ${d.reason}` : d.reason}
+            </li>
+          );
+        })}
+        {drops.length > DROP_CAP && <li>+{drops.length - DROP_CAP} more…</li>}
+      </ul>
+      <div className="mt-1.5 text-muted-foreground">
+        Everything else in this flash is unaffected; those keys keep what
+        they have.
+      </div>
+    </div>
+  );
+}
 
 export default function FlashDialog({
   open,
@@ -43,7 +96,7 @@ export default function FlashDialog({
   open: boolean;
   onOpenChange: (v: boolean) => void;
   draft: Draft;
-  onFlash: () => Promise<'ok' | 'partial' | 'fail'>;
+  onFlash: () => Promise<FlashResult>;
   onChanged: () => void;
   busy: boolean;
   state: FlashState;
@@ -73,29 +126,41 @@ export default function FlashDialog({
     setRunning(true);
     try {
       const res = await onFlash();
-      if (res === 'ok') onOpenChange(false); // keep open on partial/fail
+      if (res === 'ok') onOpenChange(false); // keep open on cannot-verify/partial/fail
     } finally {
       runningRef.current = false;
       setRunning(false);
     }
   }
 
+  // Drop list: while nothing has run yet, a live merge of the refusal
+  // ledger + a pure probe of the queued ops; once a flash started, the
+  // flash-start snapshot in state takes over (the run self-removes ops and
+  // reconciles the queue, so a live re-probe would under-report what the
+  // flash carried).
+  const drops =
+    state.phase === 'idle' || state.drops === undefined
+      ? collectDrops(draft)
+      : state.drops;
+
   const status =
     state.phase === 'running'
       ? `Writing ${state.done}/${state.total}…`
       : state.phase === 'ok'
         ? `Done — ${state.total}/${state.total} verified`
-        : state.phase === 'partial'
-          ? `Partial — ${state.message}`
-          : state.phase === 'fail'
-            ? `Failed — ${state.message}`
-            : null;
+        : state.phase === 'cannot-verify'
+          ? state.message
+          : state.phase === 'partial'
+            ? `Partial — ${state.message}`
+            : state.phase === 'fail'
+              ? `Failed — ${state.message}`
+              : null;
   const statusCls =
     state.phase === 'ok'
       ? 'text-[#7ee2a8]'
       : state.phase === 'fail'
         ? 'text-[#ff9d9d]'
-        : state.phase === 'partial'
+        : state.phase === 'partial' || state.phase === 'cannot-verify'
           ? 'text-amber-300'
           : 'text-muted-foreground';
 
@@ -161,6 +226,7 @@ export default function FlashDialog({
             {status}
           </div>
         )}
+        {drops.length > 0 && <DropNotice drops={drops} />}
         <DialogFooter>
           <Button
             variant="outline"
