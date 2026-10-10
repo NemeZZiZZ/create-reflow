@@ -211,6 +211,38 @@ build, host-table name resolution); file gate: `sdk/src/importers.ts`
   `queueBayColor` (kk 88-135, 24 per side); layer fill never touches bays
   (`queueFillLayer` gates kk ≤ 87).
 
+- **Flash capability model (Phase 4, 2026-10-11)**: the flash dialog
+  explains what will not store, and readbacks no longer confuse "unreadable"
+  with "empty". Refused edits become data: `Draft.drops` (`DraftDrop`,
+  `sdk/src/draft.ts`) records every queue-time refusal verbatim (`reason` =
+  validator/queue message, `effect` = the honest sentence for what the
+  keyboard does instead), deduped by reason+layer+kk; `probeDraft` re-checks
+  the queued ops purely (draft alone, no live cache, never mutates), and
+  `collectDrops` (`client/src/hooks/useFlash.ts`) merges ledger + probe into
+  the dialog's drop list (snapshotted at flash start, re-rendered after the
+  run). `counts.unknown` in OpenFlow export is deflated: known-empty
+  families — a filler `[kk,07,00]`, the legacy `[kk,00,00]` blank, or a
+  matchAction hit on the 'empty' catalog action — export `bindings: []`
+  WITHOUT an unknown increment (the slot is genuinely cleared, nothing was
+  unrepresentable); `unknown` counts only genuine unexportable records
+  (matchAction misses, unmapped usages). Multipart reads return
+  `{blob, status}` (`chunkStatus`, `sdk/src/naya.ts`): 'ok' | 'empty' |
+  'unsupported' | 'unknown:0x..' — a bare 0x16/0x18 means nothing stored
+  ('empty' stops the read clean instead of erroring), 0x11 means the read
+  itself is unsupported, any other bare byte is reported verbatim; a
+  short/garbled read is NEVER classified as empty. `LayerDump.status`
+  carries that per layer idx (keymap read seeds it; the LED read only
+  overwrites an 'ok', so the first non-'ok' classification wins). Flash
+  verdicts grade as ok | cannot-verify | partial | fail: cannot-verify sits
+  strictly between ok and partial — a still-queued op targets a layer whose
+  post-flash read came back 'unsupported'/'unknown:…', so the write may
+  have landed (never fails the flash; 'empty' and dump-absent layers fall
+  through to a plain partial). NACK aborts are structured
+  (`${opSummary} — device refused the value (0xEA): nothing was stored` /
+  `bad or missing ack (hex)`) and throw → fail; the layers op's NACK is the
+  one non-throwing case (idempotent write, the restore echo re-sends the
+  full table) → partial with a "layer-list write not acked" note.
+
 Known limitation (binding shape): OpenFlow bindings are
 `{behavior, actionType, actionCode, context: null}` — there is no slot for
 behavior parameters, so term ≠ 200 ms and non-zero unknown flag bytes do NOT
@@ -276,6 +308,13 @@ refs for `special:1` — an imported MO(2) is counted `unknown` on re-export
    layer fill stays keys+strips. Strips round-trip as `colorHex` in
    OpenFlow layer docs; bay positions 88-96 are a documented silent skip
    (parity — OF also loses bay colors). See the LED strips & bays note in
+   "Native format" above.
+6. **Flash capability model (Phase 4)** — ✅ DONE 2026-10-11 (commits
+   148bcdb..e66207f + the docs commit marking this). The flash dialog
+   renders every unstorable change with reason + effect (drop ledger + pure
+   probe), export `counts.unknown` stops counting known-empty slots, layer
+   reads distinguish empty from unsupported/unknown, and verdicts grade as
+   ok/cannot-verify/partial/fail. See the flash capability note in
    "Native format" above.
 
 ## Ecosystem / diplomacy context
