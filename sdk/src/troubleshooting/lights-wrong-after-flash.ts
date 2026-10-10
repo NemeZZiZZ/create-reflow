@@ -8,6 +8,7 @@ export default {
   details: [
     "Not a data problem: the stored LED maps are fine. The runtime lighting state is wedged (a stale ed/1011 effect slot is a frequent culprit) — the same rewrite clears that wedge too.",
     "Measured cure (third-party, 2026-09): re-writing the layer list — the 30/1001 handshake entries echoed back via 30/1002 — restores BOTH halves' lighting in a single frame and changes nothing stored.",
+    "Normal flashes now restore lighting automatically (layer-list echo at the end of every flash) — this button remains the manual cure.",
     "The left port drives both halves' lighting — run this on the left half even when only the right looks wrong.",
   ],
   steps: [

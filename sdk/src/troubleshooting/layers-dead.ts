@@ -9,6 +9,7 @@ export default {
     "Keymap/LED restores do not cover the layer list.",
     "Only a stock NayaFlow flash re-adds it (ADD_DEFAULT_DATA); its “Failed verify written data” error is benign — reproducible 2/2.",
     "Alternative (third-party, measured on their unit): rewrite the layer list directly — read it via the 30/1001 handshake and echo the entries back via 30/1002. The same rewrite also restores lighting after some dark-board states; see “Lighting wrong after a flash”, which has a button for it.",
+    "Automatic restore: normal flashes now end with the layer-list echo, so lighting comes back on its own — see “Lighting wrong after a flash” (its button remains the manual cure).",
   ],
   steps: [
     "Flash the left half once from stock NayaFlow.",

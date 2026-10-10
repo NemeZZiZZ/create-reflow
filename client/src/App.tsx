@@ -725,6 +725,7 @@ export default function App() {
             <LedTab
               layer={layer}
               onLayer={setLayer}
+              layers={exportIdxs}
               keymap={keymap}
               ledsByLayer={ledsByLayer}
               ledmap={ledmap}

@@ -186,6 +186,20 @@ build, host-table name resolution); file gate: `sdk/src/importers.ts`
   ONLY there — OpenFlow files never carry them. Legacy localStorage content
   is wiped once on upgrade; pre-flash backups preserve last-known
   `animationId`.
+- **Dynamic layers (Phase 2, 2026-10-10)**: the board's layer window is
+  0-7. The inventory comes from the 30/1001 handshake's layer-list table
+  (`parseInventory`, `sdk/src/layers.ts`); Add/Delete queue `layers` draft
+  ops (30/1002) and the post-flash dump re-reads the inventory. Layer
+  caches (keys/leds/notes/anims) are inventory-width — never assume 3.
+  Every flash ends with a layer-list restore echo; that echo also restores
+  runtime lighting on both halves automatically.
+- **STORED vs RUNTIME animation bytes — never mix them**: the layer-list
+  STORED byte is ZMK order Solid/Breathe/Spectrum/Swirl
+  (`STORED_ANIM_NAMES`, `sdk/src/layers.ts`); the RUNTIME `ed/1011` effect
+  index is Solid/Breathe/Swirl/Spectrum (`ANIM_NAMES`,
+  `sdk/src/settings.ts`) — the two tails are swapped (2↔3). Convert only
+  at the boundary, by name, via `storedAnimOf`/`storedAnimName`; never
+  reuse an index across the two tables.
 
 Known limitation (binding shape): OpenFlow bindings are
 `{behavior, actionType, actionCode, context: null}` — there is no slot for
@@ -238,6 +252,13 @@ refs for `special:1` — an imported MO(2) is counted `unknown` on re-export
    gesture editing beyond donor-copy (blocked by 1-byte payload same-length
    rule), macros (wire format still unknown — NayaFlow `macro_data` param
    exists, nothing decoded).
+4. **Layer management + lighting restore (Phase 2)** — ✅ DONE 2026-10-10
+   (commits 20c04e7..d853965 + the docs commit marking this). Dynamic 0-7
+   layer window: inventory parse + add/delete/restore encoders
+   (`sdk/src/layers.ts`), layer add/delete queue helpers, inventory-driven
+   tabs, and the flash-tail layer-list echo that restores runtime lighting
+   automatically. See the STORED vs RUNTIME animation note in "Native
+   format" above.
 
 ## Ecosystem / diplomacy context
 

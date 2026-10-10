@@ -32,6 +32,7 @@ const NO_SEL = new Set<number>();
 export default function LedTab({
   layer,
   onLayer,
+  layers,
   keymap,
   ledsByLayer,
   ledmap,
@@ -46,6 +47,8 @@ export default function LedTab({
 }: {
   layer: number;
   onLayer: (l: number) => void;
+  /** layer idxs to offer (board inventory; App's exportIdxs falls back to [0,1,2] pre-read) */
+  layers: number[];
   keymap: Map<number, Uint8Array>;
   ledsByLayer: LedRec[][];
   ledmap: Map<number, LedVal>;
@@ -119,7 +122,7 @@ export default function LedTab({
         <Card className="mb-3">
           <CardHeader className="flex-wrap">
             <div className="flex items-center gap-1" role="tablist" aria-label="Layer">
-              {[0, 1, 2].map((l) => (
+              {layers.map((l) => (
                 <Button
                   key={l}
                   variant={l === layer ? 'default' : 'outline'}

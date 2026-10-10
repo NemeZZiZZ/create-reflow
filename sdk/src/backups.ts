@@ -104,8 +104,10 @@ export function saveAutoBackup(
 ): SaveBackupResult {
   // One OpenFlow layer doc per non-empty layer cache (keys or leds —
   // either alone is restorable state); empty caches contribute nothing.
+  // Width follows the keys cache: layer caches are inventory-width (up to
+  // 8) since Phase 2, so a fixed 3 would silently drop layers 3+.
   const layers: unknown[] = [];
-  for (let L = 0; L < 3; L++) {
+  for (let L = 0; L < keys.length; L++) {
     const k = keys[L] ?? [];
     const l = leds[L] ?? [];
     if (k.length === 0 && l.length === 0) continue;

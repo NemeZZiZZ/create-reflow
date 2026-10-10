@@ -1069,6 +1069,27 @@ import { queueAction } from '@create-reflow/sdk';
     'skipped',
     '27 all-empty backup skipped',
   );
+
+  // Inventory-width caches: a 5-layer fixture stores 5 layer docs — the
+  // pre-Phase-2 fixed-3 loop silently dropped layers 3+.
+  const st5 = mkStorage();
+  const keys5: KeyRec[][] = [0, 1, 2, 3, 4].map((L) => [
+    mkRec(0x30 + L, [0x30 + L, 0x01, 0x04, 0x04, 0x00, 0x07, 0x00]),
+  ]);
+  const leds5: LedRec[][] = [0, 1, 2, 3, 4].map((L) => [
+    { kk: 0x30 + L, h: 30 * L, s: 100, offset: -1 },
+  ]);
+  const blobK5 = keys5.map((l) => l.reduce((a, r) => a + r.rec.length, 0));
+  const blobL5 = leds5.map((l) => l.length * 4);
+  const r5 = saveAutoBackup(keys5, leds5, blobK5, blobL5, undefined, st5);
+  eq(r5.status, 'saved', '27 5-layer backup saved');
+  const raw5 = JSON.parse(st5.getItem('naya-auto-backups') ?? '[]') as Array<{
+    meta: { id: string };
+    doc: { layers?: unknown[] };
+  }>;
+  eq(raw5[0]?.doc?.layers?.length, 5, '27 5-layer fixture → 5 layer docs (inventory width, not 3)');
+  const snap5 = loadAutoBackup(raw5[0]?.meta?.id ?? 'missing', st5);
+  eq(!('error' in snap5) && snap5.maps.layers.join(','), '0,1,2,3,4', '27 5-layer backup loads back layers 0-4');
 }
 
 // §32 per-key notes (UHK #8): notes ride ONLY in the backup container —
