@@ -192,7 +192,10 @@ Known limitation (binding shape): OpenFlow bindings are
 behavior parameters, so term ≠ 200 ms and non-zero unknown flag bytes do NOT
 survive an export→import round-trip; they reset to defaults on import. Also:
 backups created before ff58f42 baked a `'solid'` `animationId` into every
-layer doc.
+layer doc. Import/export asymmetry for layer switches: import maps
+`MO_LAYER_<uuid→2>` to T05 ORDER 2 (hold-layer2), but export only emits MO
+refs for `special:1` — an imported MO(2) is counted `unknown` on re-export
+(semantically honest; documented asymmetry).
 
 ## ROADMAP (owner-set priorities, 2026-10-01)
 
@@ -217,7 +220,8 @@ layer doc.
      88-96 = module bays (`#xxxxxx` placeholder — skip).
    - behavior press/tap/hold/double_tap: press+hold pair → T03; tap+hold →
      T10 (tap ≠ press = explicit multi-set); actionType 'modifier' →
-     MODMASK bytes; `layer_polite_hold` + `MO_LAYER_<uuid>` → T05 MO(n)
+     page-7 modifier usage 0xe0-0xe7 (nameToUsage), NOT MODMASK;
+     `layer_polite_hold` + `MO_LAYER_<uuid>` → T05 MO(n)
      resolved via layerRefs (device layers 1-2); per-layer animationId ≈
      ed/1011; colorHex → our H/S.
    - actionCode dictionary == the NayaCore host table already mirrored at

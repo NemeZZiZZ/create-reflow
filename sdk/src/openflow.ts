@@ -132,7 +132,9 @@ function resolveBinding(
  * the exact record selection behaviorSetOps makes: tap_hold → primary + full
  * shadow + tail; double → primary + mini shadow + tail; hold → T03 (stale-
  * shadow cleanup is the flash-time diff's job, not the parser's); base-only
- * → plain T01. Returns [] (+warning) when nothing valid remains. */
+ * → plain T01. A non-page-7 base (consumer) clamps to the base-only record
+ * with a warning — the T03/T10 quads hardcode page 0x0007. Returns []
+ * (+warning) when nothing valid remains. */
 function buildKeyRecords(pos: number, slots: Slots, warnings: string[]): Uint8Array[] {
   const { tap, hold } = slots;
   let { press, double, taphold } = slots;
@@ -153,8 +155,20 @@ function buildKeyRecords(pos: number, slots: Slots, warnings: string[]): Uint8Ar
     warnings.push(`key ${pos}: Tap+Hold dropped (double_tap missing) — device requires Double Tap first`);
     taphold = null;
   }
-  if (!hold)
-    return [base.page === 0x000c ? consumerRecord(pos, base.usage) : plainRecord(pos, base.usage)];
+  const baseOnly = () => [
+    base.page === 0x000c ? consumerRecord(pos, base.usage) : plainRecord(pos, base.usage),
+  ];
+  if (!hold) return baseOnly();
+  // The chain quads hardcode page 0x0007 (t10.ts quad()) — a non-page-7 base
+  // would be silently embedded as a keyboard usage and re-parse as a
+  // different valid key. Clamp to the base-only record, same keep-the-safe-
+  // subset rule as the press+double_tap clamp above (spec §0.2).
+  if (base.page !== 0x0007) {
+    warnings.push(
+      `key ${pos}: hold chain dropped — consumer keys cannot combine with hold/double-tap`,
+    );
+    return baseOnly();
+  }
   if (!double) return [t03Record(pos, hold.usage, base.usage)];
   return taphold
     ? [

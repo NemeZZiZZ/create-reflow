@@ -54,7 +54,7 @@ export function parseSnapshotFile(obj: unknown): ParseFileResult {
   if (!isObj(obj)) return { error: 'not a JSON object' };
   if (typeof obj.version === 'number' && obj.version > 1)
     return {
-      error: `OpenFlow file version ${obj.version} is newer than this app supports (version 1) — update naya-reflow`,
+      error: `OpenFlow file version ${obj.version} is newer than this app supports (version 1) — update create-reflow`,
     };
   if (obj.tool === 'naya-backup' || obj.tool === 'naya-reflow' || obj.kind === 'naya-full-backup')
     return {

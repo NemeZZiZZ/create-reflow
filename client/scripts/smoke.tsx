@@ -1478,6 +1478,106 @@ import { queueAction } from '@create-reflow/sdk';
   eq('error' in eOrder && /orderId/.test(eOrder.error), true, '48 orderId 3 rejected');
   const eKeys = parseOpenFlowLayer({ version: 1, kind: 'layer', layer: { orderId: 1 } });
   eq('error' in eKeys && /keys/.test(eKeys.error), true, '48 missing keys rejected');
+  // Final-review regression: a consumer-page base used to be embedded into
+  // the page-7-only T03/T10 quads (silent corruption, laundered by round-trip
+  // as a different valid key). Now the chain is dropped, the base-only
+  // consumer record survives, and a warning names it (spec §0.2 clamp style).
+  eq(
+    nameToUsage('C_VOL_UP')?.page === 0x000c && nameToUsage('C_VOL_UP')?.usage === 0xe9,
+    true,
+    '48 C_VOL_UP is consumer 0xe9',
+  );
+  const consLayer = {
+    version: 1,
+    kind: 'layer',
+    layer: {
+      srcId: OF_TEST_UUID1,
+      name: 'Layer 1',
+      orderId: 1,
+      iconId: null,
+      animationId: 'breathe',
+      keys: [] as { positionId: number; colorHex: null; bindings: ReturnType<typeof bind>[] }[],
+    },
+    macros: [] as unknown[],
+    layerRefs: { [OF_TEST_UUID1]: 1, [OF_TEST_UUID2]: 2 },
+  };
+  // T03 variant: consumer press + hold.
+  const consA = parseOpenFlowLayer({
+    ...consLayer,
+    layer: {
+      ...consLayer.layer,
+      keys: [
+        {
+          positionId: 7,
+          colorHex: null,
+          bindings: [bind('press', 'key', 'C_VOL_UP'), bind('hold', 'key', 'B')],
+        },
+      ],
+    },
+  });
+  eq('error' in consA ? 'err' : 'ok', 'ok', '48 consumer+hold doc parses');
+  if (!('error' in consA)) {
+    const atA = (kk: number) => consA.maps.keys[1].find((x) => x.kk === kk);
+    eq(
+      toHex(atA(7)!.rec),
+      '07 01 04 e9 00 0c 00',
+      '48 consumer base + hold → base-only consumer record (no T03)',
+    );
+    eq(consA.maps.keys[1].length, 1, '48 clamped key emits no extra records');
+    eq(
+      (consA.warnings.join('\n').match(/hold chain dropped/g) ?? []).length,
+      1,
+      '48 exactly one hold-chain-dropped warning',
+    );
+    const expA = buildOpenFlowLayer(consA.maps.keys[1], [], 1, null);
+    eq(expA.counts.unknown, 0, '48 roundtrip: consumer key exports, counts.unknown stays 0');
+    const reA = parseOpenFlowLayer(expA.data);
+    eq(
+      !('error' in reA) &&
+        reA.maps.keys[1].length === 1 &&
+        toHex(reA.maps.keys[1][0].rec) === '07 01 04 e9 00 0c 00',
+      true,
+      '48 roundtrip: re-parse gives back the same consumer record bytes',
+    );
+  }
+  // T10 variant: hold + double_tap chain. The tap slot cannot carry a
+  // consumer usage (parse guard skips it), so the consumer base enters via
+  // press; press+hold+double_tap is the T10-primary path (base = press when
+  // tap is absent).
+  const consB = parseOpenFlowLayer({
+    ...consLayer,
+    layer: {
+      ...consLayer.layer,
+      keys: [
+        {
+          positionId: 9,
+          colorHex: null,
+          bindings: [
+            bind('press', 'key', 'C_VOL_UP'),
+            bind('hold', 'key', 'D'),
+            bind('double_tap', 'key', 'E'),
+          ],
+        },
+      ],
+    },
+  });
+  eq('error' in consB ? 'err' : 'ok', 'ok', '48 consumer+hold+double doc parses');
+  if (!('error' in consB)) {
+    const atB = (kk: number) => consB.maps.keys[1].find((x) => x.kk === kk);
+    eq(toHex(atB(9)!.rec), '09 01 04 e9 00 0c 00', '48 T10 variant clamps to consumer record');
+    eq(consB.maps.keys[1].length, 1, '48 T10 variant emits no shadow or tail');
+    eq(/hold chain dropped/.test(consB.warnings.join('\n')), true, '48 T10 variant chain dropped warning');
+    const expB = buildOpenFlowLayer(consB.maps.keys[1], [], 1, null);
+    eq(expB.counts.unknown, 0, '48 T10 variant roundtrip: counts.unknown stays 0');
+    const reB = parseOpenFlowLayer(expB.data);
+    eq(
+      !('error' in reB) &&
+        reB.maps.keys[1].length === 1 &&
+        toHex(reB.maps.keys[1][0].rec) === '09 01 04 e9 00 0c 00',
+      true,
+      '48 T10 variant roundtrip: same consumer record bytes',
+    );
+  }
 }
 
 // §49 OpenFlow export + roundtrip
