@@ -1,5 +1,7 @@
 // Shared Save dropdown — lives in the headers of both Keyboard and
 // Layout views (exports read from the layer caches, no device traffic).
+// One OpenFlow layer doc per layer carries keys AND colors; 'All layers'
+// downloads all three in one go.
 import { Download } from "lucide-react";
 import { Button } from "./ui/button";
 import {
@@ -12,14 +14,14 @@ import {
 
 export default function SaveMenu({
   leftOn,
-  onExportKeys,
-  onExportLeds,
+  onExportLayer,
+  onExportAll,
   onImport,
   onBackups,
 }: {
   leftOn: boolean;
-  onExportKeys: (all: boolean) => void;
-  onExportLeds: (all: boolean) => void;
+  onExportLayer: (layer: number) => void;
+  onExportAll: () => void;
   onImport: () => void;
   onBackups: () => void;
 }) {
@@ -31,18 +33,18 @@ export default function SaveMenu({
         </Button>
       </DropdownMenuTrigger>
       <DropdownMenuContent>
-        <DropdownMenuItem onClick={() => onExportKeys(false)} disabled={!leftOn}>
-          Save keys
-        </DropdownMenuItem>
-        <DropdownMenuItem onClick={() => onExportKeys(true)} disabled={!leftOn}>
-          Save all keys
-        </DropdownMenuItem>
+        {[0, 1, 2].map((L) => (
+          <DropdownMenuItem
+            key={L}
+            onClick={() => onExportLayer(L)}
+            disabled={!leftOn}
+          >
+            Layer {L} (.openflow-layer.json)
+          </DropdownMenuItem>
+        ))}
         <DropdownMenuSeparator />
-        <DropdownMenuItem onClick={() => onExportLeds(false)} disabled={!leftOn}>
-          Save colors
-        </DropdownMenuItem>
-        <DropdownMenuItem onClick={() => onExportLeds(true)} disabled={!leftOn}>
-          Save all colors
+        <DropdownMenuItem onClick={onExportAll} disabled={!leftOn}>
+          All layers
         </DropdownMenuItem>
         <DropdownMenuSeparator />
         <DropdownMenuItem onClick={onImport} disabled={!leftOn}>

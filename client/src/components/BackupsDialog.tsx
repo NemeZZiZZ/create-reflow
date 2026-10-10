@@ -3,7 +3,6 @@
 // queues ops — nothing reaches the device until the user Flashes.
 import { useMemo, useState } from 'react';
 import { deleteAutoBackup, listAutoBackups } from '@create-reflow/sdk';
-import { SNAPSHOT_VERSION } from '@create-reflow/sdk';
 import { Button } from './ui/button';
 import {
   Dialog,
@@ -76,7 +75,7 @@ export default function BackupsDialog({
           </div>
         )}
         <p className="text-xs text-muted-foreground">
-          naya-reflow-web · snapshot schema v{SNAPSHOT_VERSION} · max 20 kept
+          naya-reflow-web · OpenFlow layer docs · max 20 kept
         </p>
       </DialogContent>
     </Dialog>

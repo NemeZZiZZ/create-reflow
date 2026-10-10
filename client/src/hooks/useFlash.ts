@@ -29,6 +29,7 @@ export function useFlash({
   draftRef,
   layers,
   notes,
+  anims,
   dumpAll,
   bumpDraft,
   log,
@@ -45,6 +46,9 @@ export function useFlash({
   };
   /** per-key notes ("L:kk") carried into the auto-backup */
   notes?: Record<string, string>;
+  /** last-known per-layer animations (lowercase animationId) read at flash
+   * time — getter so the freshest ref value lands in the backup */
+  anims?: () => Record<number, string>;
   dumpAll: (ses: NayaSession) => Promise<LayerDump | null>;
   bumpDraft: () => void;
   log: LogFn;
@@ -85,6 +89,8 @@ export function useFlash({
         layers.blobKeys,
         layers.blobLeds,
         notes,
+        undefined, // storage — default localStorage
+        anims?.(),
       );
       if (bk.status === 'saved')
         log(
@@ -194,7 +200,7 @@ export function useFlash({
       busyRef.current = false;
       setFlashing(false);
     }
-  }, [sesRef, busyRef, draftRef, layers, notes, dumpAll, bumpDraft, log]);
+  }, [sesRef, busyRef, draftRef, layers, notes, anims, dumpAll, bumpDraft, log]);
 
   const doFlashQueue = useCallback((): Promise<FlashResult> => {
     if (inFlight.current) return inFlight.current;

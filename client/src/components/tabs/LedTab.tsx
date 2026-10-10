@@ -42,6 +42,7 @@ export default function LedTab({
   leftOn,
   customColors,
   onSaveCustomColors,
+  onAnimQueued,
 }: {
   layer: number;
   onLayer: (l: number) => void;
@@ -55,6 +56,8 @@ export default function LedTab({
   leftOn: boolean;
   customColors: HsColor[];
   onSaveCustomColors: (cs: HsColor[]) => void;
+  /** device has no GET for ed/1011 — App tracks last-known animations */
+  onAnimQueued?: (layer: number, anim: number) => void;
 }) {
   const [tool, setTool] = useState<LedTool>('brush');
   const [color, setColor] = useState<HsColor>({ h: 180, s: 100 });
@@ -98,6 +101,7 @@ export default function LedTab({
   function queueAnim(i: number) {
     draftRef.current.add(animOp(layer, i));
     bumpDraft();
+    onAnimQueued?.(layer, i);
     log('inf', `queued animation L${layer} → ${ANIM_NAMES[i]}`);
   }
 

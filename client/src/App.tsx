@@ -35,10 +35,10 @@ import { useCustomColors } from "./hooks/useCustomColors";
 import { useKbFit } from "./hooks/useKbFit";
 import { queueAction, queueBehaviorSet, queueColor, queueFillLayer, type SelKey } from '@create-reflow/sdk';
 import { FLAVOR_BYTES, flavorById, type FlavorId } from '@create-reflow/sdk';
-import { buildKeymapExport, buildLedmapExport } from '@create-reflow/sdk';
+import { buildOpenFlowLayer, animOp, ANIM_NAMES } from '@create-reflow/sdk';
 import { saveJson } from './lib/save';
 import { diffSnapshotToDraft, parseSnapshotFile } from '@create-reflow/sdk';
-import type { SnapMaps } from '@create-reflow/sdk';
+import type { ParseFileResult, SnapMaps } from '@create-reflow/sdk';
 import { listAutoBackups, loadAutoBackup } from '@create-reflow/sdk';
 import type { ActionDef } from '@create-reflow/sdk';
 import type { BehaviorSet } from '@create-reflow/sdk';
@@ -111,6 +111,12 @@ export default function App() {
       /* ignore */
     }
   }
+  // Last-known per-layer LED animation, as the lowercase OpenFlow
+  // animationId ('solid' | 'breathe' | 'swirl' | 'spectrum'). The device
+  // has no GET for ed/1011, so this host-side record is all we have:
+  // exports and pre-flash backups bake it into the layer doc, imports
+  // queue only the diffs. Absent layer → null → builder emits 'solid'.
+  const animByLayer = useRef<Record<number, string>>({});
   const [colorDlg, setColorDlg] = useState(false);
   const [dlgColor, setDlgColor] = useState({ h: 180, s: 100 });
   const [flashOpen, setFlashOpen] = useState(false);
@@ -160,6 +166,7 @@ export default function App() {
       blobLeds: blobTotals.leds,
     },
     notes,
+    anims: () => animByLayer.current,
     dumpAll: layers.dumpAll,
     bumpDraft,
     log,
@@ -224,28 +231,30 @@ export default function App() {
     }
   }
 
-  function exportKeys(all: boolean) {
-    const r = buildKeymapExport(keysByLayer, blobTotals.keys, layer, all, notes);
-    if (!r) {
-      log("err", "export keys: layer cache empty — Refresh first");
+  // Exports: one OpenFlow layer doc per layer — keys AND colors live in
+  // the same file now (the old split keymap/ledmap exports died with the
+  // legacy format). The animation rides in as animationId from last-known
+  // state; an absent record lets the builder emit 'solid'.
+  function exportLayer(L: number) {
+    const keys = keysByLayer[L] ?? [];
+    const leds = ledsByLayer[L] ?? [];
+    if (keys.length === 0 && leds.length === 0) {
+      log("err", `export: layer ${L} cache empty — Refresh first`);
       return;
     }
-    for (const [L, n] of Object.entries(r.counts))
-      log("inf", `export: layer ${L}: ${n} records`);
+    const r = buildOpenFlowLayer(keys, leds, L, animByLayer.current[L] ?? null);
     saveJson(r.fileName, r.data);
-    log("inf", "export: keymap JSON saved");
+    log(
+      "inf",
+      `export: ${r.fileName}: ${r.counts.keys} keys, ${r.counts.leds} colors` +
+        (r.counts.unknown > 0
+          ? `, ${r.counts.unknown} unexportable dropped`
+          : ""),
+    );
   }
 
-  function exportLeds(all: boolean) {
-    const r = buildLedmapExport(ledsByLayer, blobTotals.leds, layer, all);
-    if (!r) {
-      log("err", "export leds: layer cache empty — Refresh first");
-      return;
-    }
-    for (const [L, n] of Object.entries(r.counts))
-      log("inf", `export: ledmap ${L}: ${n} LEDs`);
-    saveJson(r.fileName, r.data);
-    log("inf", "export: ledmap JSON saved");
+  function exportAllLayers() {
+    for (const L of [0, 1, 2]) exportLayer(L);
   }
 
   // --- troubleshooting actions ----------------------------------------------
@@ -358,19 +367,57 @@ export default function App() {
   const importRef = useRef<HTMLInputElement>(null);
   const [backupsOpen, setBackupsOpen] = useState(false);
 
-  // Shared import/restore tail: diff a parsed snapshot against the live
-  // caches and queue the difference (latest-op-wins). Caller does the
-  // log/toast wording around it.
-  function applySnap(snap: SnapMaps, name: string) {
-    const r = diffSnapshotToDraft(draftRef.current, snap, keysByLayer, ledsByLayer);
+  // Strips (74-87) and module bays (88-96) have no writable device store —
+  // the parser reports them as skip-warnings on every layer doc we export
+  // ourselves (exactly 2 per layer, always). Purely informational, so the
+  // per-layer pair collapses into one counted line instead of spamming.
+  const stripBayRe =
+    /^(?:layer (\d+): )?skipped \d+ (?:LED strip|module bay) position/;
+
+  // Shared import/restore tail: log the parse warnings, diff the parsed
+  // maps against the live caches and queue the difference (latest-op-wins),
+  // then queue per-layer animation diffs against last-known. Caller does
+  // the log/toast wording around it.
+  function applySnap(
+    res: Extract<ParseFileResult, { maps: SnapMaps }>,
+    name: string,
+  ) {
+    const stripBays: Record<number, number> = {};
+    for (const w of res.warnings) {
+      const m = stripBayRe.exec(w);
+      if (!m) {
+        log("inf", `import '${name}': ${w}`);
+        continue;
+      }
+      const L = m[1] !== undefined ? Number(m[1]) : res.maps.layers[0] ?? 0;
+      stripBays[L] = (stripBays[L] ?? 0) + 1;
+    }
+    for (const [L, n] of Object.entries(stripBays))
+      log("inf", `import '${name}': layer ${L}: strips/bays informational ×${n}`);
+
+    const r = diffSnapshotToDraft(draftRef.current, res.maps, keysByLayer, ledsByLayer);
     bumpDraft();
     log(
       "inf",
-      `import '${name}': layers [${snap.layers.join(",")}] → ` +
+      `import '${name}': layers [${res.maps.layers.join(",")}] → ` +
         `${r.keysQueued} key(s) + ${r.ledsQueued} LED(s) queued` +
         (r.skippedMissing > 0 ? `, ${r.skippedMissing} skipped (no live counterpart)` : ""),
     );
-    if (r.keysQueued + r.ledsQueued > 0)
+
+    // Animation: queue an ed/1011 op only when the file disagrees with
+    // last-known — the device has no GET, animByLayer is the only baseline.
+    let animsQueued = 0;
+    for (const [Ls, anim] of Object.entries(res.anims)) {
+      const L = Number(Ls);
+      const animName = ANIM_NAMES[anim];
+      if (!animName) continue; // parser never emits out of range; guarded anyway
+      if (animName.toLowerCase() === (animByLayer.current[L] ?? null)) continue;
+      draftRef.current.add(animOp(L, anim));
+      animsQueued++;
+      log("inf", `import '${name}': layer ${L} animation → ${animName}`);
+    }
+
+    if (r.keysQueued + r.ledsQueued + animsQueued > 0)
       log("inf", "import: review the queue, then Flash to apply");
     else log("inf", "import: device already matches the snapshot");
   }
@@ -408,6 +455,23 @@ export default function App() {
     const meta = listAutoBackups().find((m) => m.id === id);
     applySnap(snap, `backup ${meta ? meta.ts : id}`);
     setBackupsOpen(false);
+  }
+
+  // Flash + last-known animation promotion: settings ops self-remove from
+  // the queue on ACK, so harvest the queued ed/1011 payloads BEFORE the run
+  // and promote them to animByLayer only when every op verified.
+  async function handleFlash() {
+    const queuedAnims: Record<number, number> = {};
+    for (const o of draftRef.current.ops)
+      if (o.kind === "settings" && o.path === "ed/1011" && o.payload.length >= 2)
+        queuedAnims[o.payload[0]] = o.payload[1];
+    const r = await doFlashQueue();
+    if (r === "ok")
+      for (const [L, a] of Object.entries(queuedAnims)) {
+        const animName = ANIM_NAMES[a];
+        if (animName) animByLayer.current[Number(L)] = animName.toLowerCase();
+      }
+    return r;
   }
 
   // Live timeout read for the Behavior tab (left half only). Failures
@@ -486,8 +550,8 @@ export default function App() {
   const saveMenu = (
     <SaveMenu
       leftOn={leftOn}
-      onExportKeys={exportKeys}
-      onExportLeds={exportLeds}
+      onExportLayer={exportLayer}
+      onExportAll={exportAllLayers}
       onImport={() => importRef.current?.click()}
       onBackups={() => setBackupsOpen(true)}
     />
@@ -594,6 +658,10 @@ export default function App() {
               leftOn={leftOn}
               customColors={customColors}
               onSaveCustomColors={saveCustomColors}
+              onAnimQueued={(L, a) => {
+                const animName = ANIM_NAMES[a];
+                if (animName) animByLayer.current[L] = animName.toLowerCase();
+              }}
             />
           )}
 
@@ -678,7 +746,7 @@ export default function App() {
           open={flashOpen}
           onOpenChange={setFlashOpen}
           draft={draftRef.current}
-          onFlash={doFlashQueue}
+          onFlash={handleFlash}
           onChanged={bumpDraft}
           busy={flashing}
           state={flashState}
