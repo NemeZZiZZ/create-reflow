@@ -533,10 +533,16 @@ export class NayaSession {
   }
 
   async writeLayerList(payload: Uint8Array): Promise<Frame> {
-    // 30/1002 layer-list write (add / delete / restore share the channel;
-    // the payload's leading 00 is the count byte, entries follow). ACK
-    // gating stays caller-side: accepted when payload[0] === 0x00 or
-    // echoes a layer idx; 0xEA = value rejected → caller aborts.
+    // 30/1002 layer-list write (add / delete / restore share the channel).
+    // Wire facts (owner KB + captures, fw 3.41.0): every measured 30/1002
+    // write's params begin `00 00` — flag byte + index byte 0x00, the same
+    // [00, index, data] convention as writeKey/writeLed (the encoders in
+    // layers.ts bake the prefix in). Read-side replies (30/1001) carry a
+    // two-byte header — status + index echo — before the 20-byte entries;
+    // parseInventory skips both. ACK gating stays caller-side: accepted
+    // when payload[0] === 0x00 (e.g. the `00 00` ack) or a layer idx
+    // echo; 0xEA = value rejected → the caller marks the flash partial
+    // and continues (the tail restore-echo re-sends the full table).
     return this.cmd(0x30, 0x10, 0x02, payload);
   }
 

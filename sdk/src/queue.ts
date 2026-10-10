@@ -241,3 +241,22 @@ export function queueLayerDelete(
   for (const r of leds) draft.add({ kind: 'led', layer: idx, kk: r.kk, h: 0, s: 0 });
   return { queued: true, frames: 1 + totalKeys + leds.length };
 }
+
+/** Idxes of layer ADDs already queued in the draft (double-add guard).
+ * The board inventory only changes after a flash, so a UI computing the
+ * next free idx from the inventory would queue a second add at the SAME
+ * idx on a second click — callers refuse when the target idx is already
+ * here. Decodes add ops from their payload: an add entry carries the
+ * wire signature [idx][idx][anim][0x10][uuid16] after the 00 00 prefix;
+ * delete payloads ([idx] 00 00 00 ×2) never match it. */
+export function pendingLayerAddIdxs(draft: Draft): number[] {
+  const out: number[] = [];
+  for (const o of draft.ops) {
+    if (o.kind !== 'layers') continue;
+    const p = o.payload;
+    for (let off = 2; off + 20 <= p.length; off += 20) {
+      if (p[off] === p[off + 1] && p[off + 3] === 0x10) out.push(p[off]);
+    }
+  }
+  return out;
+}

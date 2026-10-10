@@ -39,7 +39,7 @@ import {
   uuidToBytes, bytesToUuid, mintLayerUuid,
 } from '@create-reflow/sdk';
 import type { LayerEntry } from '@create-reflow/sdk';
-import { queueLayerAdd, queueLayerDelete } from '@create-reflow/sdk';
+import { queueLayerAdd, queueLayerDelete, pendingLayerAddIdxs } from '@create-reflow/sdk';
 
 let n = 0;
 function eq(a: unknown, b: unknown, name: string) {
@@ -1843,42 +1843,55 @@ import { queueAction } from '@create-reflow/sdk';
       return true;
     }
   };
-  // Real board table (OF capture): count byte + three 20-byte entries
-  // [idx][id][anim][0x10][uuid16].
+  // Real board table — byte-exact 30/1001 reply payload (fw 3.41.0),
+  // from the owner's capture research/dumps/aux-left.txt (identical in
+  // all six aux-left* captures): [status][index echo] + three 20-byte
+  // entries [idx][id][anim][0x10][uuid16]. TWO leading bytes before the
+  // first entry (62 B payload = 2 + 3×20); the second byte is NOT a count.
   const tableHex51 =
-    '00' +
-    '00 00 00 10 0c b7 6a 71 1d 42 43 c8 8b 4e ab 1c 52 16 95 c9' +
-    '01 01 01 10 c3 2c 7d 56 a4 72 44 bb ac 09 f8 b5 26 ef a8 c1' +
-    '02 02 03 10 5c ea 2e 10 36 bc 4d d5 90 dc bf d6 1e 13 a1 f9';
+    '00 00' +
+    ' 00 00 00 10 3b 19 05 55 02 e0 4b 29 8b c9 ea c0 67 0f 11 36' +
+    ' 01 01 00 10 e6 b7 0e c8 75 ad 46 63 a1 f4 9f a2 94 c7 de 9a' +
+    ' 02 02 00 10 8e e3 ff fe 78 94 40 1e b9 b5 3e 94 ea 8a a5 35';
   const inv51 = parseInventory(hexToBytes(tableHex51)!);
   eq(inv51.length === 3, true, '51 board table → 3 entries');
   eq(
     JSON.stringify(inv51.map((e) => [e.idx, e.uuid, e.animStored])),
     JSON.stringify([
-      [0, '0cb76a711d4243c88b4eab1c521695c9', 0],
-      [1, 'c32c7d56a47244bbac09f8b526efa8c1', 1],
-      [2, '5cea2e1036bc4dd590dcbfd61e13a1f9', 3],
+      [0, '3b19055502e04b298bc9eac0670f1136', 0],
+      [1, 'e6b70ec875ad4663a1f49fa294c7de9a', 0],
+      [2, '8ee3fffe7894401eb9b53e94ea8aa535', 0],
     ]),
     '51 board table entries',
   );
-  eq(inv51[2].animStored === 3, true, '51 layer2 animStored 3');
+  // The real capture carries anim 0 on every entry; a patched variant
+  // (entry-2 anim byte → 03) pins the animStored parse position.
+  const anim51 = parseInventory(
+    hexToBytes(tableHex51.replace('02 02 00 10', '02 02 03 10'))!,
+  );
+  eq(anim51[2].animStored === 3, true, '51 layer2 animStored 3 (patched variant)');
   eq(storedAnimName(3), 'Swirl', '51 storedAnimName(3)');
-  // Count byte is discarded: leading 03 variant parses identically.
-  const invCount51 = parseInventory(hexToBytes('03' + tableHex51.slice(2))!);
+  // The two leading bytes (status + index echo) are discarded — a
+  // non-zero index echo parses identically (it is NOT a layer count).
+  const invCount51 = parseInventory(hexToBytes('00 03' + tableHex51.slice(5))!);
   eq(
     JSON.stringify(invCount51) === JSON.stringify(inv51),
     true,
-    '51 count byte discarded (03 variant)',
+    '51 status+index-echo bytes discarded (echo 03 variant)',
   );
   // Tolerance: uuid-length byte ≠ 0x10 skips the entry.
-  const corrupt51 = hexToBytes(tableHex51.replace('01 01 01 10', '01 01 01 08'))!;
+  const corrupt51 = hexToBytes(tableHex51.replace('01 01 00 10', '01 01 00 08'))!;
   eq(parseInventory(corrupt51).length === 2, true, '51 len≠0x10 entry skipped');
   // Trailing bytes that don't form a full 20-byte block are ignored.
   const garbage51 = hexToBytes(tableHex51 + ' de ad be')!;
   eq(parseInventory(garbage51).length === 3, true, '51 trailing garbage tolerated');
   // Empty / short payloads → [].
   eq(parseInventory(new Uint8Array(0)).length === 0, true, '51 empty payload → []');
-  eq(parseInventory(hexToBytes('00 00 00 10 0c b7')!).length === 0, true, '51 short payload → []');
+  eq(
+    parseInventory(hexToBytes('00 00 00 00 00 10 3b 19')!).length === 0,
+    true,
+    '51 short payload → []',
+  );
   // Wire guard: 30/1002 is a legal layer-list channel.
   eq(throws51(() => assertWireAllowed(0x30, 0x10, 0x02)), false, '51 guard allows 30/1002');
   // Stored-anim map (data + lookups).
@@ -1888,45 +1901,62 @@ import { queueAction } from '@create-reflow/sdk';
   eq(storedAnimOf('nope') === -1, true, '51 storedAnimOf unknown');
   eq(storedAnimName(0), 'Solid', '51 storedAnimName(0)');
   eq(storedAnimName(9), null, '51 storedAnimName out of range');
-  // Add encode (OF test capture, two entries).
+  // Anim discriminator (review gap): a queued 'Swirl' add must land the
+  // STORED anim byte 3 in the op payload entry — bytes 0/1 (flag+index)
+  // are identical for every anim; the anim byte is what discriminates
+  // STORED vs RUNTIME mappings.
+  {
+    const d51s = new Draft();
+    queueLayerAdd(d51s, 5, '8ee3fffe7894401eb9b53e94ea8aa535', 'Swirl');
+    const pay51s = (d51s.ops[0] as LayerListOp).payload;
+    eq(
+      pay51s[0] === 0 && pay51s[1] === 0 && pay51s[4] === 3,
+      true,
+      '51 Swirl add → stored anim byte 3 in op payload',
+    );
+  }
+  // Add encode (measured wire form, KB LY-07 style: `00 00 0303 00 10 <uuid>`
+  // — every 30/1002 write opens with flag byte + index byte 0x00, the same
+  // [00, index, data] convention as writeKey/writeLed).
   const add51: LayerEntry[] = [
-    { idx: 3, uuid: '878610a4c7434723a59932655479dee2', animStored: 0 },
-    { idx: 4, uuid: '05a59817d3a442df9b959d5f85067603', animStored: 0 },
+    { idx: 3, uuid: '3b19055502e04b298bc9eac0670f1136', animStored: 0 },
+    { idx: 4, uuid: 'e6b70ec875ad4663a1f49fa294c7de9a', animStored: 0 },
   ];
   eq(
     toHex(encodeLayerListAdd(add51)),
-    '00 03 03 00 10 87 86 10 a4 c7 43 47 23 a5 99 32 65 54 79 de e2' +
-      ' 04 04 00 10 05 a5 98 17 d3 a4 42 df 9b 95 9d 5f 85 06 76 03',
-    '51 add byte-exact',
+    '00 00 03 03 00 10 3b 19 05 55 02 e0 4b 29 8b c9 ea c0 67 0f 11 36' +
+      ' 04 04 00 10 e6 b7 0e c8 75 ad 46 63 a1 f4 9f a2 94 c7 de 9a',
+    '51 add byte-exact (00 00 flag+index prefix)',
   );
-  eq(toHex(encodeLayerListAdd([])), '00', '51 empty add = count byte only');
-  // Delete encode: whole set sent TWICE (OF capture).
+  eq(toHex(encodeLayerListAdd([])), '00 00', '51 empty add = flag+index prefix only');
+  // Delete encode: whole set sent TWICE (measured, KB LY-08 style:
+  // `00 00 03000000 04000000 03000000 04000000`).
   eq(
     toHex(encodeLayerListDelete([3, 4])),
-    '00 03 00 00 00 04 00 00 00 03 00 00 00 04 00 00 00',
-    '51 delete byte-exact (set twice)',
+    '00 00 03 00 00 00 04 00 00 00 03 00 00 00 04 00 00 00',
+    '51 delete byte-exact (00 00 prefix, set twice)',
   );
   // Restore = add over the full sorted table.
   eq(
     toHex(
       encodeRestorePayload([
-        { idx: 4, uuid: '05a59817d3a442df9b959d5f85067603', animStored: 1 },
-        { idx: 3, uuid: '878610a4c7434723a59932655479dee2', animStored: 2 },
+        { idx: 4, uuid: 'e6b70ec875ad4663a1f49fa294c7de9a', animStored: 1 },
+        { idx: 3, uuid: '3b19055502e04b298bc9eac0670f1136', animStored: 2 },
       ]),
     ),
-    '00 03 03 02 10 87 86 10 a4 c7 43 47 23 a5 99 32 65 54 79 de e2' +
-      ' 04 04 01 10 05 a5 98 17 d3 a4 42 df 9b 95 9d 5f 85 06 76 03',
+    '00 00 03 03 02 10 3b 19 05 55 02 e0 4b 29 8b c9 ea c0 67 0f 11 36' +
+      ' 04 04 01 10 e6 b7 0e c8 75 ad 46 63 a1 f4 9f a2 94 c7 de 9a',
     '51 restore sorts by idx',
   );
   // uuid ↔ bytes helpers (plain hex, no dashes).
   eq(
-    toHex(uuidToBytes('878610a4c7434723a59932655479dee2')),
-    '87 86 10 a4 c7 43 47 23 a5 99 32 65 54 79 de e2',
+    toHex(uuidToBytes('3b19055502e04b298bc9eac0670f1136')),
+    '3b 19 05 55 02 e0 4b 29 8b c9 ea c0 67 0f 11 36',
     '51 uuidToBytes hex',
   );
   eq(
-    bytesToUuid(uuidToBytes('878610a4c7434723a59932655479dee2')),
-    '878610a4c7434723a59932655479dee2',
+    bytesToUuid(uuidToBytes('3b19055502e04b298bc9eac0670f1136')),
+    '3b19055502e04b298bc9eac0670f1136',
     '51 uuid roundtrip',
   );
   // Minted uuids: 32 lowercase hex, unique per call.
@@ -1971,8 +2001,8 @@ import { queueAction } from '@create-reflow/sdk';
     true,
     '51 restore = add over inventory (echo transparency)',
   );
-  // Single-frame budget: a 4-entry restore payload (count + 4×20B) must
-  // stay ≤ 250 bytes so one 30/1002 frame carries it.
+  // Single-frame budget: a 4-entry restore payload (00 00 prefix + 4×20B)
+  // must stay ≤ 250 bytes so one 30/1002 frame carries it.
   const inv4_51 = parseInventory(
     hexToBytes(
       tableHex51 +
@@ -2165,7 +2195,8 @@ import { queueAction } from '@create-reflow/sdk';
 
 // §53 layer add/delete queue helpers
 {
-  const u53 = '878610a4c7434723a59932655479dee2';
+  const u53 = '3b19055502e04b298bc9eac0670f1136'; // real captured uuid
+  const u53b = 'e6b70ec875ad4663a1f49fa294c7de9a'; // real captured uuid
   // Add: ONE layers op, payload = single-entry encodeLayerListAdd.
   const d53 = new Draft();
   const a53 = queueLayerAdd(d53, 3, u53);
@@ -2206,7 +2237,7 @@ import { queueAction } from '@create-reflow/sdk';
   // Two adds with different uuids → different payloads → coexist.
   const d53e = new Draft();
   queueLayerAdd(d53e, 3, u53);
-  queueLayerAdd(d53e, 4, '05a59817d3a442df9b959d5f85067603');
+  queueLayerAdd(d53e, 4, u53b);
   eq(d53e.size, 2, '53 two adds coexist');
   // Delete: the layers op goes FIRST, then the layer's keymap span is
   // blanked via ONE keyset op of [pos][07][00] fillers (absent-satisfied
@@ -2237,9 +2268,13 @@ import { queueAction } from '@create-reflow/sdk';
   );
   eq(dlop53.label, 'delete layer 2', '53 delete label');
   eq(
-    dlop53.payload.length === 9 && dlop53.payload[1] === 2 && dlop53.payload[5] === 2,
+    dlop53.payload.length === 10 &&
+      dlop53.payload[0] === 0 &&
+      dlop53.payload[1] === 0 &&
+      dlop53.payload[2] === 2 &&
+      dlop53.payload[6] === 2,
     true,
-    '53 delete ×2 repeat pattern present',
+    '53 delete ×2 repeat pattern present (00 00 + [idx]000000 ×2 = 10 B)',
   );
   const ks53 = d53f.ops.find((o): o is KeySetOp => o.kind === 'keyset');
   eq(ks53 !== undefined, true, '53 blank keyset op present');
@@ -2292,6 +2327,24 @@ import { queueAction } from '@create-reflow/sdk';
     '53 coexist: both layers ops kept',
   );
   eq(d53i.size, 6, '53 coexist total ops = 2 layers + 1 keyset + 3 leds');
+  // Double-add guard: pendingLayerAddIdxs decodes the queued add idxs
+  // from the draft (the inventory only changes after a flash, so a
+  // second click must see the first add still queued). Delete payloads
+  // never match the [idx][idx][anim][0x10] add signature.
+  const d53j = new Draft();
+  queueLayerAdd(d53j, 5, u53);
+  queueLayerAdd(d53j, 6, u53b);
+  queueLayerDelete(d53j, 2, keys53, leds53, 156, 3);
+  eq(
+    JSON.stringify(pendingLayerAddIdxs(d53j)),
+    '[5,6]',
+    '53 pendingLayerAddIdxs → queued add idxs only',
+  );
+  eq(
+    pendingLayerAddIdxs(new Draft()).length,
+    0,
+    '53 pendingLayerAddIdxs empty draft → []',
+  );
 }
 
 void main();

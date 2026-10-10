@@ -25,7 +25,7 @@ import { TooltipProvider } from "./components/ui/tooltip";
 import { useLog } from "./hooks/useLog";
 import { usePersistentFlag } from "./hooks/usePersistentFlag";
 import { initialUrlState, useUrlSync } from "./hooks/useUrlSync";
-import { useLayers } from "./hooks/useLayers";
+import { useLayers, readInventory } from "./hooks/useLayers";
 import { useSessions } from "./hooks/useSessions";
 import { useAuxPolling } from "./hooks/useAuxPolling";
 import { useSelection } from "./hooks/useSelection";
@@ -33,7 +33,7 @@ import { useDraft } from "./hooks/useDraft";
 import { useFlash } from "./hooks/useFlash";
 import { useCustomColors } from "./hooks/useCustomColors";
 import { useKbFit } from "./hooks/useKbFit";
-import { queueAction, queueBehaviorSet, queueColor, queueFillLayer, queueLayerAdd, queueLayerDelete, mintLayerUuid, Draft, type SelKey } from '@create-reflow/sdk';
+import { queueAction, queueBehaviorSet, queueColor, queueFillLayer, queueLayerAdd, queueLayerDelete, pendingLayerAddIdxs, mintLayerUuid, encodeRestorePayload, Draft, type SelKey } from '@create-reflow/sdk';
 import { FLAVOR_BYTES, flavorById, type FlavorId } from '@create-reflow/sdk';
 import { buildOpenFlowLayer, animOp, ANIM_NAMES } from '@create-reflow/sdk';
 import { saveJson } from './lib/save';
@@ -286,6 +286,13 @@ export default function App() {
       toast.error('layer window is full (0-7)');
       return;
     }
+    // Double-add guard: the inventory only changes after a flash, so a
+    // second click before flashing would queue another add at the SAME
+    // idx. Refuse — flash to apply the queued one first.
+    if (pendingLayerAddIdxs(draftRef.current).includes(next)) {
+      toast.error(`Layer ${next + 1} is already queued — flash to apply`);
+      return;
+    }
     const r = queueLayerAdd(draftRef.current, next, mintLayerUuid(), 'Solid');
     if (!r.queued) {
       toast.error(r.error ?? 'layer add not queued');
@@ -372,35 +379,25 @@ export default function App() {
         toast.info("Safe reboot sent — reconnects in ~30 s");
         log("cdc", "trouble: ee/10ce safe reboot sent");
       },
-      // R5 echo-back: read the layer list, echo the same entries back.
-      // Restores wedged runtime lighting on both halves (measured 2026-09,
-      // third-party); changes nothing stored. Shape-validated: an odd reply
-      // aborts instead of echoing garbage into 30/1002.
+      // R5 echo-back: read the layer list fresh, echo the same entries
+      // back. Restores wedged runtime lighting on both halves (measured
+      // 2026-09, third-party); changes nothing stored. Reuses the same
+      // SDK path the flash tail uses — readInventory parses the
+      // two-byte-header reply, writeLayerList sends the 00 00-prefixed
+      // restore payload. No hand-rolled parse/echo.
       rewriteLayerList: async () => {
         const left = sesRef.current.get("left");
         if (!left) throw new Error("Connect the LEFT half first");
-        const f = await left.handshake();
-        const p = f.payload;
-        if (
-          p.length < 20 ||
-          p[2] !== 0x00 ||
-          p[3] !== 0x10 ||
-          (p.length - 4) % 16 !== 0
-        )
+        const inv = await readInventory(left);
+        if (inv.length === 0)
           throw new Error(
-            `layer-list reply has an unexpected shape (${p.length} B) — refusing to echo it back`,
+            "layer list unreadable (0 entries) — nothing to echo back",
           );
         assertWireAllowed(0x30, 0x10, 0x02);
-        await left.cmd(
-          0x30,
-          0x10,
-          0x02,
-          Uint8Array.from([0, 0, ...p.slice(4)]),
-        );
-        const n = (p.length - 4) / 16;
+        await left.writeLayerList(encodeRestorePayload(inv));
         log(
           "inf",
-          `trouble: layer list rewritten (${n} entr${n === 1 ? "y" : "ies"} echoed back unchanged)`,
+          `trouble: layer list rewritten (${inv.length} entr${inv.length === 1 ? "y" : "ies"} echoed back unchanged)`,
         );
       },
     };

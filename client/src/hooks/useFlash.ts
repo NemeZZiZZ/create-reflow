@@ -24,9 +24,11 @@ export interface FlashState {
 
 const IDLE: FlashState = { phase: 'idle', done: 0, total: 0, message: null };
 
-/** Layer-list ACK gate (30/1002): accepted when payload[0] is 00 or echoes
- * a layer idx (the app's 0..7 window). 0xEA = value rejected; an empty
- * payload or any other byte is not an ACK. */
+/** Layer-list ACK gate (30/1002): accepted when payload[0] is 00 (the
+ * measured ack opens `00 00` — flag byte + index echo, same prefix every
+ * 30/1002 exchange uses) or echoes a layer idx (the app's 0..7 window).
+ * 0xEA = value rejected; an empty payload or any other byte is not an
+ * ACK. */
 function isLayerListAck(payload: Uint8Array): boolean {
   if (payload.length === 0) return false;
   const p0 = payload[0];
@@ -179,6 +181,11 @@ export function useFlash({
       }
       bumpDraft(); // settings/module/layers ops removed themselves above
       log('inf', `flash queue: ${done}/${total} written, re-reading…`);
+      // The device drops or reorders frames right after a write burst
+      // (ED animation writes spin the LED engine up; immediate reads and
+      // re-dumps came back truncated or with spliced parts). Settle FIRST,
+      // then read — the inventory read below is as exposed as the dump.
+      await sleep(600);
       // Layer-list restore echo (flash tail): re-read the inventory FRESH
       // post-write — never a cached copy, this flash may have changed the
       // table — then send the full table back so the board's stored
@@ -201,10 +208,6 @@ export function useFlash({
             `layer-list echo: ${inv.length} entries — stored lighting restored (both halves)`,
           );
       }
-      // ED writes (animations) spin the LED engine up and the device drops
-      // or reorders multipart replies right after — immediate re-dumps came
-      // back with spliced parts ("truncated"). Let it settle first.
-      await sleep(600);
       const fresh = await dumpAll(ses);
       if (fresh) {
         d.reconcile(fresh.keys, fresh.leds);

@@ -24,9 +24,10 @@ export interface LayerDump {
 }
 
 /** Fresh layer-list inventory: one handshake — its Frame payload IS the
- * inventory (count byte + 20-byte entries). Single frame, so no settle or
- * retry. Callers that must not serve stale data (flash tail) always read
- * fresh; dumpAll parses the same handshake it already performs. */
+ * inventory (status + index echo + 20-byte entries; parseInventory skips
+ * the two leading bytes). Single frame, so no settle or retry. Callers
+ * that must not serve stale data (flash tail) always read fresh;
+ * dumpAll parses the same handshake it already performs. */
 export async function readInventory(
   ses: NayaSession,
 ): Promise<LayerEntry[]> {
