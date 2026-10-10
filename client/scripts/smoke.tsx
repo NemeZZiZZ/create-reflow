@@ -42,6 +42,13 @@ import type { LayerEntry } from '@create-reflow/sdk';
 import { queueLayerAdd, queueLayerDelete, pendingLayerAddIdxs } from '@create-reflow/sdk';
 import { BAY_LED_RANGES, queueBayColor, queueFillLayer } from '@create-reflow/sdk';
 import { chunkStatus, probeDraft } from '@create-reflow/sdk';
+import {
+  MODULE_ADDR, moduleAddr, MODULE_TYPE_CODE,
+  encodeListAdd, encodeListDelete, encodeBlankConfig,
+  encodeModuleField, encodeTwoWord, encodeMouseMask, MOUSE_MASK,
+  bayRecord, BAY_POSITIONS, BAY_INHERIT,
+  fitsChunkBudget, chunkBudget,
+} from '@create-reflow/sdk';
 import type { DraftDrop, GestureBinding } from '@create-reflow/sdk';
 import type { LayerDump } from '../src/hooks/useLayers';
 
@@ -2906,5 +2913,43 @@ void (async () => {
   eq(dump56.status[0], 'ok', '56 LayerDump.status: healthy layer → ok');
   eq(dump56.status[1], 'empty', '56 LayerDump.status: empty slot → empty');
 })();
+
+// §57 module wire encoders: 30/100A module-list add/delete payloads, 100C
+// blank config, per-field config records and layer-data bay records — all
+// byte-exact against captured writes. MODULE_ADDR is the single seam where
+// layer-vs-slot addressing lives (see sdk/src/module-wire.ts header).
+{
+  eq(MODULE_ADDR.prefix.join(','), '0', '57 MODULE_ADDR prefix = single 0x00 byte');
+  eq(moduleAddr(5).join(','), '0,5', '57 moduleAddr(5) seam returns [0x00, 5]');
+  eq(toHex(encodeListAdd(5, 5, MODULE_TYPE_CODE.TRACK, '00112233445566778899aabbccddeeff')),
+    '00 05 05 01 10 00 11 22 33 44 55 66 77 88 99 aa bb cc dd ee ff',
+    '57 list add slot 5 Track (captured 00 05 05 01 10 <uuid16>)');
+  eq(toHex(encodeListDelete(5)), '00 05 00 00 00', '57 list delete slot 5 (captured 00 05 00 00 00)');
+  const blank57 = encodeBlankConfig(3);
+  eq(blank57.length, 121, '57 blank 100C payload = 121 bytes (slot + 40 records)');
+  eq(blank57[0], 3, '57 blank opens with the slot byte');
+  eq(toHex(blank57.slice(1, 4)), '00 00 00', '57 blank first record [0, 0, 0]');
+  eq(toHex(blank57.slice(118)), '27 00 00', '57 blank last record [0x27, 0, 0]');
+  eq(toHex(encodeModuleField(0x00, 'none')), '00 07 00', '57 none record = type 0x07 empty');
+  eq(toHex(encodeModuleField(0x00, 'setting', 72)), '00 01 01 48', '57 setting record 00 01 01 48 (=72)');
+  eq(toHex(encodeModuleField(0x05, 'keypress', Uint8Array.from([0x01, 0x04, 0x04, 0x00, 0x07, 0x00]))),
+    '05 04 06 01 04 04 00 07 00', '57 keypress record carries action body bytes verbatim');
+  eq(toHex(encodeTwoWord(0x05, 4, -1)), '05 0f 08 04 00 00 00 ff ff ff ff',
+    '57 twoWord 0f 08 + cat u32LE + selector i32LE (-1 two-complement)');
+  eq(toHex(encodeMouseMask(0x0b, MOUSE_MASK.M5)), '0b 0f 08 03 00 00 00 10 00 00 00',
+    '57 mouseMask M5: 0f 08 + 03 u32LE + mask 16 i32LE');
+  eq(`${MOUSE_MASK.M1},${MOUSE_MASK.M2},${MOUSE_MASK.M3},${MOUSE_MASK.M4},${MOUSE_MASK.M5}`,
+    '1,2,4,8,16', '57 MOUSE_MASK M1..M5 = 1/2/4/8/16');
+  eq(toHex(bayRecord(0x4c, 5)), '4c 05 00', '57 bay record slot 5 (captured 4c 05 00)');
+  eq(toHex(bayRecord(0x4c, BAY_INHERIT)), '4c 78 00', '57 bay record inherit 0x78 (resolves to BASE)');
+  eq(toHex(bayRecord(0x4c, 0)), '4c 00 00', '57 bay record disabled 0x00');
+  eq(toHex(Uint8Array.from([
+    ...BAY_POSITIONS.TOUCH, ...BAY_POSITIONS.TRACK,
+    ...BAY_POSITIONS.TUNE, ...BAY_POSITIONS.FLOAT,
+  ])), '4a 4b 4c 4d 4e 4f 50 51', '57 BAY_POSITIONS TOUCH/TRACK/TUNE/FLOAT');
+  eq(fitsChunkBudget(new Uint8Array(483)), true, '57 483B payload fits the chunk budget');
+  eq(fitsChunkBudget(new Uint8Array(484)), false, '57 484B payload over budget (3rd frame hangs fw 3.28.7)');
+  eq(chunkBudget(new Uint8Array(300)), 2, '57 chunkBudget 300B = 2 frames under 242B chunking');
+}
 
 void main();
