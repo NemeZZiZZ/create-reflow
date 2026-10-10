@@ -221,8 +221,6 @@ export function parseOpenFlowLayer(
   const warnings: string[] = [];
   const parsed: ParsedKey[] = [];
   const seen = new Map<number, number>(); // positionId → index into parsed
-  let strips = 0;
-  let bays = 0;
 
   for (const entry of layer.keys as unknown[]) {
     if (!isObj(entry) || typeof entry.positionId !== 'number' || !Number.isInteger(entry.positionId)) {
@@ -234,20 +232,27 @@ export function parseOpenFlowLayer(
       warnings.push(`positionId ${pos} out of range (0-96) — key skipped`);
       continue;
     }
-    // 74–87 = LED strips, 88–96 = module bays: not backed by writable
-    // device stores yet — counted, never records (not even LED records).
-    if (pos >= 74 && pos <= 87) {
-      strips++;
-      continue;
-    }
-    if (pos >= 88) {
-      bays++;
+    // Read the color FIRST so strips round-trip through the same hexToHs
+    // path keys use. Null-safe: malformed hex degrades to no color record.
+    let led: { h: number; s: number } | null = null;
+    if (typeof entry.colorHex === 'string') led = hexToHs(entry.colorHex);
+    // 74–87 = LED strips: the color round-trips through the leds cache —
+    // LED-only entry, no key records, no warning. 88–96 = module bays: no
+    // writable device store yet — silent skip (no record, no warning; bays
+    // stay out of the log entirely).
+    if (pos >= 74) {
+      if (pos <= 87 && led) {
+        const item: ParsedKey = { pos, records: [], led };
+        const prev = seen.get(pos);
+        if (prev !== undefined) parsed[prev] = item;
+        else {
+          seen.set(pos, parsed.length);
+          parsed.push(item);
+        }
+      }
       continue;
     }
     if (seen.has(pos)) warnings.push(`positionId ${pos} duplicated — last wins`);
-
-    let led: { h: number; s: number } | null = null;
-    if (typeof entry.colorHex === 'string') led = hexToHs(entry.colorHex);
 
     const slots: Slots = { press: null, tap: null, hold: null, double: null, taphold: null };
     let layerOrder: number | null = null;
@@ -309,11 +314,6 @@ export function parseOpenFlowLayer(
       parsed.push(item);
     }
   }
-
-  if (strips > 0)
-    warnings.push(`skipped ${strips} LED strip position(s) (74-87) — no writable device store yet`);
-  if (bays > 0)
-    warnings.push(`skipped ${bays} module bay position(s) (88-96) — no writable device store yet`);
 
   let anim: number | null = null;
   const animId = layer.animationId;
@@ -426,11 +426,13 @@ function bindingsFor(recs: KeyRec[], kk: number, counts: Record<string, number>)
  * keys/leds are ONE layer's caches (KeyRec[]/LedRec[] as diffSnapshotToDraft
  * consumes; looked up by kk). Fully deterministic: fixed uuids, no
  * timestamps — two calls with equal inputs are deep-equal. Keys array is
- * exactly 97 entries ordered by positionId; strips (74–87) and bays (88–96)
- * are emitted with empty bindings and NO colorHex field (parse ignores
- * colorHex there, so no placeholder is written). Throws when layer is
- * outside the app's window 0..7 — an out-of-window srcId would produce a
- * doc no import can ever resolve. */
+ * exactly 97 entries ordered by positionId. Keys (0-73) AND strips (74-87)
+ * emit colorHex from the leds cache — parse reads strip colors back, so the
+ * strip round-trip is exact in h/s; strips carry empty bindings. Bays
+ * (88-96) stay placeholder rows with empty bindings and NO colorHex field
+ * (no writable store — documented skip). Throws when layer is outside the
+ * app's window 0..7 — an out-of-window srcId would produce a doc no import
+ * can ever resolve. */
 export function buildOpenFlowLayer(
   keys: KeyRec[],
   leds: LedRec[],
@@ -445,12 +447,17 @@ export function buildOpenFlowLayer(
   const ofKeys: OfKeyEntry[] = [];
   for (let pos = 0; pos <= 96; pos++) {
     const entry: OfKeyEntry = { positionId: pos, bindings: [] };
-    if (pos <= 73) {
+    // colorHex rides for keys AND strips (pos ≤ 87); counts.leds counts
+    // every emitted colorHex (keys + strips).
+    if (pos <= 87) {
       const led = ledByKk.get(pos);
       if (led) {
         entry.colorHex = hsToHex(led.h, led.s);
         counts.leds++;
       }
+    }
+    // Bindings are a keys-only concept — strips/bays stay binding-less.
+    if (pos <= 73) {
       entry.bindings = bindingsFor(keys, pos, counts);
       if (entry.bindings.length > 0) counts.keys++;
     }

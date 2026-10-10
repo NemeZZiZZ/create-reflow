@@ -40,6 +40,7 @@ import {
 } from '@create-reflow/sdk';
 import type { LayerEntry } from '@create-reflow/sdk';
 import { queueLayerAdd, queueLayerDelete, pendingLayerAddIdxs } from '@create-reflow/sdk';
+import { BAY_LED_RANGES, queueBayColor, queueFillLayer } from '@create-reflow/sdk';
 
 let n = 0;
 function eq(a: unknown, b: unknown, name: string) {
@@ -982,9 +983,24 @@ import { queueAction } from '@create-reflow/sdk';
     );
     eq(toHex(snap.maps.keys[2][0].rec), '1e 01 04 73 00 07 00', '27 layer-2 rec round-trips');
     eq(snap.maps.leds[2][0].h, 300, '27 layer-2 led hue');
-    eq(snap.warnings.length > 0, true, '27 parse warnings surface');
+    // Strips round-trip and bays skip silently now — a canonical machine-
+    // built backup parses warning-free (the old strip/bay skip warnings are
+    // gone by design); the pass-through itself is asserted below.
+    eq(snap.warnings.length, 0, '27 canonical backup round-trips warning-free');
     eq(snap.warnings.every((w) => /^layer [0-2]: /.test(w)), true, '27 warnings carry the layer prefix');
   }
+  // Pass-through with the layer prefix: an unknown animationId in a stored
+  // layer doc surfaces verbatim (loadAutoBackup → parse warnings joined).
+  const stW = mkStorage();
+  saveAutoBackup(keys, leds, blobKeys, blobLeds, undefined, stW, { 0: 'not-an-anim' });
+  const snapW = loadAutoBackup(listAutoBackups(stW)[0].id, stW);
+  eq(
+    !('error' in snapW) &&
+      snapW.warnings.length === 1 &&
+      /^layer 0: unknown animationId 'not-an-anim'/.test(snapW.warnings[0]),
+    true,
+    '27 parse warnings surface with layer prefix (pass-through)',
+  );
   eq(deleteAutoBackup(metas[0].id, st), true, '27 delete works');
   eq(deleteAutoBackup(metas[0].id, st), false, '27 delete idempotent-false');
   eq('error' in loadAutoBackup(metas[0].id, st), true, '27 deleted id errors');
@@ -1483,7 +1499,7 @@ import { queueAction } from '@create-reflow/sdk';
     const led1 = r.maps.leds[1].find((x) => x.kk === 1);
     const wantHs = hexToHs('#3366ff')!;
     eq(led1 !== undefined && led1.h === wantHs.h && led1.s === wantHs.s, true, '48 colorHex → led h/s');
-    eq(r.maps.leds[1].length, 1, '48 strips/bays produce no led records');
+    eq(r.maps.leds[1].length, 2, '48 led recs: key 1 + strip 74 (strips round-trip now)');
     eq(r.anim, 1, '48 animationId breathe → anim 1');
     const w = r.warnings.join('\n');
     eq(/Double Tap dropped/.test(w), true, '48 clamp warning');
@@ -1493,8 +1509,8 @@ import { queueAction } from '@create-reflow/sdk';
     eq(/NO_SUCH_KEY/.test(w), true, '48 unknown actionCode warning');
     eq(/out of range/.test(w), true, '48 positionId range warning');
     eq(/duplicated/.test(w), true, '48 duplicate positionId warning');
-    eq(/skipped 1 LED strip/.test(w), true, '48 strip count warning');
-    eq(/skipped 1 module bay/.test(w), true, '48 bay count warning');
+    eq(/skipped 1 LED strip/.test(w), false, '48 strips no longer warn (round-trip now)');
+    eq(/module bay/.test(w), false, '48 bays silent (no bay warning)');
     eq(/1 macro/.test(w), true, '48 macros count warning');
   }
   const rNull = parseOpenFlowLayer({ ...doc, layer: { ...doc.layer, animationId: null } });
@@ -2344,6 +2360,185 @@ import { queueAction } from '@create-reflow/sdk';
     pendingLayerAddIdxs(new Draft()).length,
     0,
     '53 pendingLayerAddIdxs empty draft → []',
+  );
+}
+
+// §54 LED strips round-trip + bay block helper + fill range gate
+{
+  // Bay block spans pinned: left 88..111, right 112..135 (24 blocks each).
+  eq(
+    BAY_LED_RANGES.left.first === 88 && BAY_LED_RANGES.left.last === 111,
+    true,
+    '54 bay range left = 88..111',
+  );
+  eq(
+    BAY_LED_RANGES.right.first === 112 && BAY_LED_RANGES.right.last === 135,
+    true,
+    '54 bay range right = 112..135',
+  );
+
+  // Import: strip colorHex lands in maps.leds (round-trips now); bays stay
+  // silent — no record, no warning. Invalid strip hex is null-safe.
+  const doc54 = {
+    version: 1,
+    kind: 'layer',
+    layer: {
+      srcId: OF_LAYER_UUIDS[1],
+      name: 'Layer 1',
+      orderId: 1,
+      iconId: null,
+      animationId: 'solid',
+      keys: [
+        { positionId: 0, colorHex: null, bindings: [{ behavior: 'press', actionType: 'key', actionCode: 'A', context: null }] },
+        { positionId: 74, colorHex: '#ff0000', bindings: [] },
+        { positionId: 75, colorHex: '#zzzzzz', bindings: [] },
+        { positionId: 87, colorHex: '#00ff00', bindings: [] },
+        { positionId: 88, colorHex: '#123456', bindings: [] },
+        { positionId: 96, colorHex: '#abcdef', bindings: [] },
+      ],
+    },
+    macros: [],
+    layerRefs: {},
+  };
+  const r54 = parseOpenFlowLayer(doc54);
+  eq('error' in r54 ? 'err' : 'ok', 'ok', '54 strip/bay doc parses');
+  if (!('error' in r54)) {
+    const hs74 = hexToHs('#ff0000')!;
+    const hs87 = hexToHs('#00ff00')!;
+    const led74 = r54.maps.leds[1].find((x) => x.kk === 74);
+    const led87 = r54.maps.leds[1].find((x) => x.kk === 87);
+    eq(
+      led74 !== undefined && led74.h === hs74.h && led74.s === hs74.s,
+      true,
+      '54 strip 74 #ff0000 → LedRec with h/s',
+    );
+    eq(
+      led87 !== undefined && led87.h === hs87.h && led87.s === hs87.s,
+      true,
+      '54 strip 87 #00ff00 → LedRec with h/s',
+    );
+    eq(
+      r54.maps.leds[1].find((x) => x.kk === 75) === undefined,
+      true,
+      '54 strip invalid hex → no record (null-safe)',
+    );
+    eq(r54.maps.keys[1].length, 1, '54 strips emit no key records');
+    eq(
+      r54.maps.leds[1].every((x) => x.kk < 88),
+      true,
+      '54 bays 88-96 never become led records',
+    );
+    const w54 = r54.warnings.join('\n');
+    eq(/strip/i.test(w54), false, '54 strips parse silently (no strip warning)');
+    eq(/bay/i.test(w54), false, '54 bays skip silently (no bay warning)');
+  }
+
+  // Round-trip: parse(strip colors) → build → reparse gives the same h/s back.
+  if (!('error' in r54)) {
+    const rt2 = buildOpenFlowLayer(r54.maps.keys[1], r54.maps.leds[1], 1, 'solid');
+    const rt3 = parseOpenFlowLayer(JSON.parse(JSON.stringify(rt2.data)));
+    eq('error' in rt3 ? 'err' : 'ok', 'ok', '54 roundtrip reparse ok');
+    if (!('error' in rt3)) {
+      const want74 = hexToHs('#ff0000')!;
+      const want87 = hexToHs('#00ff00')!;
+      const back74 = rt3.maps.leds[1].find((x) => x.kk === 74);
+      const back87 = rt3.maps.leds[1].find((x) => x.kk === 87);
+      eq(
+        back74 !== undefined && back74.h === want74.h && back74.s === want74.s,
+        true,
+        '54 roundtrip strip 74 h/s equal',
+      );
+      eq(
+        back87 !== undefined && back87.h === want87.h && back87.s === want87.s,
+        true,
+        '54 roundtrip strip 87 h/s equal',
+      );
+    }
+  }
+
+  // Export: strips 74-87 emit colorHex from the leds cache (same as keys),
+  // bindings stay empty; bays 88-96 keep placeholder rows with NO colorHex.
+  const leds54: LedRec[] = [
+    { kk: 74, h: 0, s: 100, offset: 0 },
+    { kk: 87, h: 120, s: 100, offset: 1 },
+  ];
+  const b54 = buildOpenFlowLayer([], leds54, 1, 'solid');
+  const k54 = (b54.data as { layer: { keys: { colorHex?: string; bindings: unknown[] }[] } })
+    .layer.keys;
+  eq(k54[74].colorHex === '#ff0000', true, '54 export strip 74 emits colorHex');
+  eq(k54[87].colorHex === '#00ff00', true, '54 export strip 87 emits colorHex');
+  eq('colorHex' in k54[75] === false, true, '54 export strip 75 (no cache) → no colorHex');
+  eq(k54[74].bindings.length === 0, true, '54 export strip bindings stay empty');
+  eq(
+    k54.slice(88, 97).every((k) => 'colorHex' in k === false),
+    true,
+    '54 export bays 88-96 never carry colorHex',
+  );
+  eq(b54.counts.leds, 2, '54 counts.leds counts strip colorHex');
+
+  // Fill range gate: a full 136-LED dump fills keys+strips ONLY — exactly
+  // 88 ops, all kk ≤ 87 (regression trap: it used to queue all 136).
+  const ledsFull: LedRec[] = [];
+  for (let kk = 0; kk <= 135; kk++) ledsFull.push({ kk, h: 0, s: 0, offset: kk });
+  const dF = new Draft();
+  const filled = queueFillLayer(dF, 1, ledsFull, { h: 45, s: 80 });
+  const opsF = dF.ops.filter((o) => o.kind === 'led');
+  eq(
+    dF.size === 88 && filled === 88 && opsF.length === 88,
+    true,
+    '54 fill on 136-rec input queues exactly 88 ops',
+  );
+  eq(
+    opsF.every((o) => o.kind === 'led' && o.kk <= 87),
+    true,
+    '54 fill ops all kk ≤ 87 (bays excluded)',
+  );
+  eq(
+    opsF.every((o) => o.kind === 'led' && o.kk >= 0 && o.h === 45 && o.s === 80) &&
+      Math.max(...opsF.map((o) => o.kk)) === 87,
+    true,
+    '54 fill max kk 87, h/s carried',
+  );
+
+  // queueBayColor: exactly 24 led ops per side, same h/s across the block,
+  // routed through the existing queueColor gate (kk ≤ 0x87).
+  const dL = new Draft();
+  queueBayColor(dL, 1, 'left', 30, 90);
+  const ledL = dL.ops.filter((o) => o.kind === 'led');
+  eq(
+    dL.size === 24 && ledL.length === 24,
+    true,
+    '54 queueBayColor left queues exactly 24 led ops',
+  );
+  eq(
+    ledL.every((o) => o.kind === 'led' && o.layer === 1 && o.h === 30 && o.s === 90),
+    true,
+    '54 left ops all layer 1 h30 s90',
+  );
+  eq(
+    ledL.every((o) => o.kk >= 88 && o.kk <= 111) &&
+      new Set(ledL.map((o) => o.kk)).size === 24,
+    true,
+    '54 left span 88..111, 24 distinct kk',
+  );
+  const dR = new Draft();
+  queueBayColor(dR, 2, 'right', 200, 50);
+  const ledR = dR.ops.filter((o) => o.kind === 'led');
+  eq(
+    dR.size === 24 && ledR.length === 24,
+    true,
+    '54 queueBayColor right queues exactly 24 led ops',
+  );
+  eq(
+    ledR.every((o) => o.kk >= 112 && o.kk <= 135) &&
+      new Set(ledR.map((o) => o.kk)).size === 24,
+    true,
+    '54 right span 112..135, 24 distinct kk',
+  );
+  eq(
+    ledR.every((o) => o.kind === 'led' && o.layer === 2 && o.h === 200 && o.s === 50),
+    true,
+    '54 right ops all layer 2 h200 s50',
   );
 }
 

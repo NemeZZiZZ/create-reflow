@@ -80,16 +80,46 @@ export function queueColor(
   return { queued, skipped };
 }
 
-/** Queue a color for every LED of one layer. Returns the op count. */
+/** Queue a color for every LED of one layer. Keys + strips only (kk ≤ 87
+ * decimal): the device LED map spans 136 blocks, and kk 88-135 are the
+ * module bays — no per-layer store, so filling them would queue 48 dead
+ * ops. Returns the queued op count. */
 export function queueFillLayer(
   draft: Draft,
   layer: number,
   recs: LedRec[],
   color: { h: number; s: number },
 ): number {
-  for (const r of recs)
+  let n = 0;
+  for (const r of recs) {
+    if (r.kk < 0 || r.kk > 87) continue;
     draft.add({ kind: 'led', layer, kk: r.kk, h: color.h, s: color.s });
-  return recs.length;
+    n++;
+  }
+  return n;
+}
+
+/** Module bay LED block spans (device LED map kk): 24 writable blocks per
+ * side — left edge 88..111, right edge 112..135. */
+export const BAY_LED_RANGES = {
+  left: { first: 88, last: 111 },
+  right: { first: 112, last: 135 },
+} as const;
+
+/** Queue one color across a module bay side's 24 LED blocks (all blocks
+ * get the same h/s). Routed through queueColor's existing kk ≤ 0x87 gate —
+ * exactly 24 led ops per call. */
+export function queueBayColor(
+  draft: Draft,
+  layer: number,
+  side: 'left' | 'right',
+  h: number,
+  s: number,
+): void {
+  const { first, last } = BAY_LED_RANGES[side];
+  const sel: SelKey[] = [];
+  for (let kk = first; kk <= last; kk++) sel.push({ layer, kk });
+  queueColor(draft, sel, { h, s });
 }
 
 /** Thin draft.add wrapper for settings ops (symmetry with queue helpers). */
