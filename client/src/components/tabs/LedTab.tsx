@@ -10,7 +10,12 @@ import { Card, CardContent, CardHeader } from '../ui/card';
 import type { Draft } from '@create-reflow/sdk';
 import type { LedRec } from '@create-reflow/sdk';
 import { hsToHex, ledCss } from '@create-reflow/sdk';import { ANIM_NAMES, animOp } from '@create-reflow/sdk';
-import { queueColor, queueFillLayer } from '@create-reflow/sdk';
+import {
+  BAY_LED_RANGES,
+  queueBayColor,
+  queueColor,
+  queueFillLayer,
+} from '@create-reflow/sdk';
 import type { HsColor } from '../../hooks/useCustomColors';
 import type { LogFn } from '../../hooks/useLog';
 import { cn } from '../../lib/utils';
@@ -18,7 +23,7 @@ import { cn } from '../../lib/utils';
 type LedTool = 'brush' | 'fill' | 'pipette';
 
 const TOOLS: { id: LedTool; label: string; Icon: LucideIcon; hint: string }[] = [
-  { id: 'brush', label: 'Brush', Icon: Brush, hint: 'Paint keys — click or drag across the board' },
+  { id: 'brush', label: 'Brush', Icon: Brush, hint: 'Paint keys, strips and bays — click or drag across the board' },
   { id: 'fill', label: 'Fill', Icon: PaintBucket, hint: 'Paint the whole layer (ignores the clicked key)' },
   { id: 'pipette', label: 'Pipette', Icon: Pipette, hint: 'Pick the clicked key color, queues nothing' },
 ];
@@ -101,6 +106,29 @@ export default function LedTab({
     else log('err', `KK ${kk} (0x${kk.toString(16)}) has no LED — skipped`);
   }
 
+  // Module bays paint as one swatch: pipette samples the bay block's first
+  // LED (left 88 / right 112), brush and fill queue the whole 24-LED block —
+  // per-LED targeting makes no sense on a single swatch.
+  function bayClick(side: 'left' | 'right') {
+    if (!leftOn) return;
+    if (tool === 'pipette') {
+      const cur = ledmap.get(BAY_LED_RANGES[side].first);
+      if (cur) {
+        setColor({ h: cur.h, s: cur.s });
+        log('inf', `pipette ${side} module bay → H${cur.h} S${cur.s}`);
+      } else {
+        log('inf', `pipette ${side} module bay: no LED there`);
+      }
+      return;
+    }
+    queueBayColor(draftRef.current, layer, side, color.h, color.s);
+    bumpDraft();
+    log(
+      'inf',
+      `queued bay color L${layer} ${side} (24 LEDs) → H${color.h}/S${color.s}`,
+    );
+  }
+
   function queueAnim(i: number) {
     draftRef.current.add(animOp(layer, i));
     bumpDraft();
@@ -146,6 +174,7 @@ export default function LedTab({
                 sel={NO_SEL}
                 onSelect={toolClick}
                 onPaint={(kk) => paintKey(kk, true)}
+                onBayPaint={bayClick}
                 cursorClass={tool === 'brush' ? 'cursor-crosshair' : undefined}
                 disabled={!leftOn}
                 dirty={dirtyKks}

@@ -437,13 +437,6 @@ export default function App() {
   const importRef = useRef<HTMLInputElement>(null);
   const [backupsOpen, setBackupsOpen] = useState(false);
 
-  // Strips (74-87) and module bays (88-96) have no writable device store —
-  // the parser reports them as skip-warnings on every layer doc we export
-  // ourselves (exactly 2 per layer, always). Purely informational, so the
-  // per-layer pair collapses into one counted line instead of spamming.
-  const stripBayRe =
-    /^(?:layer (\d+): )?skipped \d+ (?:LED strip|module bay) position/;
-
   // Shared import/restore tail: log the parse warnings, diff the parsed
   // maps against the live caches and queue the difference (latest-op-wins),
   // then queue per-layer animation diffs against last-known. Caller does
@@ -452,18 +445,7 @@ export default function App() {
     res: Extract<ParseFileResult, { maps: SnapMaps }>,
     name: string,
   ) {
-    const stripBays: Record<number, number> = {};
-    for (const w of res.warnings) {
-      const m = stripBayRe.exec(w);
-      if (!m) {
-        log("inf", `import '${name}': ${w}`);
-        continue;
-      }
-      const L = m[1] !== undefined ? Number(m[1]) : res.maps.layers[0] ?? 0;
-      stripBays[L] = (stripBays[L] ?? 0) + 1;
-    }
-    for (const [L, n] of Object.entries(stripBays))
-      log("inf", `import '${name}': layer ${L}: strips/bays informational ×${n}`);
+    for (const w of res.warnings) log("inf", `import '${name}': ${w}`);
 
     const r = diffSnapshotToDraft(draftRef.current, res.maps, keysByLayer, ledsByLayer);
     bumpDraft();

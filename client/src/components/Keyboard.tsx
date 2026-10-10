@@ -227,6 +227,102 @@ function Key({ pos, rec, led, ledMode, selected, dirty, onSelect, onPaintDown, o
   );
 }
 
+interface StripDotProps {
+  kk: number;
+  led?: LedVal;
+  selected: boolean;
+  dirty?: boolean;
+  onSelect: (
+    pos: number,
+    kk: number,
+    additive: boolean,
+    allLayers: boolean,
+  ) => void;
+  /** same pointer pipeline as Key: drag paints, click is the fallback */
+  onPaintDown?: (kk: number) => void;
+  onPaintEnter?: (kk: number) => void;
+  onPaintClick?: (kk: number) => void;
+}
+
+/** Edge LED-strip dot (kks 74-87): a compact bar driven by the same paint /
+ *  select pipeline and dirty marker as the keys. Rendered only in LED mode,
+ *  flanking the halves' outer edges. */
+function StripDot({
+  kk,
+  led,
+  selected,
+  dirty,
+  onSelect,
+  onPaintDown,
+  onPaintEnter,
+  onPaintClick,
+}: StripDotProps) {
+  const fill = led ? ledCss(led.h, led.s) : null;
+  return (
+    <Tooltip>
+      <TooltipTrigger asChild>
+        <button
+          type="button"
+          aria-label={`LED strip ${kk}`}
+          className="relative h-4 w-2 shrink-0 rounded-[3px] border border-border hover:brightness-125"
+          style={
+            selected && fill
+              ? {
+                  background: fill,
+                  outline: `2px solid ${contrastStroke(fill)}`,
+                  outlineOffset: 1,
+                }
+              : { background: fill ?? "transparent" }
+          }
+          onClick={
+            onPaintDown
+              ? (onPaintClick ? () => onPaintClick(kk) : undefined)
+              : (e) => onSelect(kk, kk, e.shiftKey, e.altKey)
+          }
+          onPointerDown={
+            onPaintDown
+              ? (e) => {
+                  e.preventDefault();
+                  onPaintDown(kk);
+                }
+              : undefined
+          }
+          onPointerEnter={onPaintEnter ? () => onPaintEnter(kk) : undefined}
+        >
+          {dirty && (
+            <span
+              className="absolute -top-0.5 -right-0.5 size-1.5 rounded-full bg-amber-400"
+              title="queued change — not flashed yet"
+            />
+          )}
+        </button>
+      </TooltipTrigger>
+      <TooltipContent>
+        <div className="grid gap-0.5">
+          <div className="font-medium">
+            LED strip {kk}
+            <span className="ml-2 font-normal text-muted-foreground">
+              KK 0x{kk.toString(16)}
+            </span>
+          </div>
+          {led && (
+            <div className="flex items-center gap-1.5">
+              <span
+                className="inline-block size-3 rounded-sm border border-border"
+                style={{ background: ledCss(led.h, led.s) }}
+              />
+              <span className="font-mono">{hsToHex(led.h, led.s)}</span>
+              <span className="text-muted-foreground">
+                H {led.h} · S {led.s}
+              </span>
+            </div>
+          )}
+        </div>
+      </TooltipContent>
+    </Tooltip>
+  );
+}
+
 interface KeyboardProps {
   keymap: Map<number, Uint8Array>;
   ledmap: Map<number, LedVal>;
@@ -245,6 +341,9 @@ interface KeyboardProps {
   dirty?: Set<number>;
   /** drag-paint mode: pointer-down starts a stroke, pointer-enter paints */
   onPaint?: (kk: number) => void;
+  /** LED-mode bay swatch click (no drag — a bay is one swatch): paints the
+   *  whole 24-LED block of that side; absent → bays render as indicators */
+  onBayPaint?: (side: 'left' | 'right') => void;
   /** cursor override for paint tools (e.g. "cursor-crosshair") */
   cursorClass?: string;
   /** keymap-mode right click on a key: (kk, viewport x, viewport y) */
@@ -262,6 +361,7 @@ export default function Keyboard({
   disabled = false,
   dirty,
   onPaint,
+  onBayPaint,
   cursorClass,
   onContext,
   keyNotes,
@@ -323,8 +423,85 @@ export default function Keyboard({
     </div>
   );
 
+  // Edge LED strips (LED mode only): 7 individual dots per side, wired into
+  // the same paint/drag/select pipeline and dirty marker as the keys.
+  const stripCol = (kks: number[]) => (
+    <div className="flex flex-col items-center justify-center gap-1">
+      {kks.map((kk) => (
+        <StripDot
+          key={kk}
+          kk={kk}
+          led={ledmap.get(kk)}
+          selected={sel.has(kk)}
+          dirty={dirty?.has(kk) ?? false}
+          onSelect={pick}
+          onPaintDown={paintDown}
+          onPaintEnter={paintEnter}
+          onPaintClick={paintClick}
+        />
+      ))}
+    </div>
+  );
+
+  // Module bays (LED mode only): one swatch per side showing the bay block's
+  // first LED (left 88 / right 112); click paints all 24 blocks of the side.
+  // Without onBayPaint (keymap view) they stay non-interactive indicators.
+  const baySwatch = (side: "left" | "right") => {
+    const kk = side === "left" ? 88 : 112;
+    const led = ledmap.get(kk);
+    const fill = led ? ledCss(led.h, led.s) : null;
+    return (
+      <Tooltip>
+        <TooltipTrigger asChild>
+          {onBayPaint ? (
+            <button
+              type="button"
+              aria-label={side === "left" ? "Left module bay" : "Right module bay"}
+              className="relative h-11 w-11 rounded-[10px] border-2 border-[#555] hover:brightness-125"
+              style={{ background: fill ?? "#222" }}
+              onClick={() => onBayPaint(side)}
+            >
+              {dirty?.has(kk) && (
+                <span
+                  className="absolute -top-1 -right-1 size-1.5 rounded-full bg-amber-400"
+                  title="queued change — not flashed yet"
+                />
+              )}
+            </button>
+          ) : (
+            <div
+              className="h-11 w-11 rounded-[10px] border-2 border-[#555]"
+              style={{ background: fill ?? "#222" }}
+            />
+          )}
+        </TooltipTrigger>
+        <TooltipContent>
+          <div className="grid gap-0.5">
+            <div className="font-medium">Module bay LED ({side})</div>
+            {led && (
+              <div className="flex items-center gap-1.5">
+                <span
+                  className="inline-block size-3 rounded-sm border border-border"
+                  style={{ background: ledCss(led.h, led.s) }}
+                />
+                <span className="font-mono">{hsToHex(led.h, led.s)}</span>
+                <span className="text-muted-foreground">
+                  H {led.h} · S {led.s}
+                </span>
+              </div>
+            )}
+            <div className="text-muted-foreground">
+              KK 0x{kk.toString(16)} · 24 LEDs
+            </div>
+          </div>
+        </TooltipContent>
+      </Tooltip>
+    );
+  };
+
   const halfLeft = (
     <div className="flex h-full justify-self-end gap-1">
+      {ledMode && stripCol([81, 82, 83, 84, 85, 86, 87])}
       {col("mt-[1.5rem]", [0, 16, 30, 46, 62])}
       {col("mt-[1rem]", [1, 17, 31, 47, 63])}
       {col("mt-[0.5rem]", [2, 18, 32, 48, 64])}
@@ -364,6 +541,7 @@ export default function Keyboard({
       {col("mt-[0.5rem]", [13, 27, 43, 59, 71])}
       {col("mt-[1rem]", [14, 28, 44, 60, 72])}
       {col("mt-[1.5rem]", [15, 29, 45, 61, 73])}
+      {ledMode && stripCol([74, 75, 76, 77, 78, 79, 80])}
     </div>
   );
 
@@ -374,8 +552,17 @@ export default function Keyboard({
   const middle = (
     <div className="flex flex-col gap-4 justify-between pb-4 items-center h-full">
       <div className="flex justify-center gap-[3.3rem] h-full items-start pt-4">
-        {dock}
-        {dock}
+        {ledMode ? (
+          <>
+            {baySwatch("left")}
+            {baySwatch("right")}
+          </>
+        ) : (
+          <>
+            {dock}
+            {dock}
+          </>
+        )}
       </div>
       <div className="-mx-12 flex items-center justify-between gap-8">
         <div className="flex gap-1">{[37, 53, 67].map(K)}</div>
