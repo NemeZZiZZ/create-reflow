@@ -201,6 +201,16 @@ build, host-table name resolution); file gate: `sdk/src/importers.ts`
   at the boundary, by name, via `storedAnimOf`/`storedAnimName`; never
   reuse an index across the two tables.
 
+- **LED strips & bays (Phase 3, 2026-10-10)**: strip positions 74-87
+  round-trip as ordinary `colorHex` entries — parse maps them to
+  color-only led records, export emits `colorHex` for keys AND strips
+  (pos ≤ 87; OF parity, LAST_KEYED_LED = 87). Bay positions 88-96 are a
+  documented silent skip: OF files carry only stale `#xxxxxx` placeholders
+  there, OF's own flash refuses to write bays, and OF also loses bay
+  colors — parity. In the app one bay click queues 24 per-LED ops via
+  `queueBayColor` (kk 88-135, 24 per side); layer fill never touches bays
+  (`queueFillLayer` gates kk ≤ 87).
+
 Known limitation (binding shape): OpenFlow bindings are
 `{behavior, actionType, actionCode, context: null}` — there is no slot for
 behavior parameters, so term ≠ 200 ms and non-zero unknown flag bytes do NOT
@@ -248,10 +258,10 @@ refs for `special:1` — an imported MO(2) is counted `unknown` on re-export
      from the OpenFlow author (Discord contact exists).
 2. Optional: live-verify flavor selector on device (byte written only on
    explicit user pick — safe by construction).
-3. Bigger backlog (unranked): LED strips/bays UI coverage (74-96), module
-   gesture editing beyond donor-copy (blocked by 1-byte payload same-length
-   rule), macros (wire format still unknown — NayaFlow `macro_data` param
-   exists, nothing decoded).
+3. Bigger backlog (unranked): LED strips/bays UI coverage (74-96) — done,
+   Phase 3 (item 5); module gesture editing beyond donor-copy (blocked by
+   1-byte payload same-length rule), macros (wire format still unknown —
+   NayaFlow `macro_data` param exists, nothing decoded).
 4. **Layer management + lighting restore (Phase 2)** — ✅ DONE 2026-10-10
    (commits 20c04e7..d853965 + the docs commit marking this). Dynamic 0-7
    layer window: inventory parse + add/delete/restore encoders
@@ -259,6 +269,14 @@ refs for `special:1` — an imported MO(2) is counted `unknown` on re-export
    tabs, and the flash-tail layer-list echo that restores runtime lighting
    automatically. See the STORED vs RUNTIME animation note in "Native
    format" above.
+5. **LED strips/bays painting (Phase 3)** — ✅ DONE 2026-10-10 (commits
+   f00ce67..e069276 + the docs commit marking this). Full 136-LED painting
+   in the LED tab: edge strips (74-87) as individual dots, module-bay
+   swatches (one click → 24 per-LED ops per side via `queueBayColor`),
+   layer fill stays keys+strips. Strips round-trip as `colorHex` in
+   OpenFlow layer docs; bay positions 88-96 are a documented silent skip
+   (parity — OF also loses bay colors). See the LED strips & bays note in
+   "Native format" above.
 
 ## Ecosystem / diplomacy context
 
