@@ -33,6 +33,12 @@ import { TROUBLES, UNDARK_LADDER, assertWireAllowed } from '@create-reflow/sdk';
 import { customHidAction, groupKeyboardCategory, parseCustomHid } from '@create-reflow/sdk';
 import { nameToUsage, usageToName, HOST_TABLE_SIZE } from '@create-reflow/sdk';
 import { parseOpenFlowLayer, OF_LAYER_UUIDS, buildOpenFlowLayer } from '@create-reflow/sdk';
+import {
+  parseInventory, encodeLayerListAdd, encodeLayerListDelete, encodeRestorePayload,
+  storedAnimOf, storedAnimName, STORED_ANIM_NAMES,
+  uuidToBytes, bytesToUuid, mintLayerUuid,
+} from '@create-reflow/sdk';
+import type { LayerEntry } from '@create-reflow/sdk';
 
 let n = 0;
 function eq(a: unknown, b: unknown, name: string) {
@@ -1800,6 +1806,109 @@ import { queueAction } from '@create-reflow/sdk';
   );
   const prof50 = parseSnapshotFile({ version: 1, kind: 'profile' });
   eq('error' in prof50 && /unsupported kind/.test(prof50.error), true, '50 kind profile rejected');
+}
+
+// §51 layer list: inventory + encoders
+{
+  const throws51 = (fn: () => unknown) => {
+    try {
+      fn();
+      return false;
+    } catch {
+      return true;
+    }
+  };
+  // Real board table (OF capture): count byte + three 20-byte entries
+  // [idx][id][anim][0x10][uuid16].
+  const tableHex51 =
+    '00' +
+    '00 00 00 10 0c b7 6a 71 1d 42 43 c8 8b 4e ab 1c 52 16 95 c9' +
+    '01 01 01 10 c3 2c 7d 56 a4 72 44 bb ac 09 f8 b5 26 ef a8 c1' +
+    '02 02 03 10 5c ea 2e 10 36 bc 4d d5 90 dc bf d6 1e 13 a1 f9';
+  const inv51 = parseInventory(hexToBytes(tableHex51)!);
+  eq(inv51.length === 3, true, '51 board table → 3 entries');
+  eq(
+    JSON.stringify(inv51.map((e) => [e.idx, e.uuid, e.animStored])),
+    JSON.stringify([
+      [0, '0cb76a711d4243c88b4eab1c521695c9', 0],
+      [1, 'c32c7d56a47244bbac09f8b526efa8c1', 1],
+      [2, '5cea2e1036bc4dd590dcbfd61e13a1f9', 3],
+    ]),
+    '51 board table entries',
+  );
+  eq(inv51[2].animStored === 3, true, '51 layer2 animStored 3');
+  eq(storedAnimName(3), 'Swirl', '51 storedAnimName(3)');
+  // Count byte is discarded: leading 03 variant parses identically.
+  const invCount51 = parseInventory(hexToBytes('03' + tableHex51.slice(2))!);
+  eq(
+    JSON.stringify(invCount51) === JSON.stringify(inv51),
+    true,
+    '51 count byte discarded (03 variant)',
+  );
+  // Tolerance: uuid-length byte ≠ 0x10 skips the entry.
+  const corrupt51 = hexToBytes(tableHex51.replace('01 01 01 10', '01 01 01 08'))!;
+  eq(parseInventory(corrupt51).length === 2, true, '51 len≠0x10 entry skipped');
+  // Trailing bytes that don't form a full 20-byte block are ignored.
+  const garbage51 = hexToBytes(tableHex51 + ' de ad be')!;
+  eq(parseInventory(garbage51).length === 3, true, '51 trailing garbage tolerated');
+  // Empty / short payloads → [].
+  eq(parseInventory(new Uint8Array(0)).length === 0, true, '51 empty payload → []');
+  eq(parseInventory(hexToBytes('00 00 00 10 0c b7')!).length === 0, true, '51 short payload → []');
+  // Wire guard: 30/1002 is a legal layer-list channel.
+  eq(throws51(() => assertWireAllowed(0x30, 0x10, 0x02)), false, '51 guard allows 30/1002');
+  // Stored-anim map (data + lookups).
+  eq(STORED_ANIM_NAMES.join(','), 'Solid,Breathe,Spectrum,Swirl', '51 stored anim names');
+  eq(storedAnimOf('swirl') === 3, true, '51 storedAnimOf lowercase');
+  eq(storedAnimOf('Swirl') === 3, true, '51 storedAnimOf mixed case');
+  eq(storedAnimOf('nope') === -1, true, '51 storedAnimOf unknown');
+  eq(storedAnimName(0), 'Solid', '51 storedAnimName(0)');
+  eq(storedAnimName(9), null, '51 storedAnimName out of range');
+  // Add encode (OF test capture, two entries).
+  const add51: LayerEntry[] = [
+    { idx: 3, uuid: '878610a4c7434723a59932655479dee2', animStored: 0 },
+    { idx: 4, uuid: '05a59817d3a442df9b959d5f85067603', animStored: 0 },
+  ];
+  eq(
+    toHex(encodeLayerListAdd(add51)),
+    '00 03 03 00 10 87 86 10 a4 c7 43 47 23 a5 99 32 65 54 79 de e2' +
+      ' 04 04 00 10 05 a5 98 17 d3 a4 42 df 9b 95 9d 5f 85 06 76 03',
+    '51 add byte-exact',
+  );
+  eq(toHex(encodeLayerListAdd([])), '00', '51 empty add = count byte only');
+  // Delete encode: whole set sent TWICE (OF capture).
+  eq(
+    toHex(encodeLayerListDelete([3, 4])),
+    '00 03 00 00 00 04 00 00 00 03 00 00 00 04 00 00 00',
+    '51 delete byte-exact (set twice)',
+  );
+  // Restore = add over the full sorted table.
+  eq(
+    toHex(
+      encodeRestorePayload([
+        { idx: 4, uuid: '05a59817d3a442df9b959d5f85067603', animStored: 1 },
+        { idx: 3, uuid: '878610a4c7434723a59932655479dee2', animStored: 2 },
+      ]),
+    ),
+    '00 03 03 02 10 87 86 10 a4 c7 43 47 23 a5 99 32 65 54 79 de e2' +
+      ' 04 04 01 10 05 a5 98 17 d3 a4 42 df 9b 95 9d 5f 85 06 76 03',
+    '51 restore sorts by idx',
+  );
+  // uuid ↔ bytes helpers (plain hex, no dashes).
+  eq(
+    toHex(uuidToBytes('878610a4c7434723a59932655479dee2')),
+    '87 86 10 a4 c7 43 47 23 a5 99 32 65 54 79 de e2',
+    '51 uuidToBytes hex',
+  );
+  eq(
+    bytesToUuid(uuidToBytes('878610a4c7434723a59932655479dee2')),
+    '878610a4c7434723a59932655479dee2',
+    '51 uuid roundtrip',
+  );
+  // Minted uuids: 32 lowercase hex, unique per call.
+  const m51a = mintLayerUuid();
+  const m51b = mintLayerUuid();
+  eq(/^[0-9a-f]{32}$/.test(m51a), true, '51 mint uuid shape');
+  eq(m51a !== m51b, true, '51 mint uuid unique');
 }
 
 void main();
