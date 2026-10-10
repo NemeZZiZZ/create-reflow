@@ -7,9 +7,10 @@ import { toast } from 'sonner';
 import { saveAutoBackup, listAutoBackups } from '@create-reflow/sdk';
 import { opSummary } from '@create-reflow/sdk';
 import type { Draft } from '@create-reflow/sdk';
-import { concat, describeStatus, isWriteAck, sleep, toHex } from '@create-reflow/sdk';
-import type { KeyRec, LedRec, NayaSession, Side } from '@create-reflow/sdk';
+import { concat, describeStatus, encodeRestorePayload, isWriteAck, sleep, toHex } from '@create-reflow/sdk';
+import type { KeyRec, LayerEntry, LedRec, NayaSession, Side } from '@create-reflow/sdk';
 import { parseCmdPath } from '@create-reflow/sdk';
+import { readInventory } from './useLayers';
 import type { LayerDump } from './useLayers';
 import type { LogFn } from './useLog';
 
@@ -22,6 +23,15 @@ export interface FlashState {
 }
 
 const IDLE: FlashState = { phase: 'idle', done: 0, total: 0, message: null };
+
+/** Layer-list ACK gate (30/1002): accepted when payload[0] is 00 or echoes
+ * a layer idx (the app's 0..7 window). 0xEA = value rejected; an empty
+ * payload or any other byte is not an ACK. */
+function isLayerListAck(payload: Uint8Array): boolean {
+  if (payload.length === 0) return false;
+  const p0 = payload[0];
+  return p0 === 0x00 || (p0 >= 0x01 && p0 <= 0x07);
+}
 
 export function useFlash({
   sesRef,
@@ -77,6 +87,7 @@ export function useFlash({
     setFlashState({ phase: 'running', done: 0, total: d.size, message: null });
     const total = d.size;
     let done = 0;
+    let layersNack = false;
     try {
       log('inf', `flash queue: ${total} op(s)`);
       // Pre-flash auto-backup (UHK compensation pattern): the device has
@@ -146,14 +157,50 @@ export function useFlash({
               `module write NACK (${describeStatus(f.payload[0] ?? 0)}): ${toHex(f.payload)}`,
             );
           d.removeAt(d.ops.indexOf(o)); // no GET — ACK is the only verification
+        } else if (o.kind === 'layers') {
+          // Layer-list write (30/1002). ACK gate: 00 or an echoed layer
+          // idx; 0xEA = value rejected. A NACK marks the flash partial but
+          // the loop CONTINUES — layer-list writes are idempotent and the
+          // tail restore-echo re-sends the full table below.
+          const ack = await ses.writeLayerList(o.payload);
+          if (!isLayerListAck(ack.payload)) {
+            layersNack = true;
+            log(
+              'err',
+              `layer-list write NACK (${toHex(ack.payload)}) — continuing (idempotent)`,
+            );
+          }
+          d.removeAt(d.ops.indexOf(o)); // self-remove like settings/module
         } else {
           throw new Error('unknown op kind');
         }
         done++;
         setFlashState({ phase: 'running', done, total, message: null });
       }
-      bumpDraft(); // settings ops removed themselves above
+      bumpDraft(); // settings/module/layers ops removed themselves above
       log('inf', `flash queue: ${done}/${total} written, re-reading…`);
+      // Layer-list restore echo (flash tail): re-read the inventory FRESH
+      // post-write — never a cached copy, this flash may have changed the
+      // table — then send the full table back so the board's stored
+      // lighting is restored on both halves.
+      let inv: LayerEntry[] = [];
+      try {
+        inv = await readInventory(ses);
+      } catch {
+        inv = [];
+      }
+      if (inv.length === 0) {
+        log('cdc', 'flash: layer list unreadable — skipping lighting restore');
+      } else {
+        const ack = await ses.writeLayerList(encodeRestorePayload(inv));
+        if (!isLayerListAck(ack.payload))
+          log('err', `layer-list restore NACK (${toHex(ack.payload)}) — continuing`);
+        else
+          log(
+            'inf',
+            `layer-list echo: ${inv.length} entries — stored lighting restored (both halves)`,
+          );
+      }
       // ED writes (animations) spin the LED engine up and the device drops
       // or reorders multipart replies right after — immediate re-dumps came
       // back with spliced parts ("truncated"). Let it settle first.
@@ -167,7 +214,7 @@ export function useFlash({
       // ACK-self-removed settings/module ops. (dropped alone undercounts when
       // the queue held self-removing ops alongside.)
       const confirmed = total - d.size;
-      if (fresh && d.size === 0) {
+      if (fresh && d.size === 0 && !layersNack) {
         toast.success('Flash complete', {
           description: `${total} change(s) verified on device`,
         });
@@ -175,13 +222,14 @@ export function useFlash({
         setFlashState({ phase: 'ok', done: total, total, message: null });
         return 'ok';
       } else {
+        const note = layersNack ? ' — layer-list write not acked' : '';
         toast.error('Flash partially verified', {
-          description: `${confirmed}/${total} confirmed — ${d.size} still queued`,
+          description: `${confirmed}/${total} confirmed — ${d.size} still queued${note}`,
         });
-        log('err', `flash queue: ${d.size} op(s) not reflected`);
+        log('err', `flash queue: ${d.size} op(s) not reflected${note}`);
         setFlashState({
           phase: 'partial', done: confirmed, total,
-          message: `${confirmed}/${total} confirmed — ${d.size} still queued`,
+          message: `${confirmed}/${total} confirmed — ${d.size} still queued${note}`,
         });
         return 'partial';
       }

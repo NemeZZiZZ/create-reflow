@@ -532,6 +532,14 @@ export class NayaSession {
     return this.cmd(0x30, 0x10, 0x01, new Uint8Array([0, 0]));
   }
 
+  async writeLayerList(payload: Uint8Array): Promise<Frame> {
+    // 30/1002 layer-list write (add / delete / restore share the channel;
+    // the payload's leading 00 is the count byte, entries follow). ACK
+    // gating stays caller-side: accepted when payload[0] === 0x00 or
+    // echoes a layer idx; 0xEA = value rejected → caller aborts.
+    return this.cmd(0x30, 0x10, 0x02, payload);
+  }
+
   async readLayer(layer: number): Promise<Uint8Array> {
     // Multipart: response payload = [MORE, LAYER, DATA...], loop until MORE=0.
     return this.readMultipart(0x03, layer);

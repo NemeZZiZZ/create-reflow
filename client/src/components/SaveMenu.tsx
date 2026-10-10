@@ -1,7 +1,7 @@
 // Shared Save dropdown — lives in the headers of both Keyboard and
 // Layout views (exports read from the layer caches, no device traffic).
 // One OpenFlow layer doc per layer carries keys AND colors; 'All layers'
-// downloads all three in one go.
+// downloads every inventory layer in one go.
 import { Download } from "lucide-react";
 import { Button } from "./ui/button";
 import {
@@ -14,12 +14,15 @@ import {
 
 export default function SaveMenu({
   leftOn,
+  layers,
   onExportLayer,
   onExportAll,
   onImport,
   onBackups,
 }: {
   leftOn: boolean;
+  /** layer idx list to offer (App derives it from the board inventory) */
+  layers: number[];
   onExportLayer: (layer: number) => void;
   onExportAll: () => void;
   onImport: () => void;
@@ -33,13 +36,13 @@ export default function SaveMenu({
         </Button>
       </DropdownMenuTrigger>
       <DropdownMenuContent>
-        {[0, 1, 2].map((L) => (
+        {layers.map((L) => (
           <DropdownMenuItem
             key={L}
             onClick={() => onExportLayer(L)}
             disabled={!leftOn}
           >
-            Layer {L} (.openflow-layer.json)
+            Layer {L + 1} (.openflow-layer.json)
           </DropdownMenuItem>
         ))}
         <DropdownMenuSeparator />

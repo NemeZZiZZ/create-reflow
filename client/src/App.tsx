@@ -33,7 +33,7 @@ import { useDraft } from "./hooks/useDraft";
 import { useFlash } from "./hooks/useFlash";
 import { useCustomColors } from "./hooks/useCustomColors";
 import { useKbFit } from "./hooks/useKbFit";
-import { queueAction, queueBehaviorSet, queueColor, queueFillLayer, type SelKey } from '@create-reflow/sdk';
+import { queueAction, queueBehaviorSet, queueColor, queueFillLayer, queueLayerAdd, queueLayerDelete, mintLayerUuid, Draft, type SelKey } from '@create-reflow/sdk';
 import { FLAVOR_BYTES, flavorById, type FlavorId } from '@create-reflow/sdk';
 import { buildOpenFlowLayer, animOp, ANIM_NAMES } from '@create-reflow/sdk';
 import { saveJson } from './lib/save';
@@ -125,7 +125,7 @@ export default function App() {
 
   // --- data hooks ---------------------------------------------------------
   const layers = useLayers({ busyRef, log });
-  const { keysByLayer, ledsByLayer, blobTotals, dumpStat, ledDumpStat } =
+  const { keysByLayer, ledsByLayer, layerList, hasRead, blobTotals, dumpStat, ledDumpStat } =
     layers;
   const selection = useSelection(urlInit.selKey ? [urlInit.selKey] : []);
   const { sel, setSel } = selection;
@@ -155,6 +155,18 @@ export default function App() {
   });
   const draft = useDraft({ keysByLayer, ledsByLayer, layer });
   const { draftRef, bumpDraft, keymap, ledmap, dirtyKks, draftSize } = draft;
+
+  // Keep the viewed layer inside the board's real inventory: after a dump
+  // (or a delete + post-flash refresh) a stale ?layer= or now-removed layer
+  // snaps to the closest valid idx below, else the lowest. Empty inventory
+  // (pre-read) keeps the URL fallback (0..2).
+  useEffect(() => {
+    if (layerList.length === 0 || layerList.some((e) => e.idx === layer)) return;
+    const idxs = layerList.map((e) => e.idx).sort((a, b) => a - b);
+    const below = idxs.filter((i) => i < layer);
+    setLayer(below.length > 0 ? below[below.length - 1] : idxs[0]);
+  }, [layerList, layer]);
+
   const { flashing, flashState, doFlashQueue } = useFlash({
     sesRef,
     busyRef,
@@ -253,8 +265,69 @@ export default function App() {
     );
   }
 
+  // Export/save list: every inventory layer; before the first read, the
+  // classic 0..2 (same fallback the tabs show pre-read).
+  const exportIdxs =
+    layerList.length > 0
+      ? layerList.map((e) => e.idx).sort((a, b) => a - b)
+      : [0, 1, 2];
+
   function exportAllLayers() {
-    for (const L of [0, 1, 2]) exportLayer(L);
+    for (const L of exportIdxs) exportLayer(L);
+  }
+
+  // Add layer: queue an inventory add (30/1002) for the next free slot
+  // (max idx + 1, window 0..7) with a fresh uuid and the Solid stored
+  // animation. The new tab appears after the flash — the post-flash dump
+  // re-reads the inventory.
+  function addLayer() {
+    const next = layerList.reduce((m, e) => Math.max(m, e.idx), -1) + 1;
+    if (next > 7) {
+      toast.error('layer window is full (0-7)');
+      return;
+    }
+    const r = queueLayerAdd(draftRef.current, next, mintLayerUuid(), 'Solid');
+    if (!r.queued) {
+      toast.error(r.error ?? 'layer add not queued');
+      return;
+    }
+    bumpDraft();
+    toast.success(`Layer ${next + 1} added — flash to apply`);
+    log('inf', `layers: add layer ${next} queued (Solid, fresh uuid)`);
+  }
+
+  // Delete layer: confirm first — naming the layer, with the write-frame
+  // estimate from a scratch-draft dry run of queueLayerDelete — then queue
+  // the real thing (inventory delete + full keymap blank + LED clear so a
+  // re-add can't inherit ghosts). Cancel leaves the queue untouched.
+  function deleteLayer(idx: number) {
+    const keys = keysByLayer[idx] ?? [];
+    const leds = ledsByLayer[idx] ?? [];
+    const probe = queueLayerDelete(
+      new Draft(), idx, keys, leds, 156, layerList.length,
+    );
+    if (!probe.queued) {
+      toast.error(probe.error ?? 'layer delete not possible');
+      return;
+    }
+    const label = `Layer ${idx + 1}`;
+    const est = probe.frames === 1 ? '1 frame' : `~${probe.frames} frames`;
+    if (
+      !window.confirm(
+        `Delete ${label}? Its bindings and colors will be cleared on the device after flash. (${est} will be written)`,
+      )
+    )
+      return;
+    const r = queueLayerDelete(
+      draftRef.current, idx, keys, leds, 156, layerList.length,
+    );
+    if (!r.queued) {
+      toast.error(r.error ?? 'layer delete not queued');
+      return;
+    }
+    bumpDraft();
+    toast.success(`${label} queued for deletion — flash to apply`);
+    log('inf', `layers: delete layer ${idx} queued (${r.frames} frames)`);
   }
 
   // --- troubleshooting actions ----------------------------------------------
@@ -423,8 +496,8 @@ export default function App() {
   }
 
   async function importSnapshotFile(f: File) {
-    if (keysByLayer.some((k) => k.length === 0)) {
-      log("err", "import: layer cache empty — Refresh first (diff needs live state)");
+    if (!hasRead) {
+      log("err", "import: no device state read yet — Refresh first (diff needs live state)");
       return;
     }
     let obj: unknown;
@@ -443,8 +516,8 @@ export default function App() {
   }
 
   function restoreBackup(id: string) {
-    if (keysByLayer.some((k) => k.length === 0)) {
-      log("err", "restore: layer cache empty — Refresh first (diff needs live state)");
+    if (!hasRead) {
+      log("err", "restore: no device state read yet — Refresh first (diff needs live state)");
       return;
     }
     const snap = loadAutoBackup(id);
@@ -550,6 +623,7 @@ export default function App() {
   const saveMenu = (
     <SaveMenu
       leftOn={leftOn}
+      layers={exportIdxs}
       onExportLayer={exportLayer}
       onExportAll={exportAllLayers}
       onImport={() => importRef.current?.click()}
@@ -593,6 +667,9 @@ export default function App() {
               onView={setView}
               layer={layer}
               onLayer={setLayer}
+              layerList={layerList}
+              onAddLayer={addLayer}
+              onDeleteLayer={deleteLayer}
               leftOn={leftOn}
               onDump={() => void dump()}
               ledMode={ledMode}

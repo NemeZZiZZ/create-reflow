@@ -1943,6 +1943,22 @@ import { queueAction } from '@create-reflow/sdk';
   eq(d51r.size, 1, '51 layer op survives reconcile');
   eq(SECTIONS.includes('layers'), true, '51 SECTIONS includes layers');
   eq(SECTION_LABELS.layers, 'Layers', '51 SECTION_LABELS.layers = Layers');
+  // Task 5 flash tail — restore echo is byte-transparent to add over the
+  // same parsed inventory (the board echoes back what add would send).
+  eq(
+    toHex(encodeRestorePayload(inv51)) === toHex(encodeLayerListAdd(inv51)),
+    true,
+    '51 restore = add over inventory (echo transparency)',
+  );
+  // Single-frame budget: a 4-entry restore payload (count + 4×20B) must
+  // stay ≤ 250 bytes so one 30/1002 frame carries it.
+  const inv4_51 = parseInventory(
+    hexToBytes(
+      tableHex51 +
+        ' 03 03 02 10 aa bb cc dd ee ff 00 11 22 33 44 55 66 77 88 99',
+    )!,
+  );
+  eq(encodeRestorePayload(inv4_51).length <= 250, true, '51 restore 4-entry payload single frame');
 }
 
 // §52 OpenFlow layer window 0..7 (Phase 2: the board stores 8 layer slots)

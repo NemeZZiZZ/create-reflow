@@ -12,7 +12,7 @@ import { ACTIONS, buildRecord, type ActionDef } from '@create-reflow/sdk';
 import { behaviorSetOf, hidPairOf, type BehaviorSet, type Slot } from '@create-reflow/sdk';
 import { POS_KEY } from "../../lib/kb-data";
 import { shortLabel } from "../../lib/key-icon-map";
-import type { KeyRec } from '@create-reflow/sdk';
+import type { KeyRec, LayerEntry } from '@create-reflow/sdk';
 import { hex2 } from '@create-reflow/sdk';
 import { X } from "lucide-react";
 import type { HsColor } from "../../hooks/useCustomColors";
@@ -24,6 +24,9 @@ export default function BindingsTab({
   onView,
   layer,
   onLayer,
+  layerList,
+  onAddLayer,
+  onDeleteLayer,
   leftOn,
   onDump,
   ledMode,
@@ -64,6 +67,9 @@ export default function BindingsTab({
   onView: (v: EditorView) => void;
   layer: number;
   onLayer: (l: number) => void;
+  layerList?: LayerEntry[];
+  onAddLayer?: () => void;
+  onDeleteLayer?: (idx: number) => void;
   leftOn: boolean;
   onDump: () => void;
   ledMode: boolean;
@@ -187,6 +193,9 @@ export default function BindingsTab({
           onView={onView}
           layer={layer}
           onLayer={onLayer}
+          layerList={layerList}
+          onAddLayer={onAddLayer}
+          onDeleteLayer={onDeleteLayer}
           leftOn={leftOn}
           onDump={onDump}
           ledMode={ledMode}
@@ -210,6 +219,9 @@ export default function BindingsTab({
           onView={onView}
           layer={layer}
           onLayer={onLayer}
+          layerList={layerList}
+          onAddLayer={onAddLayer}
+          onDeleteLayer={onDeleteLayer}
           leftOn={leftOn}
           onDump={onDump}
           showRaw={showRaw}

@@ -2,6 +2,7 @@
 import { RefreshCw } from "lucide-react";
 import ViewLayerTabs from "./ViewLayerTabs";
 import type { EditorView } from "./ViewLayerTabs";
+import type { LayerEntry } from '@create-reflow/sdk';
 import { Button } from "./ui/button";
 import { Card, CardContent, CardHeader } from "./ui/card";
 import { Checkbox } from "./ui/checkbox";
@@ -29,6 +30,9 @@ export default function LayoutTable({
   onView,
   layer,
   onLayer,
+  layerList,
+  onAddLayer,
+  onDeleteLayer,
   leftOn,
   onDump,
   showRaw,
@@ -44,6 +48,9 @@ export default function LayoutTable({
   onView: (v: EditorView) => void;
   layer: number;
   onLayer: (l: number) => void;
+  layerList?: LayerEntry[];
+  onAddLayer?: () => void;
+  onDeleteLayer?: (idx: number) => void;
   leftOn: boolean;
   onDump: () => void;
   showRaw: boolean;
@@ -61,7 +68,15 @@ export default function LayoutTable({
   return (
     <Card className="mb-3">
       <CardHeader className="flex-wrap">
-        <ViewLayerTabs view={view} onView={onView} layer={layer} onLayer={onLayer}>
+        <ViewLayerTabs
+          view={view}
+          onView={onView}
+          layer={layer}
+          onLayer={onLayer}
+          layerList={layerList}
+          onAddLayer={onAddLayer}
+          onDeleteLayer={onDeleteLayer}
+        >
           <Button
             variant="secondary"
             size="sm"

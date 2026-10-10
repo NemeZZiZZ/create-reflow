@@ -1,15 +1,37 @@
-/* Layer caches: all 3 layers (keymap + LED map) are fetched at once on
- * connect / Refresh, tabs then switch the view instantly with no device
- * traffic. Owns the dumpAll() full-read core. */
+/* Layer caches: every layer the board reports in its inventory (keymap +
+ * LED map) is fetched at once on connect / Refresh, tabs then switch the
+ * view instantly with no device traffic. Owns the dumpAll() full-read core
+ * and the fresh-inventory readInventory() used by the flash tail. */
 
 import { useCallback, useState } from 'react';
-import { parseLayer, parseLedmap, sleep } from '@create-reflow/sdk';
-import type { KeyRec, LedRec, NayaSession } from '@create-reflow/sdk';
+import {
+  parseInventory,
+  parseLayer,
+  parseLedmap,
+  sleep,
+} from '@create-reflow/sdk';
+import type {
+  KeyRec,
+  LayerEntry,
+  LedRec,
+  NayaSession,
+} from '@create-reflow/sdk';
 import type { LogFn } from './useLog';
 
 export interface LayerDump {
   keys: KeyRec[][];
   leds: LedRec[][];
+}
+
+/** Fresh layer-list inventory: one handshake — its Frame payload IS the
+ * inventory (count byte + 20-byte entries). Single frame, so no settle or
+ * retry. Callers that must not serve stale data (flash tail) always read
+ * fresh; dumpAll parses the same handshake it already performs. */
+export async function readInventory(
+  ses: NayaSession,
+): Promise<LayerEntry[]> {
+  const f = await ses.handshake();
+  return parseInventory(f.payload);
 }
 
 export function useLayers({
@@ -21,6 +43,11 @@ export function useLayers({
 }) {
   const [keysByLayer, setKeysByLayer] = useState<KeyRec[][]>([[], [], []]);
   const [ledsByLayer, setLedsByLayer] = useState<LedRec[][]>([[], [], []]);
+  const [layerList, setLayerList] = useState<LayerEntry[]>([]);
+  // True once a full read succeeded: import/restore diff against live
+  // caches, so gating on "every slot non-empty" would deadlock with sparse
+  // layer caches (a missing inventory idx is a legitimate empty slot).
+  const [hasRead, setHasRead] = useState(false);
   const [blobTotals, setBlobTotals] = useState<{
     keys: number[];
     leds: number[];
@@ -28,25 +55,33 @@ export function useLayers({
   const [dumpStat, setDumpStat] = useState('');
   const [ledDumpStat, setLedDumpStat] = useState('');
 
-  // Single core for full reads: one handshake, then keymap+LED for layers
-  // 0..2. Used by auto-fetch on connect and by the Refresh button.
+  // Single core for full reads: one handshake (whose payload parses the
+  // layer inventory), then keymap+LED for every inventory layer. Used by
+  // auto-fetch on connect and by the Refresh button.
   // Returns the freshly read layers so callers can reconcile the draft
   // against real device state (setState alone would leave closures stale).
   const dumpAll = useCallback(
     async (ses: NayaSession): Promise<LayerDump | null> => {
       busyRef.current = true;
       try {
-        log('inf', 'dump: all 3 layers (keymap + LED) under one handshake…');
+        log('inf', 'dump: keymap + LED for every inventory layer under one handshake…');
         setDumpStat('handshake…');
         setLedDumpStat('handshake…');
-        await ses.handshake();
-        const keys: KeyRec[][] = [[], [], []];
-        const leds: LedRec[][] = [[], [], []];
-        const keyTotals = [0, 0, 0];
-        const ledTotals = [0, 0, 0];
+        // The handshake Frame payload IS the layer inventory — parse it
+        // FIRST, then read keymap+LED for exactly those indices (not a
+        // hardcoded 0..2; the board stores 8 layer slots). Caches grow to
+        // max idx+1; indices missing from the inventory stay empty slots
+        // (consumers use ?? []).
+        const inv = await readInventory(ses);
+        setLayerList(inv);
+        const width = inv.reduce((m, e) => Math.max(m, e.idx), -1) + 1;
+        const keys: KeyRec[][] = Array.from({ length: width }, () => []);
+        const leds: LedRec[][] = Array.from({ length: width }, () => []);
+        const keyTotals = new Array<number>(width).fill(0);
+        const ledTotals = new Array<number>(width).fill(0);
         let nKeys = 0;
         let nLeds = 0;
-        for (const L of [0, 1, 2]) {
+        for (const L of inv.map((e) => e.idx)) {
           // Multipart reads can desync on a lost frame (parts share the same
           // cmd id): a short blob ends mid-record. parseLayer's invariant is
           // consumed === total, parseLedmap's is a fixed 544B/layer. Anything
@@ -120,9 +155,10 @@ export function useLayers({
         setKeysByLayer(keys);
         setLedsByLayer(leds);
         setBlobTotals({ keys: keyTotals, leds: ledTotals });
-        setDumpStat(`3 layers, ${nKeys} key records`);
-        setLedDumpStat(`3 layers, ${nLeds} LEDs`);
-        log('inf', `dump done: ${nKeys} keys, ${nLeds} LEDs`);
+        setHasRead(true);
+        setDumpStat(`${inv.length} layers, ${nKeys} key records`);
+        setLedDumpStat(`${inv.length} layers, ${nLeds} LEDs`);
+        log('inf', `dump done: ${inv.length} layers, ${nKeys} keys, ${nLeds} LEDs`);
         return { keys, leds };
       } catch (e) {
         setDumpStat('FAILED: ' + (e as Error).message);
@@ -139,6 +175,8 @@ export function useLayers({
   const clearLayers = useCallback(() => {
     setKeysByLayer([[], [], []]);
     setLedsByLayer([[], [], []]);
+    setLayerList([]);
+    setHasRead(false);
     setDumpStat('');
     setLedDumpStat('');
   }, []);
@@ -146,6 +184,8 @@ export function useLayers({
   return {
     keysByLayer,
     ledsByLayer,
+    layerList,
+    hasRead,
     blobTotals,
     dumpStat,
     ledDumpStat,
