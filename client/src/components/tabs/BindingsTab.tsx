@@ -18,6 +18,8 @@ import { X } from "lucide-react";
 import type { HsColor } from "../../hooks/useCustomColors";
 import type { SelKey } from '@create-reflow/sdk';
 import type { EditorView } from "../ViewLayerTabs";
+import type { useModuleProfiles } from "../../hooks/useModuleProfiles";
+import BayPicker from "./modules/BayPicker";
 
 export default function BindingsTab({
   view,
@@ -62,6 +64,7 @@ export default function BindingsTab({
   notes,
   onSetNote,
   ledCount,
+  modules,
 }: {
   view: EditorView;
   onView: (v: EditorView) => void;
@@ -117,6 +120,9 @@ export default function BindingsTab({
   notes: Record<string, string>;
   onSetNote: (kk: number, v: string) => void;
   ledCount: number;
+  /** module-profile store: the per-layer bay picker edits it through
+   * setBay (Task 4) — the hook queues the wire ops. */
+  modules: ReturnType<typeof useModuleProfiles>;
 }) {
   // Right-click context popover target (keymap mode only; LED paint mode
   // keeps its own pointer semantics).
@@ -234,6 +240,10 @@ export default function BindingsTab({
           onToggleAll={() => toggleAllRowKks(layer, rows.map((r) => r.kk))}
         />
       )}
+
+      {/* Per-layer bay picker (Task 4): layer context exists here in both
+          views; picks queue wire ops through the hook's setBay. */}
+      <BayPicker modules={modules} layer={layer} />
 
       {sel.length > 0 && (
         <SelectionPanel

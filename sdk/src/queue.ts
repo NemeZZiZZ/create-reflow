@@ -389,14 +389,28 @@ export function queueModuleListDelete(
 /** Queue a module bay assignment: the EXISTING key op kind at KK
  * 0x4A–0x51 carrying a bay record ([pos][value][00], Task-1 bytes). Bay
  * records live in the layer data (30/1004), so they ride the key path —
- * latest-wins per layer+pos comes free from the shared opKey. */
+ * latest-wins per layer+pos comes free from the shared opKey. The value
+ * window is 0 | 0x78 (BAY_INHERIT) | 1..7 — anything else would be byte
+ * garbage on the wire (the device ignores unknown bay bytes, so a bad
+ * write would silently no-op); refused with a ledger drop, nothing
+ * queued (queueModuleConfig guard style). */
 export function queueBayAssignment(
   draft: Draft,
   layer: number,
   pos: number,
   value: number | 'inherit' | 'disabled',
-): { queued: boolean } {
+): { queued: boolean; error?: string } {
   const v = value === 'inherit' ? BAY_INHERIT : value === 'disabled' ? 0x00 : value;
+  if (v !== 0x00 && v !== BAY_INHERIT && (v < 1 || v > 7)) {
+    const error = `bay value ${v} is outside the writable window (0, 0x78 inherit, 1-7)`;
+    draft.addDrop({
+      layer,
+      kk: pos,
+      reason: error,
+      effect: 'this bay keeps its current assignment',
+    });
+    return { queued: false, error };
+  }
   const name =
     value === 'inherit' ? 'BASE (inherit)' : value === 'disabled' ? 'disabled' : `slot ${v}`;
   draft.add({

@@ -3452,6 +3452,31 @@ void (async () => {
   eq(qb59.size, 1, '59 bay latest-wins per layer+kk (shared key opKey)');
   eq(opKey(qb59.ops[0]), 'key:1:76', '59 bay opKey = key:layer:kk (0x4c = 76)');
 
+  /* --- bay window guard (Task-4 hardening, 5a BINDING a) ---------------- */
+  const qdBad59 = new Draft();
+  const bad9 = queueBayAssignment(qdBad59, 1, 0x4c, 9);
+  const bad200 = queueBayAssignment(qdBad59, 2, 0x4d, 200);
+  eq(
+    bad9.queued === false && bad200.queued === false &&
+      bad9.error === 'bay value 9 is outside the writable window (0, 0x78 inherit, 1-7)' &&
+      qdBad59.size === 0 &&
+      qdBad59.drops.length === 2 &&
+      qdBad59.drops.every((d) => d.reason.includes('outside the writable window')) &&
+      qdBad59.drops[0].effect === 'this bay keeps its current assignment' &&
+      qdBad59.drops[0].at === 'queue',
+    true,
+    '59 bay window guard: 9 + 200 refuse-with-drop (window reason, honest effect), nothing queued',
+  );
+
+  /* --- orphanGcOps slot-0 skip (Task-4 hardening, 5a BINDING a) ---------- */
+  eq(
+    orphanGcOps([0], { 0: { 0x4a: 0 }, 1: { 0x4c: 0 } }).length === 0 &&
+      orphanGcOps([0, 3], {}).every((o) => o.slot !== 0) &&
+      orphanGcOps([0, 3], {}).some((o) => o.kind === 'listDelete' && o.slot === 3),
+    true,
+    '59 orphan GC: slot 0 (the blank template) is never GCd — skipped silently, slot 3 still reclaimed',
+  );
+
   /* --- the guard routes module verbs (review condition a) -------------------------------- */
   let guarded59 = 0;
   try { assertWireAllowed(0x30, 0x10, 0x09); } catch { guarded59++; }

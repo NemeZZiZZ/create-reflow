@@ -181,8 +181,15 @@ export default function App() {
   // Module profile store (Phase 5b): profiles + bay picks persist in
   // localStorage; readAll() captures unmatched slots on read. ModulesTab
   // edits this store; the flash pre-step plans module writes against it.
-  // Declared BEFORE useFlash for that reason.
-  const moduleProfiles = useModuleProfiles({ sesRef, busyRef, log });
+  // Declared BEFORE useFlash for that reason. draftRef/bumpDraft let bay
+  // picks queue their wire op (Task 4 — bay records are plain key ops).
+  const moduleProfiles = useModuleProfiles({
+    sesRef,
+    busyRef,
+    log,
+    draftRef,
+    bumpDraft,
+  });
   // The clearLive indirection lands in an effect (carry [iv]): a ref write
   // during render breaks under concurrent rendering — onLeftCleared (inside
   // useSessions) calls it, profiles/bays persist, only the read verdicts die.
@@ -727,6 +734,7 @@ export default function App() {
                 });
               }}
               ledCount={ledsByLayer[layer]?.length ?? 0}
+              modules={moduleProfiles}
             />
           )}
 

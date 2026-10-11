@@ -33,6 +33,7 @@ import {
   matchSlots,
   mintLayerUuid,
   parseModuleList,
+  queueBayAssignment,
   recordsFromModuleBlob,
   repointBays,
   ticksFromWire,
@@ -41,6 +42,7 @@ import type {
   BayAssignments,
   ConfigRecords,
   DiffRow,
+  Draft,
   ModuleListEntry,
   ModuleProfile,
   ModuleType,
@@ -163,10 +165,16 @@ export function useModuleProfiles({
   sesRef,
   busyRef,
   log,
+  draftRef,
+  bumpDraft,
 }: {
   sesRef: React.RefObject<Map<Side, NayaSession>>;
   busyRef: React.RefObject<boolean>;
   log: LogFn;
+  /** The shared edit queue — bay picks queue a wire op into it (a bay
+   * record is a plain key op at KK 0x4A-0x51; Task 4). */
+  draftRef: React.RefObject<Draft>;
+  bumpDraft: () => void;
 }) {
   // Lazy validated parse (useCustomColors pattern) — runs once at mount.
   const [profiles, setProfiles] = useState<ModuleProfile[]>(loadProfiles);
@@ -348,22 +356,67 @@ export function useModuleProfiles({
     [profiles, saveProfiles, busyGated],
   );
 
-  /** Point one bay position at a profile; null clears it (an emptied layer
-   * row is dropped). Bay picks are the user's deliberate choice — only
-   * capture-on-read repoints rows programmatically. */
+  /** Point one bay position at a pick; null clears the stored intent (an
+   * emptied layer row is dropped). `pick` is a profile id or the literal
+   * intents 'inherit' / 'disabled' — the bay→wire mapping is the hook's
+   * job, the caller never passes raw bytes.
+   *
+   * The store is updated first (JSON-safe: ids and intents are strings;
+   * the planner reads the ids as bay references), then the wire op is
+   * queued into the draft when the byte is known NOW:
+   *   - 'inherit' → BAY_INHERIT 0x78, 'disabled' → 0x00 — always queueable
+   *     (inherit refused on layer 0: 0x78 points AT the base layer, so on
+   *     the base layer itself it resolves to nothing);
+   *   - a profile id → its live matched slot — a profile not on the
+   *     keyboard yet has no slot byte until the next read plans one, so
+   *     the pick is stored and the queue touched only after a read.
+   * Bay ops are plain key ops at KK 0x4A-0x51 (queueBayAssignment) — they
+   * ride the existing executor/preview, no executor change. Clearing to
+   * null never un-queues a previously queued op — the queue is reviewed
+   * (and its rows removable) in the flash dialog. */
   const setBay = useCallback(
-    (layer: number, pos: number, profileId: string | null) => {
+    (layer: number, pos: number, pick: string | null) => {
       if (busyGated()) return;
+      if (pick === 'inherit' && layer === 0) {
+        log(
+          'inf',
+          'modules: bay inherit points at the BASE layer — nothing to inherit on layer 0, ignored',
+        );
+        return;
+      }
       const next: BayAssignments = {};
       for (const [lk, layerMap] of Object.entries(bays)) next[Number(lk)] = { ...layerMap };
       const row = next[layer] ?? {};
-      if (profileId === null) delete row[pos];
-      else row[pos] = profileId;
+      if (pick === null) delete row[pos];
+      else row[pos] = pick;
       if (Object.keys(row).length > 0) next[layer] = row;
       else delete next[layer];
       saveBays(next);
+      // Wire op: only when the byte is resolvable this moment.
+      let wire: number | 'inherit' | 'disabled' | null = null;
+      if (pick === 'inherit' || pick === 'disabled') wire = pick;
+      else if (pick !== null) {
+        const slot = Object.values(live).find((m) => m.matched?.id === pick)?.slot;
+        if (slot === undefined) {
+          const name = profiles.find((p) => p.id === pick)?.name ?? pick;
+          log(
+            'inf',
+            `modules: bay pick "${name}" stored — the profile is not on the keyboard yet, its bay write is queued after the next read`,
+          );
+          return;
+        }
+        wire = slot;
+      }
+      if (wire === null) return; // clearing a pick queues nothing
+      const r = queueBayAssignment(draftRef.current, layer, pos, wire);
+      if (r.queued) {
+        bumpDraft();
+        log('inf', `modules: bay write queued (layer ${layer}, KK 0x${pos.toString(16)})`);
+      } else {
+        log('err', `modules: bay write refused — ${r.error ?? 'unknown reason'}`);
+      }
     },
-    [bays, saveBays, busyGated],
+    [bays, live, profiles, saveBays, busyGated, log, draftRef, bumpDraft],
   );
 
   /** New profile seeded from the type's stock map (the first stock of that

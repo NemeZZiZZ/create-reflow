@@ -255,7 +255,13 @@ export function orphanGcOps(
   baysByLayer: Record<number, Record<number, BayValue>>,
 ): OrphanGcOp[] {
   const out: OrphanGcOp[] = [];
-  const orphans = [...new Set(orphanSlots)].sort((a, b) => a - b);
+  // Slot 0 is the blank template — never allocated, never GC'd. Filtered
+  // BEFORE the set is built so a bay value of 0 (which means DISABLED, not
+  // "points at slot 0") can never trip the bay pass either. Defense-in-
+  // depth for direct callers: the planner's scans start at 1.
+  const orphans = [...new Set(orphanSlots)]
+    .filter((s) => s !== 0)
+    .sort((a, b) => a - b);
   const orphanSet = new Set(orphans);
   const layers = Object.keys(baysByLayer).map(Number).sort((a, b) => a - b);
   for (const layer of layers) {
