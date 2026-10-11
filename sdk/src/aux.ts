@@ -17,6 +17,7 @@ import {
   toHex,
 } from './naya';
 import type { Side } from './naya';
+import { BleCapabilityCache } from './ble';
 
 /** Pill/popover-facing per-half state. */
 export interface HalfInfo {
@@ -55,11 +56,16 @@ export const emptyHalf = (side: Side): HalfSnapshot => ({
   devRows: [['—', 'not connected']],
 });
 
-/** Full aux sweep for one half. Read-only. */
+/** Full aux sweep for one half. Read-only. `caps` (optional) wires the
+ * negative-only BLE capability cache into the be/1006 + be/100f asks —
+ * verbs recorded unanswered for this (side, fw) skip the wire entirely
+ * (the 30s sweep used to re-ask dead verbs forever). Everything else is
+ * unchanged. */
 export async function readAux(
   ses: NayaSession,
   side: Side,
   busyGuard?: { current: boolean },
+  caps?: BleCapabilityCache,
 ): Promise<Omit<HalfSnapshot, 'side' | 'connected'>> {
   const rows: [string, string][] = [];
   let fw = '—';
@@ -76,6 +82,26 @@ export async function readAux(
     c1: number,
     fmt: (p: Uint8Array) => string,
   ): Promise<Uint8Array | null> => {
+    // Negative-capability seam — be/1006 + be/100f ONLY: when the cache has
+    // this verb recorded unanswered for (side, fw), skip the wire entirely.
+    // fw for the be/1006 key is the PREVIOUS sweep's base FW (fe/1002 answers
+    // later in the sweep; first sweep ever probes under '').
+    if (caps !== undefined && t === 0xbe && (c1 === 0x06 || c1 === 0x0f)) {
+      const cached = await caps.ask(side, caps.fwOf(side), c1, async () => {
+        try {
+          return await ses.cmd(t, c0, c1, new Uint8Array([0]), busyGuard);
+        } catch (e) {
+          if ((e as Error).name === 'BusySkipError') throw e; // not a device fault
+          return null;
+        }
+      });
+      if (cached === null) {
+        rows.push([label, 'NO REPLY (cached unanswered for this fw)']);
+        return null;
+      }
+      rows.push([label, fmt(cached.payload)]);
+      return cached.payload;
+    }
     try {
       const f = await ses.cmd(t, c0, c1, new Uint8Array([0]), busyGuard);
       rows.push([label, fmt(f.payload)]);
@@ -96,7 +122,12 @@ export async function readAux(
   );
   if (nm) bleNm = bleName(nm);
   const f2 = await q('fe/1002 base FW', 0xfe, 0x10, 0x02, fwVersionText);
-  if (f2) fw = fwVersionText(f2).split('  [')[0];
+  if (f2) {
+    fw = fwVersionText(f2).split('  [')[0];
+    // Feed the capability-cache key: the be/100f ask below (and the NEXT
+    // sweep's be/1006) key on this fw, so an fw upgrade invalidates negatives.
+    if (caps !== undefined) caps.rememberFw(side, fw);
+  }
   const f6 = await q('fe/1006 base batt', 0xfe, 0x10, 0x06, (p) => {
     const mv = batteryMv(p);
     return mv === null

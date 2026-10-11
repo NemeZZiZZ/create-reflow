@@ -3,6 +3,7 @@
 export * from './naya';
 export * from './actions';
 export * from './aux';
+export * from './ble';
 export * from './draft';
 export * from './t10';
 export * from './settings';

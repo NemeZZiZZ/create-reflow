@@ -43,6 +43,12 @@ import { queueLayerAdd, queueLayerDelete, pendingLayerAddIdxs } from '@create-re
 import { BAY_LED_RANGES, queueBayColor, queueFillLayer } from '@create-reflow/sdk';
 import { chunkStatus, probeDraft } from '@create-reflow/sdk';
 import {
+  decodeBleStatus, pairingVerdict, splitLinkVerdict, probeReached, parseBlePairs,
+  BleCapabilityCache, bleGetPairAddress, bleGetAllPairs, bleGetAddress,
+  bleSelectProfile, bleClearProfile, readAux,
+} from '@create-reflow/sdk';
+import type { BleProfileStatus, SplitLinkReport } from '@create-reflow/sdk';
+import {
   MODULE_ADDR, moduleAddr, MODULE_TYPE_CODE,
   encodeListAdd, encodeListDelete, encodeBlankConfig, encodeModuleConfig,
   encodeModuleField, encodeTwoWord, encodeMouseMask, MOUSE_MASK,
@@ -4064,5 +4070,356 @@ void (async () => {
       toHex(d62.ops[2].payload) === toHex(gen62[2].payload),
     true, '62 injection: queue-helper payloads are byte-identical to the producer payloads');
 }
+
+// §63 BLE: verbs, 239B decode, verdicts, capability cache
+// Synthesized 239B status fixture — layout per sdk/src/ble.ts: header 15B +
+// 5×37B profiles @15 + split 39B @200, multi-byte ints BIG-ENDIAN. Profiles
+// self-validate (blk[0] = their own index); flag bytes discriminate every
+// documented bit. BLE GETs carry the [0x00] param — OUR answered aux
+// convention (OpenFlow sends EMPTY payloads; discrepancy unresolved, the
+// Phase-10 live probe settles it — see the ble.ts header note).
+void (async () => {
+  /* ---- fixtures ----------------------------------------------------------- */
+  const macA63 = [0x11, 0x22, 0x33, 0x44, 0x55, 0x66];
+  const macB63 = [0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0x0f];
+  const prof63 = (
+    i: number, flags: number, peer: number[] | null, extra: Record<number, number>,
+  ): Uint8Array => {
+    const b = new Uint8Array(37);
+    b[0] = i;
+    b[1] = flags;
+    b[2] = 0x00; b[3] = 0x01; b[4] = 0x02; // constant prefix — NOT state
+    if (peer) for (let k = 0; k < 6; k++) b[6 + k] = peer[k]!;
+    for (const k of Object.keys(extra)) b[Number(k)] = extra[Number(k)]!;
+    return b;
+  };
+  const mkStatus63 = (): Uint8Array => {
+    const u = new Uint8Array(239);
+    u[0] = 0x00; u[1] = 0x01; u[2] = 0x02; u[3] = 0x03; // revision u32BE → 66051
+    u[4] = 3; // profileCount
+    u[5] = 2; // activeProfile
+    u[6] = 0x05; // flags: advertising | localAddrValid (hostConnected OFF)
+    u[7] = 0xab; u[8] = 0xcd; // raw unknown
+    [0x84, 0x2e, 0x14, 0x36, 0x58, 0x70].forEach((v, i) => { u[9 + i] = v; });
+    u.set(prof63(0, 0x00, null, {}), 15);
+    u.set(prof63(1, 0x7f, macA63, {}), 15 + 37);
+    u.set(prof63(2, 0x2a, [1, 2, 3, 4, 5, 6], {}), 15 + 74);
+    u.set(prof63(3, 0x00, null, { 36: 0x77 }), 15 + 111);
+    u.set(prof63(4, 0x00, null, {}), 15 + 148);
+    [0xaa, 0x55, 0xaa, 0x55, ...macB63, 0x00, 0x10, 0x00, 0x04, 0x01, 0x90]
+      .forEach((v, i) => { u[200 + i] = v; });
+    for (let i = 16; i < 39; i++) u[200 + i] = 0xee; // unknown tail
+    return u;
+  };
+  const S239_63 = mkStatus63();
+
+  /* ---- (a) 239B decode, byte-pinned --------------------------------------- */
+  const st63 = decodeBleStatus(S239_63);
+  const L63 = st63.layout;
+  eq(L63 !== null, true, '63 decode: 239B → layout parsed');
+  if (L63) {
+    eq(L63.revision, 66051, '63 header: revision u32BE 00 01 02 03 → 66051');
+    eq(L63.profileCount, 3, '63 header: profileCount [4]');
+    eq(L63.activeProfile, 2, '63 header: activeProfile [5]');
+    eq(L63.advertising, true, '63 header: flags.0x01 advertising');
+    eq(L63.hostConnected, false, '63 header: flags.0x02 hostConnected off');
+    eq(L63.localAddrValid, true, '63 header: flags.0x04 localAddrValid');
+    eq(toHex(L63.unknownBytes), 'ab cd', '63 header: bytes [7:9] kept raw-unknown');
+    eq(toHex(L63.localAddress), '84 2e 14 36 58 70', '63 header: localAddress MAC [9:15]');
+    eq(L63.profiles.length, 5, '63 layout: 5×37B profiles');
+    eq(L63.profiles.every((p, i) => p.index === i), true,
+      '63 profiles: self-validating indices 0..4');
+    const fl63 = (p: BleProfileStatus): string =>
+      [p.configured, p.bonded, p.connected, p.active, p.hasPeerAddr, p.encrypted, p.authenticated]
+        .map((b) => (b ? '1' : '0')).join('');
+    eq(fl63(L63.profiles[0]!), '0000000', '63 prof0: flags 0x00 → all 7 bits false');
+    eq(fl63(L63.profiles[1]!), '1111111', '63 prof1: flags 0x7f → all 7 bits true');
+    eq(fl63(L63.profiles[2]!), '0101010', '63 prof2: flags 0x2a → bonded+active+encrypted only');
+    eq(L63.profiles[0]!.peerAddress, null, '63 prof0: pristine slot → peerAddress null');
+    eq(toHex(L63.profiles[1]!.peerAddress ?? new Uint8Array(0)), '11 22 33 44 55 66',
+      '63 prof1: peerAddress = blk[6:12]');
+    eq(L63.profiles[2]!.peerAddress, null, '63 prof2: 0x2a lacks 0x10 → peerAddress null despite bytes');
+    eq(L63.profiles.every((p) => toHex(p.constantPrefix) === '00 01 02'), true,
+      '63 profiles: blk[2:5] constant prefix 00 01 02 (not state)');
+    eq(L63.profiles[0]!.securityLevel, 0, '63 profiles: securityLevel = blk[2]');
+    eq(L63.profiles[0]!.hasPeerData, false, '63 prof0: zero tail → hasPeerData false');
+    eq(L63.profiles[1]!.hasPeerData, true, '63 prof1: peer bytes make blk[5:] nonzero');
+    eq(L63.profiles[2]!.hasPeerData, true, '63 prof2: stray peer bytes at blk[6:12] count as data');
+    eq(L63.profiles[3]!.hasPeerData, true, '63 prof3: LAST tail byte blk[36]=0x77 → hasPeerData (any over blk[5:])');
+    eq(L63.profiles[4]!.hasPeerData, false, '63 prof4: pristine empty slot → hasPeerData false');
+    eq(toHex(L63.profiles[1]!.raw.slice(0, 12)), '01 7f 00 01 02 00 11 22 33 44 55 66',
+      '63 prof1: raw 37B kept, byte-pinned head (index, flags, prefix, peer MAC)');
+    eq(toHex(L63.split.peerAddress), 'aa bb cc dd ee 0f', '63 split: peerAddress [4:10]');
+    eq(L63.split.connectionIntervalMs, 20, '63 split: u16BE 16 × 1.25 → 20ms');
+    eq(L63.split.connectionLatency, 4, '63 split: latency u16BE');
+    eq(L63.split.supervisionTimeoutMs, 4000, '63 split: u16BE 400 × 10 → 4000ms');
+    eq(toHex(L63.split.unknownHead), 'aa 55 aa 55', '63 split: leading [0:4] kept raw-unknown');
+    eq(L63.split.unknownTail.length, 23, '63 split: trailing [16:] kept (23B)');
+    eq(st63.raw.length, 239, '63 decode: raw kept beside decode');
+    eq(st63.rawHex, toHex(S239_63), '63 decode: rawHex kept beside decode');
+  }
+
+  /* ---- (b) wrong-length passthrough (never raises) ------------------------ */
+  const bad63 = decodeBleStatus(new Uint8Array(100));
+  eq(bad63.layout, null, '63 decode: wrong length 100B → layout null');
+  eq(bad63.raw.length, 100, '63 decode: wrong length → raw passthrough');
+  eq(bad63.rawHex.split(' ').length, 100, '63 decode: wrong length → rawHex passthrough');
+  eq(decodeBleStatus(new Uint8Array(0)).layout, null, '63 decode: empty payload → layout null, never raises');
+
+  /* ---- (c) be/1005 table parse guard --------------------------------------- */
+  const empty63 = parseBlePairs(Uint8Array.from([0x00]));
+  eq(empty63 !== null && empty63.count === 0 && empty63.macs.length === 0, true,
+    '63 pairs: [0] is a valid EMPTY table — distinct from null');
+  eq(parseBlePairs(Uint8Array.from([9, ...new Array(54).fill(0)])), null,
+    '63 pairs: count>8 → null (guard)');
+  eq(parseBlePairs(Uint8Array.from([2, ...macA63])), null,
+    '63 pairs: truncated (len < 1+6·count) → null');
+  const one63 = parseBlePairs(Uint8Array.from([1, ...macA63, 0xff]));
+  eq(one63 !== null && one63.count === 1 &&
+      toHex(one63.macs[0]!) === toHex(Uint8Array.from(macA63)), true,
+    '63 pairs: [1][6B] parses to one exact MAC');
+
+  /* ---- (d) pairingVerdict (pure) -------------------------------------------
+   * CRITICAL SEMANTICS: a half's pairAddress is its PEER's address —
+   * left.pairAddress === right.bleAddress means LEFT points at RIGHT. */
+  const A63 = Uint8Array.from([0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa]);
+  const B63 = Uint8Array.from([0xbb, 0xbb, 0xbb, 0xbb, 0xbb, 0xbb]);
+  const Z63 = Uint8Array.from([0x00, 0x00, 0x00, 0x00, 0x00, 0x00]);
+  const h63 = (ble: Uint8Array | null, pair: Uint8Array | null,
+    peers?: Uint8Array[] | null): { bleAddress: Uint8Array | null; pairAddress: Uint8Array | null; pairedPeers?: Uint8Array[] | null } =>
+    ({ bleAddress: ble, pairAddress: pair, pairedPeers: peers });
+  eq(pairingVerdict(h63(A63, B63), h63(B63, A63)), 'unknown',
+    '63 verdict: mutual pairAddresses + UNREAD tables → unknown (healthy needs READ tables)');
+  eq(pairingVerdict(h63(A63, B63, [B63]), h63(B63, A63, [A63])), 'healthy',
+    '63 verdict: mutual + both read tables hold the partner → healthy');
+  eq(pairingVerdict(h63(A63, B63), h63(B63, A63, [A63])), 'unknown',
+    '63 verdict: mutual + right READ, left UNREAD → unknown (no read ≠ evidence of a bond)');
+  eq(pairingVerdict(h63(A63, B63, [Z63]), h63(B63, A63)), 'bond-missing',
+    '63 verdict: mutual + LEFT read table missing the partner → bond-missing');
+  eq(pairingVerdict(h63(A63, B63), h63(B63, A63, [Z63])), 'bond-missing',
+    '63 verdict: mutual + RIGHT read table missing the partner → bond-missing');
+  eq(pairingVerdict(h63(A63, B63), h63(B63, Z63)), 'half-paired',
+    '63 verdict: exactly one direction → half-paired');
+  eq(pairingVerdict(h63(A63, B63), h63(B63, Z63, [B63])), 'half-paired',
+    '63 verdict: address dimension first — one direction beats table content');
+  eq(pairingVerdict(h63(A63, Z63), h63(B63, Z63)), 'half-paired',
+    '63 verdict: zero directions (fresh 00:.. pairAddresses) → pairing incomplete, half-paired group');
+  eq(pairingVerdict(h63(Z63, Z63), h63(Z63, Z63)), 'half-paired',
+    '63 verdict: degenerate all-zero identity never grades healthy');
+  eq(pairingVerdict(h63(A63, B63, null), h63(B63, A63)), 'unknown',
+    '63 verdict: mutual + left UNANSWERED (null) table → unknown (asked ≠ answered)');
+  eq(pairingVerdict(h63(null, B63), h63(B63, A63)), 'unknown',
+    '63 verdict: missing bleAddress → unknown');
+  eq(pairingVerdict(h63(A63, null), h63(B63, A63)), 'unknown',
+    '63 verdict: missing pairAddress → unknown');
+
+  /* ---- (e) splitLinkVerdict (pure, ordered — first match wins) ------------- */
+  const rep63 = (over: Partial<SplitLinkReport>): SplitLinkReport => ({
+    leftConnected: true, rightConnected: true,
+    leftFw: 'v1.2.3.4', rightFw: 'v1.2.3.4', pairing: 'healthy', ...over,
+  });
+  eq(splitLinkVerdict(rep63({ leftConnected: false }), { reached: false }), 'connect-both',
+    '63 split: either half missing → connect-both (first rule wins)');
+  eq(splitLinkVerdict(
+      rep63({ pairing: 'half-paired', leftFw: 'v1', rightFw: 'v2' }), { reached: true },
+    ), 'firmware-mismatch',
+    '63 split: fw mismatch beats pairing-repair (repair refuses on mismatch — fw first)');
+  eq(splitLinkVerdict(rep63({ leftFw: 'v1', rightFw: 'v2' }), { reached: true }), 'firmware-mismatch',
+    '63 split: differing fw strings → firmware-mismatch');
+  eq(splitLinkVerdict(rep63({ pairing: 'half-paired' }), { reached: false }), 'pairing-repair',
+    '63 split: half-paired → pairing-repair (before link-down)');
+  eq(splitLinkVerdict(rep63({ pairing: 'bond-missing' }), { reached: true }), 'pairing-repair',
+    '63 split: bond-missing → pairing-repair');
+  eq(splitLinkVerdict(rep63(), { reached: false }), 'link-down',
+    '63 split: healthy pairing but partner-via-left unreached → link-down');
+  eq(splitLinkVerdict(rep63(), null), 'ok',
+    '63 split: probe not run → rule skipped → ok');
+  eq(splitLinkVerdict(rep63(), { reached: true }), 'ok',
+    '63 split: everything good → ok');
+  eq(probeReached(new Uint8Array(0)), false,
+    '63 probe: EMPTY payload reply is NOT an answer (a linkless half still replies)');
+  eq(probeReached(null), false, '63 probe: no reply frame → not reached');
+  eq(probeReached(Uint8Array.from([0x00])), true, '63 probe: non-empty payload → reached');
+
+  /* ---- (f) verb frames byte-exact over a scripted session ------------------ */
+  const scripted63 = (reply: (rq: Frame) => Uint8Array) => {
+    const reqs: Frame[] = [];
+    const queue: Uint8Array[] = [];
+    let waiter: (() => void) | null = null;
+    const reader = {
+      async read(): Promise<{ value?: Uint8Array; done?: boolean }> {
+        for (;;) {
+          const c = queue.shift();
+          if (c) return { value: c, done: false };
+          await new Promise<void>((res) => { waiter = res; });
+        }
+      },
+      cancel() { const w = waiter; waiter = null; w?.(); },
+      releaseLock() {},
+    };
+    const writer = {
+      async write(b: Uint8Array) {
+        const rq = verifyFrame(Uint8Array.from(b));
+        reqs.push(rq);
+        const resp = buildFrame(0x50, rq.type, rq.c0, rq.c1, reply(rq));
+        verifyFrame(resp);
+        setTimeout(() => { queue.push(resp); const w = waiter; waiter = null; w?.(); }, 5);
+      },
+      releaseLock() {},
+    };
+    const port = {
+      readable: { locked: false, getReader: () => reader },
+      writable: { getWriter: () => writer },
+      async open() {}, async setSignals() {}, async close() {},
+    };
+    return {
+      reqs,
+      session() {
+        const r = port.readable.getReader() as unknown as ReadableStreamDefaultReader<Uint8Array>;
+        const w = port.writable.getWriter() as unknown as WritableStreamDefaultWriter<Uint8Array>;
+        return new NayaSession(
+          port as unknown as SerialPort, 0x50,
+          new FrameReader(r), w, r,
+          async (b) => { await w.write(b); }, null,
+        );
+      },
+    };
+  };
+  const verbReply63 = (rq: Frame): Uint8Array => {
+    if (rq.c1 === 0x02) return Uint8Array.from([0x84, 0x2e, 0x14, 0x36, 0x58, 0x71]);
+    if (rq.c1 === 0x05) return Uint8Array.from([2, ...macA63, ...macB63]);
+    if (rq.c1 === 0x08) return Uint8Array.from([0x84, 0x2e, 0x14, 0x36, 0x58, 0x70]);
+    if (rq.c1 === 0x0c) return S239_63;
+    return Uint8Array.from([0x00]); // 1009/100A write acks
+  };
+  const dev63 = scripted63(verbReply63);
+  const ses63 = dev63.session();
+
+  const pair63 = await bleGetPairAddress(ses63);
+  eq(pair63 !== null && toHex(pair63) === '84 2e 14 36 58 71', true,
+    '63 verb 1002: pairAddress MAC decoded');
+  eq(toHex(dev63.reqs[0]!.raw), 'aa 00 50 00 be 03 10 02 00 12 04',
+    '63 verb 1002: request byte-exact — be 10 02 + [0x00] GET param');
+  const pairs63 = await bleGetAllPairs(ses63);
+  eq(pairs63 !== null && pairs63.count === 2 &&
+      toHex(pairs63.macs[0]!) === toHex(Uint8Array.from(macA63)) &&
+      toHex(pairs63.macs[1]!) === toHex(Uint8Array.from(macB63)), true,
+    '63 verb 1005: two-MAC table parsed from scripted reply');
+  eq(toHex(dev63.reqs[1]!.raw), 'aa 00 50 00 be 03 10 05 00 15 04',
+    '63 verb 1005: request byte-exact — be 10 05 + [0x00]');
+  const self63 = await bleGetAddress(ses63);
+  eq(self63 !== null && toHex(self63) === '84 2e 14 36 58 70', true,
+    '63 verb 1008: own address decoded');
+  eq(toHex(dev63.reqs[2]!.raw), 'aa 00 50 00 be 03 10 08 00 18 04',
+    '63 verb 1008: request byte-exact — be 10 08 + [0x00]');
+
+  // select 2 → write be/1009 [02], then read-back be/100C [00]; active is 2 → ok
+  const sel63 = await bleSelectProfile(ses63, 2);
+  eq(sel63.ok, true, '63 verb 1009: read-back activeProfile === slot → ok');
+  eq(sel63.activeProfile, 2, '63 verb 1009: read-back reports activeProfile');
+  eq(sel63.bonded, true, '63 verb 1009: read-back carries the slot hasPeerData');
+  eq(toHex(dev63.reqs[3]!.raw), 'aa 00 50 00 be 03 10 09 02 1b 04',
+    '63 verb 1009: request byte-exact — be 10 09 [slot]');
+  eq(toHex(dev63.reqs[4]!.raw), 'aa 00 50 00 be 03 10 0c 00 1c 04',
+    '63 verb 100C: read-back request byte-exact — be 10 0c + [0x00] (OUR convention)');
+  // clear 2 → be/100A [02] + read-back; slot 2 holds stray data → bonded
+  const clr63 = await bleClearProfile(ses63, 2);
+  eq(clr63.ok, true, '63 verb 100A: write acked (no confirm logic in SDK — caller confirms)');
+  eq(clr63.bonded, true, '63 verb 100A: read-back reports the slot hasPeerData as bonded');
+  eq(toHex(dev63.reqs[5]!.raw), 'aa 00 50 00 be 03 10 0a 02 18 04',
+    '63 verb 100A: request byte-exact — be 10 0a [slot]');
+  // select 3 → read-back still 2 → ok=false (mismatch surfaced, not swallowed)
+  eq((await bleSelectProfile(ses63, 3)).ok, false,
+    '63 verb 1009: read-back mismatch → ok=false');
+
+  // wire-guard pass-through: the BLE verbs are NOT on the never-send list
+  let guardOk63 = true;
+  for (const c1 of [0x02, 0x05, 0x08, 0x09, 0x0a, 0x0c]) {
+    try { assertWireAllowed(0xbe, 0x10, c1); } catch { guardOk63 = false; }
+  }
+  eq(guardOk63, true, '63 wire-guard: 1002/1005/1008/1009/100A/100C pass unblocked');
+  let blocked63 = '';
+  try { assertWireAllowed(0xbe, 0x10, 0x04); } catch (e) { blocked63 = (e as Error).message; }
+  eq(blocked63.includes('be/1004'), true, '63 wire-guard: be/1004 UNPAIR ALL stays blocked');
+
+  // refusals: slot 0 reserved (dongle) + 5 out of range — BEFORE any wire traffic
+  const preRefusal63 = dev63.reqs.length;
+  let err0a = '';
+  try { await bleSelectProfile(ses63, 0); } catch (e) { err0a = (e as Error).message; }
+  let err0b = '';
+  try { await bleClearProfile(ses63, 0); } catch (e) { err0b = (e as Error).message; }
+  let err5 = '';
+  try { await bleSelectProfile(ses63, 5); } catch (e) { err5 = (e as Error).message; }
+  eq(err0a.includes('slot 0'), true, '63 refusal: select names reserved slot 0');
+  eq(err0b.includes('slot 0'), true, '63 refusal: clear names reserved slot 0');
+  eq(err5 !== '' && err5.includes('5'), true, '63 refusal: slot 5 out of range');
+  eq(dev63.reqs.length, preRefusal63, '63 refusal: zero frames sent pre-wire');
+  await ses63.close();
+
+  // short pair-address reply → null contract (no throw)
+  let respond63: (rq: Frame) => Uint8Array = verbReply63;
+  const dev63b = scripted63((rq) => respond63(rq));
+  const ses63b = dev63b.session();
+  respond63 = () => Uint8Array.from([0x01, 0x02]);
+  eq(await bleGetPairAddress(ses63b), null, '63 verb 1002: short reply → null (no throw)');
+  await ses63b.close();
+
+  /* ---- (g) capability cache: negative-only, fw-keyed + aux seam ------------ */
+  const cache63 = new BleCapabilityCache();
+  let calls63 = 0;
+  const negFn63 = async (): Promise<Frame | null> => { calls63++; return null; };
+  eq(await cache63.ask('left', 'v1', 0x06, negFn63), null, '63 cache: first ask goes to fn → null');
+  eq(await cache63.ask('left', 'v1', 0x06, negFn63), null, '63 cache: negative remembered');
+  eq(calls63, 1, '63 cache: second ask skipped fn (no wire)');
+  const posFrame63 = (): Frame => ({
+    src: 0, dst: 0x50, id: 0, type: 0xbe, c0: 0x10, c1: 0x06,
+    payload: Uint8Array.from([0x00]), raw: new Uint8Array(0),
+  });
+  let callsPos63 = 0;
+  const posFn63 = async (): Promise<Frame | null> => { callsPos63++; return posFrame63(); };
+  eq(await cache63.ask('left', 'v9', 0x06, posFn63) !== null, true,
+    '63 cache: positive answer passes through (fresh key — the v1 negative stays put)');
+  eq(await cache63.ask('left', 'v9', 0x06, posFn63) !== null, true,
+    '63 cache: positive re-asked (negative-only memory)');
+  eq(callsPos63, 2, '63 cache: positive never cached — fn ran both times');
+  eq(await cache63.ask('left', 'v2', 0x06, negFn63), null, '63 cache: new fw key asks again');
+  eq(calls63, 2, '63 cache: new fw key → fresh probe (old negative not consulted)');
+
+  // Seam wiring: readAux must route be/1006 + be/100f through the cache and
+  // leave every other verb untouched. Negatives are pre-seeded WITHOUT wire,
+  // then two sweeps run over a scripted session that counts frames per verb.
+  // be/1006 seeds under '' (no fw seen yet); be/100f under 'v1.2.3.4' — the
+  // fw the scripted fe/1002 will report (rememberFw fires mid-sweep, before
+  // the be/100f ask).
+  const auxReply63 = (rq: Frame): Uint8Array => {
+    const k = `${rq.type.toString(16)}/${rq.c1.toString(16)}`;
+    if (k === 'fa/1') return Uint8Array.from([0x00, 0x2a]);
+    if (k === 'be/6') return Uint8Array.from([0x00, 0x4e, 0x61, 0x79, 0x61]); // 'Naya'
+    if (k === 'fe/2') return Uint8Array.from([0x00, 0x01, 0x02, 0x03, 0x04]); // v1.2.3.4
+    if (k === 'fe/6') return Uint8Array.from([0x00, 0x0f, 0xa2]);
+    if (k === 'be/f') return Uint8Array.from([0x00, 0x02, 0x07]);
+    if (k === 'de/1') return Uint8Array.from([0x00, 0x00, 0x10, 0x00]); // module absent
+    return Uint8Array.from([0x00]);
+  };
+  const cnt63 = (d: { reqs: Frame[] }, t: number, c1: number): number =>
+    d.reqs.filter((r) => r.type === t && r.c1 === c1).length;
+  const capDev63 = scripted63(auxReply63);
+  const capSes63 = capDev63.session();
+  const caps63 = new BleCapabilityCache();
+  await caps63.ask('left', '', 0x06, async () => null); // seed: be/1006 unanswered
+  await caps63.ask('left', 'v1.2.3.4', 0x0f, async () => null); // seed: be/100f unanswered
+  const snap63 = await readAux(capSes63, 'left', undefined, caps63); // sweep 1
+  const snap63b = await readAux(capSes63, 'left', undefined, caps63); // sweep 2
+  eq(cnt63(capDev63, 0xbe, 0x06), 1,
+    '63 seam: be/1006 skipped sweep 1 (cached negative), probed sweep 2 (fw key changed)');
+  eq(cnt63(capDev63, 0xbe, 0x0f), 0,
+    '63 seam: be/100f never hits the wire (negative remembered across sweeps)');
+  eq(cnt63(capDev63, 0xfa, 0x01), 2, '63 seam: non-cacheable fa/1001 unchanged — every sweep');
+  eq(cnt63(capDev63, 0xfe, 0x02), 2, '63 seam: non-cacheable fe/1002 unchanged — fw key source');
+  eq(snap63.devRows.some((r) => r[1].includes('cached unanswered')), true,
+    '63 seam: cached-negative rows surface in devRows');
+  eq(snap63b.bleName, 'Naya', '63 seam: positive re-probe still parses (name from sweep 2)');
+  await capSes63.close();
+})();
 
 void main();
