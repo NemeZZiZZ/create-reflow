@@ -5,6 +5,7 @@
 
 import { toHex } from './naya';
 import type { KeyRec, LedRec } from './naya';
+import { CHUNK_PAYLOAD_CAP, chunkBudget } from './module-wire';
 
 export interface KeyOp {
   kind: 'key';
@@ -63,7 +64,27 @@ export interface LayerListOp {
   payload: Uint8Array; // frame params from encodeLayerListAdd/encodeLayerListDelete
   label: string; // entry counts ride in the label set at queue time
 }
-export type Op = KeyOp | LedOp | KeySetOp | SettingsOp | ModuleOp | LayerListOp;
+export interface ModuleCfgOp {
+  kind: 'moduleCfg';
+  slot: number; // module slot 0..7 (0 = blank template, never assigned)
+  records: Uint8Array[]; // config field records ([f][t][len][body])
+  payload: Uint8Array; // slot byte + records joined (the 30/100C params)
+  label: string;
+}
+export interface ModuleListOp {
+  kind: 'moduleList';
+  payload: Uint8Array; // frame params from encodeListAdd/encodeListDelete
+  label: string; // entry description set at queue time
+}
+export type Op =
+  | KeyOp
+  | LedOp
+  | KeySetOp
+  | SettingsOp
+  | ModuleOp
+  | LayerListOp
+  | ModuleCfgOp
+  | ModuleListOp;
 
 /** Lowercase hex without spaces — compact stable form of a payload for opKey. */
 function payloadHex(u8: Uint8Array): string {
@@ -92,6 +113,16 @@ export function opKey(o: Op): string {
       // (latest wins); different payloads (add vs delete, two adds)
       // coexist as separate frames sent in queue order.
       return `layers:${payloadHex(o.payload)}`;
+    case 'moduleCfg':
+      // Slot + payload-addressed: re-configuring the same slot the same
+      // way replaces the stale write; different payloads coexist in
+      // queue order (a rewrite usually changes bytes).
+      return `moduleCfg:${o.slot}:${payloadHex(o.payload)}`;
+    case 'moduleList':
+      // Payload-addressed like layers: an identical wire payload is the
+      // same edit; add and delete (different payloads) coexist in
+      // queue order.
+      return `moduleList:${payloadHex(o.payload)}`;
   }
 }
 
@@ -112,6 +143,9 @@ export function opSection(o: Op): Section {
     case 'led':
       return 'led';
     case 'module':
+      return 'modules';
+    case 'moduleCfg':
+    case 'moduleList':
       return 'modules';
     case 'settings':
       return o.path === 'ed/1011' ? 'led' : 'behavior';
@@ -181,8 +215,9 @@ export class Draft {
   }
 
   /** Drop ops that the device already satisfies (post-flash readback or a
-   * fresh dump). Returns the number of ops dropped. settings/module ops have
-   * no GET — the flash executor drops them right after ACK, never reconcile. */
+   * fresh dump). Returns the number of ops dropped. settings/module/
+   * moduleCfg/moduleList ops have no GET — the flash executor drops them
+   * right after ACK, never reconcile. */
   reconcile(keysByLayer: KeyRec[][], ledsByLayer: LedRec[][]): number {
     const before = this.ops.length;
     this.ops = this.ops.filter((o) => {
@@ -215,7 +250,7 @@ export class Draft {
         if (!cur) return true;
         return !(cur.h === o.h && cur.s === o.s);
       }
-      return true; // settings/module/layers: no readback — kept until flash ACKs
+      return true; // settings/module/moduleCfg/moduleList/layers: no readback — kept until flash ACKs
     });
     return before - this.ops.length;
   }
@@ -243,6 +278,11 @@ export class Draft {
       } else if (o.kind === 'layers') {
         bytes += 10 + o.payload.length;
         frames += 1;
+      } else if (o.kind === 'moduleCfg' || o.kind === 'moduleList') {
+        // Module writes chunk at 242B/frame — frames via chunkBudget
+        // (2-frame ceiling at the 483B payload cap).
+        bytes += 10 + o.payload.length;
+        frames += chunkBudget(o.payload);
       } else {
         bytes += 10 + 2 + o.payload.length;
         frames += 1;
@@ -273,6 +313,11 @@ export function opSummary(o: Op): string {
       return `${o.path} → ${o.label}`;
     case 'module':
       return `L${o.layer} slot ${o.slot} → ${o.label}`;
+    case 'moduleCfg':
+      return `slot ${o.slot} config → ${o.label} (${o.records.length} rec)`;
+    case 'moduleList':
+      // Entry description rides in the label (set at queue time).
+      return o.label;
     case 'layers':
       // Entry counts ride in the label (set at queue time).
       return o.label;
@@ -283,11 +328,14 @@ export function opSummary(o: Op): string {
  * re-checks every invariant decidable from the draft ALONE — no live
  * cache parameter this phase, so 'no live record at this key' style
  * findings (they need the device dump) are deferred. Per op kind:
- *   key     — record self-addresses its kk (byte 0 === op kk, min shape);
- *   keyset  — every record non-empty;
- *   led     — kk inside the device LED map 0..0x87 (queueColor's gate);
- *   module  — payload byte 0 re-states the slot (S2 addressing trap);
- *   layers  — every decoded add entry sits in the app window 0..7.
+ *   key        — record self-addresses its kk (byte 0 === op kk, min shape);
+ *   keyset     — every record non-empty;
+ *   led        — kk inside the device LED map 0..0x87 (queueColor's gate);
+ *   module     — payload byte 0 re-states the slot (S2 addressing trap);
+ *   moduleCfg  — slot in the device window 0..7, payload within the
+ *                483-byte two-frame ceiling, ≤ 40 device record slots;
+ *   moduleList — entry slot byte inside the window 0..7;
+ *   layers     — every decoded add entry sits in the app window 0..7.
  * Never mutates the draft and never writes its drops ledger: two calls
  * on an unchanged draft return deep-equal arrays. Returns DraftDrop[]
  * (at:'queue') so the flash dialog can render findings with the same
@@ -330,6 +378,34 @@ export function probeDraft(d: Draft): DraftDrop[] {
           o,
           `module payload does not re-state slot ${o.slot}`,
           'the module bay keeps its current gesture',
+        );
+    } else if (o.kind === 'moduleCfg') {
+      if (o.slot < 0 || o.slot > 7)
+        push(
+          o,
+          `module config slot ${o.slot} is outside the device window (0-7)`,
+          'the module keeps its stored configuration',
+        );
+      if (o.payload.length > CHUNK_PAYLOAD_CAP)
+        push(
+          o,
+          'module config exceeds the 483-byte two-frame ceiling',
+          'the module keeps its stored configuration',
+        );
+      if (o.records.length > 40)
+        push(
+          o,
+          'module config carries more than the 40 device record slots',
+          'the module keeps its stored configuration',
+        );
+    } else if (o.kind === 'moduleList') {
+      // The entry slot byte rides at payload[1] (00 [slot] … in both the
+      // add and delete forms).
+      if (o.payload.length < 2 || o.payload[1] > 7)
+        push(
+          o,
+          `module list entry names slot ${o.payload[1] ?? '?'} — outside the device window (0-7)`,
+          'the module list stays unchanged',
         );
     } else {
       // Layers window re-check: same add-entry wire signature

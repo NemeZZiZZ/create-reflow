@@ -59,7 +59,9 @@ function nackMessage(o: Op, ack: Uint8Array): string {
 function queuedOpLayer(o: Op): number | null {
   if (o.kind === 'settings')
     return o.path === 'ed/1011' ? (o.payload[0] ?? null) : null;
-  if (o.kind === 'layers') return null;
+  // layers/moduleCfg/moduleList are device-global writes — no board layer.
+  if (o.kind === 'layers' || o.kind === 'moduleCfg' || o.kind === 'moduleList')
+    return null;
   return o.layer;
 }
 

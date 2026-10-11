@@ -59,6 +59,10 @@ import {
   overlay, encodeAxisBinding, compareRecords, diffProfile,
   parseModuleProfileFile, buildModuleProfileFile,
 } from '@create-reflow/sdk';
+import {
+  planModuleLayout, missingBaseBays, orphanGcOps,
+  queueModuleConfig, queueModuleListAdd, queueModuleListDelete, queueBayAssignment,
+} from '@create-reflow/sdk';
 import type { LayerDump } from '../src/hooks/useLayers';
 
 let n = 0;
@@ -3228,6 +3232,253 @@ void (async () => {
     && coerced58.profile.settings.pointer_accel_on === 1
     && conventionOf(coerced58.profile.settings) === 'windows', true,
     '58 parse: string settings coerce (number / true / windows)');
+}
+
+// §59 module planner: slot lifecycle (uuid-keep, capture-claim, lowest-free
+// allocation, reclaim-when-full, >8 refusal, template sources), BASE-layer
+// bay gap detection, orphan-GC ordering (bay mutations → list deletes →
+// FULL blanks last), and the moduleCfg/moduleList draft ops + bay
+// assignment through the existing key path. Wire bytes ride the Task-1
+// encoders unchanged; module verbs must route the never-send guard
+// (30/1009, 30/100A pass).
+{
+  /* --- planner: uuid-keep ------------------------------------------------- */
+  const keepA = planModuleLayout(
+    [{ id: 'u-a', type: 'TRACK' }],
+    [{ slot: 3, uuid: 'u-a', type: 'TRACK' }],
+    [],
+  );
+  eq('error' in keepA, false, '59 uuid-keep: plan succeeds');
+  if (!('error' in keepA)) {
+    eq(keepA.assignments.length === 1 && keepA.assignments[0].slot === 3, true,
+      '59 uuid-keep: the profile whose id is on the device keeps its slot');
+    const entryA = keepA.assignments[0].listEntry;
+    eq(entryA.slot === 3 && entryA.id === 3 && entryA.flag === MODULE_TYPE_CODE.TRACK
+      && entryA.uuid16 === 'u-a', true,
+      '59 list entry: slot, mirrored id, type flag, uuid16');
+    eq(keepA.templateSources['u-a'], null,
+      '59 kept slot needs no template (templateSources null)');
+  }
+
+  /* --- planner: capture-claim --------------------------------------------- */
+  const keepB = planModuleLayout(
+    [{ id: 'p-new', type: 'TUNE', capturedFrom: 'u-cap' }],
+    [{ slot: 5, uuid: 'u-cap', type: 'TUNE' }],
+    [],
+  );
+  eq('error' in keepB, false, '59 capture-claim: plan succeeds');
+  if (!('error' in keepB)) {
+    eq(keepB.assignments.length === 1 && keepB.assignments[0].slot === 5, true,
+      "59 capture-claim: capturedFrom uuid claims that module's slot");
+    eq(keepB.assignments[0].listEntry.uuid16, 'p-new',
+      "59 claimed slot's list entry carries the NEW uuid");
+    eq(keepB.templateSources['p-new'], null,
+      '59 captured slot holds its own records (templateSources null)');
+  }
+
+  /* --- planner: allocate lowest free 1..7, slot 0 never -------------------- */
+  const keepC = planModuleLayout(
+    [{ id: 'n1', type: 'TRACK' }, { id: 'n2', type: 'TRACK' }],
+    [
+      { slot: 0, uuid: 'blank-template', type: 'TRACK' },
+      { slot: 1, uuid: 'u-1', type: 'TRACK' },
+    ],
+    [],
+  );
+  eq('error' in keepC, false, '59 allocation: plan succeeds');
+  if (!('error' in keepC)) {
+    const slotOf = (id: string) => keepC.assignments.find((a) => a.profileId === id)?.slot;
+    eq(`${slotOf('n1')}/${slotOf('n2')}`, '2/3',
+      '59 allocation: lowest free from 1..7 — slot 0 (blank template) never allocated');
+    eq(keepC.templateSources['n1'], 1,
+      '59 template source: smallest same-type slot on the device (slot 0 excluded)');
+  }
+
+  /* --- planner: reclaim when full ------------------------------------------ */
+  const fullList59 = [1, 2, 3, 4, 5, 6, 7].map((s) => ({
+    slot: s, uuid: `u-${s}`, type: 'TOUCH' as const,
+  }));
+  const keepD = planModuleLayout([{ id: 'new-guy', type: 'TOUCH' }], fullList59, []);
+  eq('error' in keepD, false, '59 reclaim: plan succeeds on a full board');
+  if (!('error' in keepD)) {
+    eq(keepD.reclaimed.join(','), '1', '59 reclaim: lowest unreferenced slot reported');
+    eq(keepD.assignments[0].slot, 1, '59 reclaim: the new profile takes the reclaimed slot');
+    eq(keepD.templateSources['new-guy'], 2,
+      '59 reclaim: template source skips the slot being reclaimed');
+  }
+  const keepE = planModuleLayout([{ id: 'new-guy', type: 'TOUCH' }], fullList59, ['u-1', 'u-2']);
+  eq('error' in keepE, false, '59 reclaim (referenced): plan succeeds');
+  if (!('error' in keepE)) {
+    eq(keepE.reclaimed.join(','), '3',
+      '59 reclaim: bay-referenced slots (u-1, u-2) are skipped');
+  }
+
+  /* --- planner: refusals ----------------------------------------------------- */
+  const tooMany59 = planModuleLayout(
+    Array.from({ length: 9 }, (_, i) => ({ id: `p-${i}`, type: 'TOUCH' as const })),
+    [],
+    [],
+  );
+  eq('error' in tooMany59, true,
+    '59 refusal: 9 distinct profiles exceed the 8-entry module list');
+  const noTemplate59 = planModuleLayout([{ id: 'lone-tune', type: 'TUNE' }], [], []);
+  eq('error' in noTemplate59 && noTemplate59.error === 'Dock the module and read the keyboard first',
+    true, '59 refusal: new slot with no same-type source → exact dock-module error');
+
+  /* --- missingBaseBays -------------------------------------------------------- */
+  const fullBays59: Record<number, number> = { 0x4a: 1, 0x4b: 1, 0x4c: 2, 0x4d: 3, 0x4e: 4, 0x4f: 5 };
+  eq(missingBaseBays(fullBays59).length, 0,
+    '59 base bays: six required filled, float bays absent → no gaps (float exempt)');
+  const tuneR59: Record<number, number> = { ...fullBays59 };
+  delete tuneR59[0x4f];
+  const tuneRGaps = missingBaseBays(tuneR59);
+  eq(tuneRGaps.length, 1, '59 base bays: missing tune right → exactly one gap');
+  eq(tuneRGaps[0]?.includes('tune right') === true && tuneRGaps[0]?.includes('0x4f') === true,
+    true, '59 base bays: the gap names the bay and its position');
+  eq(missingBaseBays({ ...fullBays59, 0x4e: 'inherit' }).length, 1,
+    '59 base bays: inherit on the BASE layer is a gap (nothing to inherit)');
+  eq(missingBaseBays({ ...fullBays59, 0x4d: 'transparent' }).length, 1,
+    '59 base bays: transparent is a gap');
+  eq(missingBaseBays({ ...fullBays59, 0x4e: 'disabled' }).length, 0,
+    '59 base bays: disabled is a deliberate empty, not a gap');
+  eq(missingBaseBays({ ...fullBays59, 0x50: 'inherit', 0x51: 2 }).length, 0,
+    '59 base bays: float bays (0x50/0x51) are exempt');
+
+  /* --- orphanGcOps ordering ----------------------------------------------------- */
+  const gc59 = orphanGcOps([3], { 0: { 0x4c: 3, 0x4a: 1 }, 1: { 0x4b: 3 } });
+  eq(gc59.length, 4, '59 orphan GC: 2 bay mutations + 1 delete + 1 blank');
+  eq(gc59[0].kind === 'bay' && gc59[0].layer === 0 && gc59[0].pos === 0x4c, true,
+    '59 orphan GC: bay mutations FIRST (layer 0, lowest pos)');
+  eq(gc59[1].kind === 'bay' && gc59[1].layer === 1 && gc59[1].pos === 0x4b, true,
+    '59 orphan GC: then layer 1 — every bay op precedes any delete');
+  eq(toHex(gc59[0].payload), '4c 00 00', '59 orphan GC: bay record disabled 0x00');
+  eq(gc59[2].kind === 'listDelete' && gc59[2].slot === 3, true,
+    '59 orphan GC: list deletes MIDDLE');
+  eq(toHex(gc59[2].payload), '00 03 00 00 00', '59 orphan GC: Task-1 delete payload');
+  eq(gc59[3].kind === 'blank' && gc59[3].slot === 3, true, '59 orphan GC: blanks LAST');
+  eq(gc59[3].kind === 'blank' && gc59[3].payload.length === 121
+    && toHex(gc59[3].payload.slice(118)) === '27 00 00', true,
+    '59 orphan GC: blank IN FULL (121B ending at record 0x27 — never short)');
+  const gc2 = orphanGcOps([5, 2], {});
+  eq(gc2.filter((o) => o.kind === 'listDelete').map((o) => o.slot).join(','), '2,5',
+    '59 orphan GC: multi-orphan deletes sorted ascending');
+
+  /* --- queueModuleConfig ---------------------------------------------------------- */
+  const recA59 = Uint8Array.from([0x00, 0x01, 0x01, 0x0a]);
+  const recB59 = Uint8Array.from([0x05, 0x01, 0x01, 0x05]);
+  const qd59 = new Draft();
+  eq(queueModuleConfig(qd59, 4, [recA59, recB59], 'tune config').queued, true,
+    '59 queueModuleConfig: queued');
+  const cfg59 = qd59.ops[0];
+  eq(cfg59.kind === 'moduleCfg' && cfg59.slot === 4, true,
+    '59 moduleCfg op carries the slot');
+  eq(toHex(cfg59.kind === 'moduleCfg' ? cfg59.payload : new Uint8Array(0)),
+    '04 00 01 01 0a 05 01 01 05',
+    '59 moduleCfg payload = slot byte + records joined');
+  eq(opKey(cfg59), 'moduleCfg:4:040001010a05010105',
+    '59 moduleCfg opKey = slot + payload hex (latest-wins per write)');
+  eq(opSection(cfg59), 'modules', '59 moduleCfg sits in the modules section');
+  eq(JSON.stringify(qd59.stats()), '{"ops":1,"frames":1,"bytes":19}',
+    '59 moduleCfg stats: frames via chunkBudget, bytes = 10 + payload');
+  const qdFat59 = new Draft();
+  const fat59 = queueModuleConfig(
+    qdFat59, 1,
+    Array.from({ length: 161 }, (_, f) => Uint8Array.from([f & 0xff, 0x01, 0x01])),
+    'too big',
+  );
+  eq(fat59.queued === false && fat59.error === 'module config exceeds the 483-byte two-frame ceiling',
+    true, '59 queueModuleConfig: 484B payload refused with the exact ceiling reason');
+  eq(qdFat59.size, 0, '59 queueModuleConfig: refusal queues nothing');
+  eq(qdFat59.drops.length === 1
+    && qdFat59.drops[0].effect === 'the module keeps its stored configuration', true,
+    '59 queueModuleConfig: drop recorded with the honest effect');
+  const qdEdge59 = new Draft();
+  eq(queueModuleConfig(qdEdge59, 1, [new Uint8Array(482)], 'edge').queued, true,
+    '59 queueModuleConfig: exactly 483B (slot + record) still fits');
+
+  /* --- queueModuleListAdd/Delete ----------------------------------------------------- */
+  const ql59 = new Draft();
+  eq(queueModuleListAdd(ql59, {
+    slot: 5, id: 5, flag: MODULE_TYPE_CODE.TRACK, uuid16: '00112233445566778899aabbccddeeff',
+  }).queued, true, '59 queueModuleListAdd: queued');
+  eq(toHex(ql59.ops[0].payload),
+    '00 05 05 01 10 00 11 22 33 44 55 66 77 88 99 aa bb cc dd ee ff',
+    '59 list add payload byte-pinned (Task-1 capture 00 05 05 01 10 <uuid16>)');
+  eq(opSection(ql59.ops[0]), 'modules', '59 moduleList sits in the modules section');
+  eq(queueModuleListDelete(ql59, 5).queued, true, '59 queueModuleListDelete: queued');
+  eq(toHex(ql59.ops[1].payload), '00 05 00 00 00',
+    '59 list delete payload byte-pinned (Task-1 capture 00 05 00 00 00)');
+  eq(ql59.size, 2, '59 add and delete coexist (payload-addressed opKeys)');
+  eq(opKey(ql59.ops[0]) !== opKey(ql59.ops[1]), true,
+    '59 moduleList opKeys are payload-hex addressed');
+  queueModuleListAdd(ql59, {
+    slot: 5, id: 5, flag: MODULE_TYPE_CODE.TRACK, uuid16: '00112233445566778899aabbccddeeff',
+  });
+  eq(ql59.size, 2, '59 identical re-add replaces (latest-wins), size stays 2');
+
+  /* --- queueBayAssignment --------------------------------------------------------------- */
+  const qb59 = new Draft();
+  queueBayAssignment(qb59, 1, 0x4c, 5);
+  const bayOp59 = qb59.ops[0];
+  eq(bayOp59.kind === 'key' && bayOp59.layer === 1 && bayOp59.kk === 0x4c, true,
+    '59 bay assignment rides the EXISTING key op at KK 0x4c');
+  eq(toHex(bayOp59.kind === 'key' ? bayOp59.record : new Uint8Array(0)), '4c 05 00',
+    '59 bay record 4c 05 00 (Task-1 bytes)');
+  queueBayAssignment(qb59, 1, 0x4c, 'inherit');
+  eq(toHex(qb59.ops[0].kind === 'key' ? qb59.ops[0].record : new Uint8Array(0)), '4c 78 00',
+    '59 bay inherit → 0x78 (resolves to BASE)');
+  queueBayAssignment(qb59, 1, 0x4c, 'disabled');
+  eq(toHex(qb59.ops[0].kind === 'key' ? qb59.ops[0].record : new Uint8Array(0)), '4c 00 00',
+    '59 bay disabled → 0x00');
+  eq(qb59.size, 1, '59 bay latest-wins per layer+kk (shared key opKey)');
+  eq(opKey(qb59.ops[0]), 'key:1:76', '59 bay opKey = key:layer:kk (0x4c = 76)');
+
+  /* --- the guard routes module verbs (review condition a) -------------------------------- */
+  let guarded59 = 0;
+  try { assertWireAllowed(0x30, 0x10, 0x09); } catch { guarded59++; }
+  try { assertWireAllowed(0x30, 0x10, 0x0a); } catch { guarded59++; }
+  eq(guarded59, 0,
+    '59 module verbs route the guard: 30/1009 + 30/100A pass (never-send list untouched)');
+
+  /* --- probeDraft -------------------------------------------------------------------------- */
+  const pq59 = new Draft();
+  pq59.add({
+    kind: 'moduleCfg', slot: 8, records: [recA59],
+    payload: Uint8Array.from([8, 0, 1, 1, 0x0a]), label: 'bad slot',
+  });
+  const probeBad59 = probeDraft(pq59);
+  eq(probeBad59.length === 1 && probeBad59[0].reason.includes('slot 8'), true,
+    '59 probe: moduleCfg at slot 8 flagged (window 0-7)');
+  const pqFat = new Draft();
+  pqFat.add({
+    kind: 'moduleCfg', slot: 1, records: [new Uint8Array(484)],
+    payload: new Uint8Array(485), label: 'fat',
+  });
+  const probeFat59 = probeDraft(pqFat);
+  eq(probeFat59.length === 1 && probeFat59[0].reason.includes('483'), true,
+    '59 probe: moduleCfg payload over the 483 ceiling flagged');
+  const pqMany = new Draft();
+  pqMany.add({
+    kind: 'moduleCfg', slot: 1,
+    records: Array.from({ length: 41 }, () => Uint8Array.from([0, 7, 0])),
+    payload: Uint8Array.from([1, ...Array.from({ length: 123 }, () => 0)]),
+    label: 'many',
+  });
+  const probeMany59 = probeDraft(pqMany);
+  eq(probeMany59.length === 1 && probeMany59[0].reason.includes('40'), true,
+    '59 probe: moduleCfg over 40 record slots flagged');
+  const pqList = new Draft();
+  pqList.add({
+    kind: 'moduleList',
+    payload: Uint8Array.from([0x00, 0x08, 0x08, 0x01, 0x10, ...Array.from({ length: 16 }, () => 0xaa)]),
+    label: 'bad entry',
+  });
+  eq(probeDraft(pqList).length === 1, true,
+    '59 probe: moduleList entry naming slot 8 flagged');
+  const pqClean = new Draft();
+  queueModuleConfig(pqClean, 1, [recA59, recB59], 'fine');
+  queueModuleListDelete(pqClean, 1);
+  eq(probeDraft(pqClean).length, 0, '59 probe: in-window moduleCfg/moduleList are clean');
 }
 
 void main();

@@ -17,6 +17,14 @@ import {
   storedAnimOf,
   storedAnimName,
 } from './layers';
+import {
+  BAY_INHERIT,
+  bayRecord,
+  encodeListAdd,
+  encodeListDelete,
+  fitsChunkBudget,
+} from './module-wire';
+import type { PlanListEntry } from './module-planner';
 
 export interface SelKey {
   layer: number;
@@ -324,4 +332,78 @@ export function pendingLayerAddIdxs(draft: Draft): number[] {
     }
   }
   return out;
+}
+
+/* --- module profiles (Phase 5a) --------------------------------------------- */
+
+/** Queue a full module config write (30/100C): payload = slot byte +
+ * records joined. Refused with a ledger drop when the payload exceeds the
+ * 483-byte two-frame ceiling (a 3rd CDC frame hangs fw 3.28.7) — nothing
+ * is queued; the module keeps its stored configuration. */
+export function queueModuleConfig(
+  draft: Draft,
+  slot: number,
+  records: Uint8Array[],
+  label: string,
+): { queued: boolean; error?: string } {
+  const payload = Uint8Array.from([slot & 0xff, ...records.flatMap((r) => [...r])]);
+  if (!fitsChunkBudget(payload)) {
+    const error = 'module config exceeds the 483-byte two-frame ceiling';
+    draft.addDrop({ reason: error, effect: 'the module keeps its stored configuration' });
+    return { queued: false, error };
+  }
+  draft.add({ kind: 'moduleCfg', slot, records, payload, label });
+  return { queued: true };
+}
+
+/** Queue a module-list add (30/100A) from a planner list entry (the list
+ * id mirrors the slot on the wire — encodeListAdd owns the bytes). */
+export function queueModuleListAdd(
+  draft: Draft,
+  entry: PlanListEntry,
+  label?: string,
+): { queued: boolean } {
+  draft.add({
+    kind: 'moduleList',
+    payload: encodeListAdd(entry.slot, entry.id, entry.flag, entry.uuid16),
+    label: label ?? `add module ${entry.slot}`,
+  });
+  return { queued: true };
+}
+
+/** Queue a module-list delete (30/100A delete entry 00 [slot] 00 00 00). */
+export function queueModuleListDelete(
+  draft: Draft,
+  slot: number,
+  label?: string,
+): { queued: boolean } {
+  draft.add({
+    kind: 'moduleList',
+    payload: encodeListDelete(slot),
+    label: label ?? `remove module ${slot}`,
+  });
+  return { queued: true };
+}
+
+/** Queue a module bay assignment: the EXISTING key op kind at KK
+ * 0x4A–0x51 carrying a bay record ([pos][value][00], Task-1 bytes). Bay
+ * records live in the layer data (30/1004), so they ride the key path —
+ * latest-wins per layer+pos comes free from the shared opKey. */
+export function queueBayAssignment(
+  draft: Draft,
+  layer: number,
+  pos: number,
+  value: number | 'inherit' | 'disabled',
+): { queued: boolean } {
+  const v = value === 'inherit' ? BAY_INHERIT : value === 'disabled' ? 0x00 : value;
+  const name =
+    value === 'inherit' ? 'BASE (inherit)' : value === 'disabled' ? 'disabled' : `slot ${v}`;
+  draft.add({
+    kind: 'key',
+    layer,
+    kk: pos,
+    record: bayRecord(pos, v),
+    label: `bay 0x${pos.toString(16)} → ${name}`,
+  });
+  return { queued: true };
 }
