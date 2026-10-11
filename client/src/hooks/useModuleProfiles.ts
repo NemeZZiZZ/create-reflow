@@ -25,17 +25,22 @@ import { useCallback, useState } from 'react';
 import { toast } from 'sonner';
 import {
   MODULE_TYPES,
+  SETTING_FIELDS,
   STOCK_PROFILES,
   captureFromSlots,
+  conventionOf,
+  diffProfile,
   matchSlots,
   mintLayerUuid,
   parseModuleList,
   recordsFromModuleBlob,
   repointBays,
+  ticksFromWire,
 } from '@create-reflow/sdk';
 import type {
   BayAssignments,
   ConfigRecords,
+  DiffRow,
   ModuleListEntry,
   ModuleProfile,
   ModuleType,
@@ -104,7 +109,11 @@ function loadBays(): BayAssignments {
 /** One slot's read verdict — the in-memory transient readAll() rebuilds and
  * the left-disconnect clears. `matched` is the content match (null — every
  * same-type candidate drifts, or none exists); `closest` is what a capture
- * would seed from; `differs` is its drift count (0 ⇔ matched). */
+ * would seed from; `differs` is its drift count (0 ⇔ matched). `diffRows`
+ * is that drift per gesture (the gesture rows' 'device: X' badges);
+ * `settings` is the slot's modeled settings in app units (the Settings
+ * tab's adopt buttons read them); `records` is the raw slot config (the
+ * unmodelled-fields disclosure). */
 export interface ModuleSlotLive {
   slot: number;
   uuid: string;
@@ -112,6 +121,42 @@ export interface ModuleSlotLive {
   matched: ModuleProfile | null;
   closest: ModuleProfile | null;
   differs: number;
+  diffRows: DiffRow[];
+  settings: Record<string, number>;
+  records: ConfigRecords;
+}
+
+/** A slot's modeled settings (type-0x01 records) as app-unit numbers —
+ * identity except ticks_per_rotation, which converts back from its wire
+ * degrees-per-detent (SCRUM-50). */
+function decodeSlotSettings(type: ModuleType, records: ConfigRecords): Record<string, number> {
+  const out: Record<string, number> = {};
+  for (const [sid, idx] of Object.entries(SETTING_FIELDS[type])) {
+    const rec = records.get(idx);
+    if (rec === undefined || rec[1] !== 0x01 || rec[2] < 1) continue;
+    const wire = rec[3];
+    if (sid === 'ticks_per_rotation') {
+      const detents = ticksFromWire(wire);
+      if (detents !== null) out[sid] = detents;
+      continue;
+    }
+    out[sid] = wire;
+  }
+  return out;
+}
+
+/** One binding edit for setBinding: the action to store plus the row extras
+ * the caller wants changed EXPLICITLY. Carries [i]+[ii]: the old
+ * Pick<'actionType' | 'actionCode'> parameter could neither clear nor
+ * create a split, and plain merges preserve an existing split — whose
+ * halves would silently win on the overlay. So: `split` absent leaves any
+ * split untouched, `null` clears it (every combined rebind passes null), a
+ * value sets it; `invert` 1 sets the selector-swap flag, 0 clears it. */
+export interface BindingEdit {
+  actionType: string;
+  actionCode: string;
+  split?: ProfileBinding['split'] | null;
+  invert?: 0 | 1;
 }
 
 export function useModuleProfiles({
@@ -127,6 +172,9 @@ export function useModuleProfiles({
   const [profiles, setProfiles] = useState<ModuleProfile[]>(loadProfiles);
   const [bays, setBays] = useState<BayAssignments>(loadBays);
   const [live, setLive] = useState<Record<number, ModuleSlotLive>>({});
+  /** Reactive mirror of busyRef during readAll — the UI disables the edit
+   * controls while a read is in flight (the mutators are gated anyway). */
+  const [reading, setReading] = useState(false);
 
   // Explicit sync saves: state + localStorage in one call; private mode
   // keeps the session in-memory only.
@@ -164,6 +212,7 @@ export function useModuleProfiles({
       return;
     }
     busyRef.current = true;
+    setReading(true);
     try {
       const entries = parseModuleList(await ses.readModuleList());
       if (entries.length === 0) {
@@ -188,10 +237,13 @@ export function useModuleProfiles({
           );
         }
       }
-      // Content match → live verdicts (slot → matched/differs/closest).
+      // Content match → live verdicts (slot → matched/differs/closest plus
+      // the per-gesture drift rows, the slot's decoded settings and its raw
+      // records for the UI's badges / adopt buttons / disclosure).
       const matches = matchSlots(readEntries, slotRecords, profiles);
       const nextLive: Record<number, ModuleSlotLive> = {};
       for (const m of matches) {
+        const records = slotRecords[m.slot] ?? new Map();
         nextLive[m.slot] = {
           slot: m.slot,
           uuid: m.uuid,
@@ -199,6 +251,12 @@ export function useModuleProfiles({
           matched: m.matched,
           closest: m.closest,
           differs: m.differs,
+          diffRows:
+            m.closest !== null && m.differs > 0
+              ? diffProfile(m.closest, records, conventionOf(m.closest.settings))
+              : [],
+          settings: decodeSlotSettings(m.type, records),
+          records,
         };
       }
       setLive(nextLive);
@@ -227,18 +285,30 @@ export function useModuleProfiles({
       log('err', `modules read failed: ${(e as Error).message}`);
     } finally {
       busyRef.current = false;
+      setReading(false);
     }
   }, [sesRef, busyRef, log, profiles, bays, saveProfiles, saveBays]);
 
-  /** Replace one gesture's binding action; null removes the row. The row's
-   * own extras (invert/threshold/mode/split — ProfileBinding) are preserved:
-   * minimal mutation of the action, nothing else on the row changes. */
+  /** Carries [iii]: every store mutator is gated against an in-flight read
+   * (or flash) — readAll saves from its closure snapshot, so an edit that
+   * lands mid-read would be clobbered by the read's own saveProfiles.
+   * Returns true when the mutation must be dropped. */
+  const busyGated = useCallback((): boolean => {
+    if (!busyRef.current) return false;
+    log('inf', 'modules: device busy (read or flash in flight) — edit ignored, retry after it finishes');
+    return true;
+  }, [busyRef, log]);
+
+  /** Replace one gesture's binding; null removes the row. The row's other
+   * extras (threshold/mode) are preserved; split/invert only move when the
+   * edit says so (see BindingEdit). */
   const setBinding = useCallback(
     (
       profileId: string,
       gesture: string,
-      binding: Pick<ProfileBinding, 'actionType' | 'actionCode'> | null,
+      binding: BindingEdit | null,
     ) => {
+      if (busyGated()) return;
       saveProfiles(
         profiles.map((p) => {
           if (p.id !== profileId) return p;
@@ -246,26 +316,36 @@ export function useModuleProfiles({
           if (binding === null) delete bindings[gesture];
           else {
             const prev = bindings[gesture];
-            bindings[gesture] = prev
+            const next: ProfileBinding = prev
               ? { ...prev, actionType: binding.actionType, actionCode: binding.actionCode }
               : { actionType: binding.actionType, actionCode: binding.actionCode };
+            if (binding.split !== undefined) {
+              if (binding.split === null) delete next.split;
+              else next.split = binding.split;
+            }
+            if (binding.invert !== undefined) {
+              if (binding.invert === 1) next.invert = 1;
+              else delete next.invert;
+            }
+            bindings[gesture] = next;
           }
           return { ...p, bindings };
         }),
       );
     },
-    [profiles, saveProfiles],
+    [profiles, saveProfiles, busyGated],
   );
 
   const setSetting = useCallback(
     (profileId: string, key: string, value: number) => {
+      if (busyGated()) return;
       saveProfiles(
         profiles.map((p) =>
           p.id === profileId ? { ...p, settings: { ...p.settings, [key]: value } } : p,
         ),
       );
     },
-    [profiles, saveProfiles],
+    [profiles, saveProfiles, busyGated],
   );
 
   /** Point one bay position at a profile; null clears it (an emptied layer
@@ -273,6 +353,7 @@ export function useModuleProfiles({
    * capture-on-read repoints rows programmatically. */
   const setBay = useCallback(
     (layer: number, pos: number, profileId: string | null) => {
+      if (busyGated()) return;
       const next: BayAssignments = {};
       for (const [lk, layerMap] of Object.entries(bays)) next[Number(lk)] = { ...layerMap };
       const row = next[layer] ?? {};
@@ -282,7 +363,7 @@ export function useModuleProfiles({
       else delete next[layer];
       saveBays(next);
     },
-    [bays, saveBays],
+    [bays, saveBays, busyGated],
   );
 
   /** New profile seeded from the type's stock map (the first stock of that
@@ -291,6 +372,7 @@ export function useModuleProfiles({
    * caller's name (stock-derived when empty). Returns the new profile. */
   const addProfile = useCallback(
     (type: ModuleType, name: string): ModuleProfile | null => {
+      if (busyGated()) return null;
       const stock = STOCK_PROFILES.find((p) => p.type === type);
       if (!stock) return null;
       const next: ModuleProfile = JSON.parse(JSON.stringify(stock)) as ModuleProfile;
@@ -300,12 +382,13 @@ export function useModuleProfiles({
       saveProfiles([...profiles, next]);
       return next;
     },
-    [profiles, saveProfiles],
+    [profiles, saveProfiles, busyGated],
   );
 
   /** Remove a profile and scrub every bay row that referenced it. */
   const deleteProfile = useCallback(
     (profileId: string) => {
+      if (busyGated()) return;
       saveProfiles(profiles.filter((p) => p.id !== profileId));
       let changed = false;
       const next: BayAssignments = {};
@@ -322,22 +405,24 @@ export function useModuleProfiles({
       }
       if (changed) saveBays(next);
     },
-    [profiles, bays, saveProfiles, saveBays],
+    [profiles, bays, saveProfiles, saveBays, busyGated],
   );
 
   const renameProfile = useCallback(
     (profileId: string, name: string) => {
+      if (busyGated()) return;
       const trimmed = name.trim();
       if (trimmed === '') return;
       saveProfiles(profiles.map((p) => (p.id === profileId ? { ...p, name: trimmed } : p)));
     },
-    [profiles, saveProfiles],
+    [profiles, saveProfiles, busyGated],
   );
 
   return {
     profiles,
     bays,
     live,
+    reading,
     readAll,
     setBinding,
     setSetting,

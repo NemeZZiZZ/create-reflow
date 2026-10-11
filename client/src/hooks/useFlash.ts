@@ -11,9 +11,10 @@ import { concat, encodeRestorePayload, isWriteAck, sleep, toHex } from '@create-
 import type { KeyRec, LayerEntry, LedRec, NayaSession, Side } from '@create-reflow/sdk';
 import { parseCmdPath } from '@create-reflow/sdk';
 import {
-  encodeModuleConfig, fitsChunkBudget, overlay, planModuleLayout, recordsFromModuleBlob,
+  encodeModuleConfig, fitsChunkBudget, overlay, parseModuleList, planModuleLayout, recordsFromModuleBlob,
+  uuidToBytes,
 } from '@create-reflow/sdk';
-import type { BayAssignments, ConfigRecords, ModuleProfile } from '@create-reflow/sdk';
+import type { BayAssignments, ConfigRecords, ModuleListEntry, ModuleProfile } from '@create-reflow/sdk';
 import { readInventory } from './useLayers';
 import type { LayerDump } from './useLayers';
 import type { ModuleSlotLive } from './useModuleProfiles';
@@ -50,9 +51,12 @@ function isLayerListAck(payload: Uint8Array): boolean {
  * the addressed slot in payload[1]. UNPINNED, CONSERVATIVE — no measured
  * module-write ACK capture exists yet; the shape is inferred from the
  * 30/1002 layer-list gate and the 0xEA-rejection precedent. The Phase-10
- * live probe settles the real byte shape. 0xEA = value rejected; an
+ * live probe settles the real byte shape. 0xEA = value rejected; the
+ * 0xEA-first-byte guard runs BEFORE the slot-echo branch — a rejection
+ * [0xEA, slotEcho] would otherwise pass as an echo (carry [vii]). An
  * empty payload is not an ACK. */
 function isModuleAck(payload: Uint8Array, slot: number): boolean {
+  if (payload[0] === 0xea) return false;
   if (payload.length === 0) return false;
   return payload[0] === 0x00 || payload[1] === slot;
 }
@@ -212,6 +216,31 @@ export function useFlash({
       );
       if (modules !== undefined && hasModuleOps) {
         const { profiles, bays, live } = modules;
+        // Carries [v]: an empty live map means the board was never read
+        // this session — but 'not read' and 'nothing docked' are different
+        // problems with different fixes. One safe list read (before ANY
+        // write) tells them apart; either way the flash aborts — planning
+        // against an unseen board would allocate slots it cannot see.
+        if (Object.keys(live).length === 0) {
+          let entries: ModuleListEntry[] = [];
+          try {
+            entries = parseModuleList(await ses.readModuleList());
+          } catch {
+            throw new Error(
+              'module writes are queued but the keyboard has not been read this session and the module list could not be read — open the Modules tab and press "Read from keyboard" first; nothing was written',
+            );
+          }
+          if (entries.length === 0) {
+            throw new Error(
+              'module writes are queued but no module is docked on the board — dock the module first; nothing was written',
+            );
+          }
+          throw new Error(
+            `module writes are queued but the keyboard has not been read this session ` +
+              `(${entries.length} module slot(s) on board) — open the Modules tab and press ` +
+              `"Read from keyboard" first so the plan sees the real slots; nothing was written`,
+          );
+        }
         // Live device list from the T1 read verdicts; bay references from
         // the store's picks (every profile id a bay points at).
         const deviceList = Object.values(live).map((m) => ({
@@ -225,6 +254,45 @@ export function useFlash({
           // Dock-first / >8 refusals: ABORT before ANY write — the catch
           // below does the toast + log + fail phase with this message.
           throw new Error(plan.error);
+        }
+        // Carries [vi]: the queued ops were planned when they were queued;
+        // the store may have drifted since. A stale module-list add would
+        // label one profile's slot with another profile's uuid (the config
+        // replace below writes the NEW plan's bytes, so the pair would end
+        // up half-A half-B on the board). Compare every queued module op
+        // against THIS plan before anything goes out.
+        for (const o of d.ops) {
+          if (o.kind === 'moduleList') {
+            const slot = o.payload[1];
+            const a = plan.assignments.find((x) => x.slot === slot);
+            if (a === undefined) {
+              throw new Error(
+                `module plan drift: a queued module-list op targets slot ${slot}, which this flash's plan does not assign — review the module changes and flash again; nothing was written`,
+              );
+            }
+            if (o.payload.length > 5 && o.payload[4] === 0x10) {
+              // Add entry: the profile uuid rides payload[5..20] and must
+              // be the one the plan just assigned to this slot.
+              const want = uuidToBytes(a.listEntry.uuid16);
+              for (let i = 0; i < 16; i++) {
+                if (o.payload[5 + i] !== want[i]) {
+                  throw new Error(
+                    `module plan drift: the queued module-list add for slot ${slot} carries another profile's uuid than the plan assigns — review the module changes and flash again; nothing was written`,
+                  );
+                }
+              }
+            } else if (o.payload.length === 5 && !plan.reclaimed.includes(slot)) {
+              throw new Error(
+                `module plan drift: a queued module-list delete targets slot ${slot}, which this flash's plan keeps — review the module changes and flash again; nothing was written`,
+              );
+            }
+          } else if (o.kind === 'moduleCfg') {
+            if (!plan.assignments.some((x) => x.slot === o.slot)) {
+              throw new Error(
+                `module plan drift: a queued module config write targets slot ${o.slot}, which this flash's plan does not assign — review the module changes and flash again; nothing was written`,
+              );
+            }
+          }
         }
         // ALL template reads first (deduped per source slot), none after
         // a write has gone out.

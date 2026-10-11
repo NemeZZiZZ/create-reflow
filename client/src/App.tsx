@@ -64,7 +64,8 @@ export default function App() {
   // (profiles + bay picks persist); they clear with the rest of the
   // left-half state on disconnect. Ref indirection because onLeftCleared
   // runs inside useSessions while the hook itself (needing its sesRef) is
-  // wired after it — same render-phase ref write as useSessions' autoRef.
+  // wired after it — the assignment happens in an effect below, not during
+  // render (carry [iv]).
   const clearModuleLiveRef = useRef<() => void>(() => {});
   const [logOpen, toggleLog] = usePersistentFlag("naya-logopen", false);
   // Per-key free-text notes (UHK #8): host-side only — localStorage, carried
@@ -179,10 +180,15 @@ export default function App() {
 
   // Module profile store (Phase 5b): profiles + bay picks persist in
   // localStorage; readAll() captures unmatched slots on read. ModulesTab
-  // consumes this hook in a later task — wired here only. Declared BEFORE
-  // useFlash: the flash pre-step plans module writes against this state.
+  // edits this store; the flash pre-step plans module writes against it.
+  // Declared BEFORE useFlash for that reason.
   const moduleProfiles = useModuleProfiles({ sesRef, busyRef, log });
-  clearModuleLiveRef.current = moduleProfiles.clearLive;
+  // The clearLive indirection lands in an effect (carry [iv]): a ref write
+  // during render breaks under concurrent rendering — onLeftCleared (inside
+  // useSessions) calls it, profiles/bays persist, only the read verdicts die.
+  useEffect(() => {
+    clearModuleLiveRef.current = moduleProfiles.clearLive;
+  }, [moduleProfiles.clearLive]);
   const { flashing, flashState, doFlashQueue } = useFlash({
     sesRef,
     busyRef,
@@ -747,14 +753,7 @@ export default function App() {
           )}
 
           {tab === "modules" && (
-            <ModulesTab
-              left={sesRef.current.get("left")}
-              halves={halves}
-              leftOn={leftOn}
-              log={log}
-              draftRef={draftRef}
-              bumpDraft={bumpDraft}
-            />
+            <ModulesTab modules={moduleProfiles} halves={halves} leftOn={leftOn} />
           )}
 
           {tab === "behavior" && (
