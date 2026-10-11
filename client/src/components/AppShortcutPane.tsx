@@ -98,8 +98,11 @@ export default function AppShortcutPane({
   const [q, setQ] = useState("");
   const needle = q.trim().toLowerCase();
 
-  // Category groups in corpus order — codegen emits cats sorted and apps
-  // pre-grouped by category in name order, so insertion order suffices.
+  // Category groups sorted by category name (localeCompare — the collation
+  // codegen used for cats). The corpus sorts apps globally by NAME, so a
+  // plain db.apps walk yields first-appearance category order, not sorted
+  // order — hence the explicit sort. Within a group, apps stay in corpus
+  // order, which is name-sorted.
   const cats = useMemo(() => {
     const m = new Map<string, AppEntry[]>();
     if (db)
@@ -108,7 +111,7 @@ export default function AppShortcutPane({
         if (list) list.push(a);
         else m.set(a.cat, [a]);
       }
-    return [...m.entries()];
+    return [...m.entries()].sort(([a], [b]) => a.localeCompare(b));
   }, [db]);
 
   const app =
