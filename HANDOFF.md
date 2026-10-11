@@ -399,6 +399,16 @@ refs for `special:1` — an imported MO(2) is counted `unknown` on re-export
    `client/src/lib/bleCaps.ts` instance), a per-session device I/O log,
    and the Devices-tab BLE slot panel with confirm gating. See the BLE
    notes below.
+10. **Keyscan test mode + host OS (Phase 7)** — ✅ DONE 2026-10-12 (commits
+    0a85af0..a052d35 + the plan commit a3f3f21 + this docs commit). fe/1008
+    test-mode toggle + the fe/1009 raw event stream (`parseKeyScanEvent`,
+    `sdk/src/keyscan.ts`), `NayaSession.keyscanListen` — the whole listen
+    under the session tail-mutex, OFF guaranteed in `finally` — the
+    `useKeyscan` client hook (busyRef for the same window,
+    Escape/unmount/deadline exits), the Bindings-tab keyscan panel
+    (toggle + live raw row/col event tail), and the Behavior-tab fe/1005
+    host-OS select (Windows/macOS) riding the settings draft path. See the
+    keyscan notes below.
 
 ## BLE notes (Phase 6) — wire provenance & known limitations
 
@@ -422,6 +432,43 @@ refs for `special:1` — an imported MO(2) is counted `unknown` on re-export
 - Stale wording, eventual cleanup: `firmware-mismatch.ts`'s "vendor
   tooling" flash advice — this app flashes keymaps itself (FW flashing is
   still external).
+
+## Keyscan notes (Phase 7) — wire provenance & known limitations
+
+- **fe/1008 toggle**: ON `[01]` / OFF `[00]` — exactly 1 byte each. OFF is
+  guaranteed in the listener's `finally`, even on abort or throw. The ON
+  reply is never inspected (OpenFlow parity): a lenient matcher
+  (`match: () => true`) counts any valid frame as the ack, and an
+  unanswered ON warns, then listens anyway.
+- **fe/1009 events**: payload `[row, col, state, …]`, ≥3B — the FIRST 3
+  bytes are parsed, extras are logged and never parsed. STATE 0 = PRESS —
+  INVERTED vs intuition (`parseKeyScanEvent`, `sdk/src/keyscan.ts`).
+- **Mutex rule**: `keyscanListen` (NayaSession) holds the session
+  tail-mutex the WHOLE session — any interleaved `cmd()` flushes the RX
+  buffer and destroys queued events. The client holds `busyRef` for the
+  same window (and refuses to start while a flash/dump/read is in flight
+  or the draft is non-empty): test mode blocks ALL other device traffic —
+  the UI copy says so.
+- **ioLog tap**: stream frames bypass the roundtrip tap (it lives inside
+  `roundtrip`), so the listener pushes RX records into ioLog manually —
+  strictly observational, try/catch-wrapped.
+- **Raw row/col only**: NO row/col→KK matrix mapping exists anywhere
+  (ours, OpenFlow, the KB — verified); the Keyboard `pressed` prop
+  (KK-keyed `ReadonlySet<number>`) is an always-empty seam until a
+  verified mapping lands.
+- **fe/1005 host OS**: 1 byte, 0 = Windows, 1 = macOS (NEVER the t19
+  module 200/201). Rides the settings draft path; strip-then-queue
+  latest-wins — the settings opKey includes `payload[0]`, which IS the
+  value, so dedup alone would never replace across values. NACK →
+  partial, the op stays queued (settings ops have no readback).
+- **Phase-10 live-probe items**: keyscan ON-ACK shape; row/col→KK
+  mapping; host-input blocking while keyscan streams (do the keys ALSO
+  reach the computer?); fe/1005 ACK shape.
+- **Known limitations**: no immediate-abort channel — Escape/unmount set
+  an abort flag that takes effect at the NEXT event or the ≤10s deadline
+  (`busyRef` is held throughout; an AbortSignal rewrite is the later
+  cleanup candidate); a key held at session end freezes in the pressed
+  set (UI gated on `running`, so nothing implies live state after stop).
 
 ## Ecosystem / diplomacy context
 
