@@ -8,18 +8,22 @@
 // Power: Idle/Sleep/Deep timeout sliders (0-6000s; 0 = off, 30 s device
 // floor enforced by timeoutsPayload). Current values load live via fe/100b
 // on mount (left half only); Apply queues one fe/100a op with all three
-// values. (Replaces the old Settings dialog.)
+// values. (Replaces the old Settings dialog.) Host OS below the timeouts:
+// an explicit Windows/macOS/Unset select that mirrors the QUEUED fe/1005
+// op — picking a value queues hostOsOp, Unset removes it; the device
+// never reports host OS back and its ACK shape is unproven (noted in UI).
 // LED: Max Brightness / Scan Mode / Action Override queue ED ops on change.
 // The device reports none of these back — the queue shows what will be sent.
 import { useEffect, useState } from 'react';
 import { Button } from '../ui/button';
 import { Card, CardContent, CardHeader } from '../ui/card';
 import { Checkbox } from '../ui/checkbox';
-import type { Draft } from '@create-reflow/sdk';
+import type { Draft, SettingsOp } from '@create-reflow/sdk';
 import { timeoutsPayload } from '@create-reflow/sdk';
 import { FLAVORS, flavorById } from '@create-reflow/sdk';
 import type { FlavorId } from '@create-reflow/sdk';
 import { ledOverrideOp, maxBrtOp, scanModeOp } from '@create-reflow/sdk';
+import { hostOsOp, HOST_OS } from '@create-reflow/sdk';
 import { queueSetting } from '@create-reflow/sdk';
 import type { LogFn } from '../../hooks/useLog';
 import { cn } from '../../lib/utils';
@@ -101,6 +105,15 @@ export default function BehaviorTab({
   }, [leftOn, loadTimeouts]);
   const showingLive = leftOn && liveTimeouts;
 
+  // Host OS select mirrors the QUEUED state: the draft's fe/1005 settings
+  // op is the only source (the device never reports host OS back). At most
+  // one lives in the draft — pushHostOs keeps that invariant.
+  const queuedHostOs = draftRef.current.ops.find(
+    (o): o is SettingsOp => o.kind === 'settings' && o.path === 'fe/1005',
+  );
+  const hostOsValue =
+    queuedHostOs && queuedHostOs.payload.length > 0 ? String(queuedHostOs.payload[0]) : '';
+
   function pickFlavor(id: FlavorId) {
     onFlavor(id);
     log('inf', `interrupt flavor → ${flavorById(id)?.name} (rides inside every hold-tap record — applied on the next behavior write)`);
@@ -139,6 +152,28 @@ export default function BehaviorTab({
   function pushOverride(v: number) {
     setOverride(v);
     queueSetting(draftRef.current, ledOverrideOp(v));
+    bumpDraft();
+  }
+
+  function pushHostOs(os: keyof typeof HOST_OS | null) {
+    // fe/1005's payload byte IS the value, so draft.add's opKey dedup
+    // (settings:path:payload[0]) never replaces across values — strip any
+    // queued host-OS op first so exactly one lives in the draft and the
+    // select's queued-state display stays unambiguous. null = Unset:
+    // remove the queued op, queue nothing.
+    const cur = draftRef.current.ops.find(
+      (o): o is SettingsOp => o.kind === 'settings' && o.path === 'fe/1005',
+    );
+    if (os !== null && cur !== undefined && cur.payload[0] === HOST_OS[os]) return;
+    draftRef.current.ops = draftRef.current.ops.filter(
+      (o) => !(o.kind === 'settings' && o.path === 'fe/1005'),
+    );
+    if (os) {
+      queueSetting(draftRef.current, hostOsOp(os));
+      log('inf', `queued host OS → ${os === 'windows' ? 'Windows' : 'macOS'} (applied on the next flash)`);
+    } else if (cur) {
+      log('inf', 'removed the queued host OS op');
+    }
     bumpDraft();
   }
 
@@ -233,6 +268,35 @@ export default function BehaviorTab({
             <Button size="sm" onClick={applyTimeouts}>
               Queue timeouts
             </Button>
+          </div>
+          <div className="mt-2 border-t pt-1">
+            <Row
+              label="Host OS"
+              hint="Queues a host-OS write for the next flash; Unset removes the queued op."
+            >
+              <select
+                value={hostOsValue}
+                onChange={(e) =>
+                  pushHostOs(
+                    e.target.value === ''
+                      ? null
+                      : e.target.value === String(HOST_OS.mac)
+                        ? 'mac'
+                        : 'windows',
+                  )
+                }
+                className={cn('rounded border bg-background px-2 py-1 text-sm')}
+              >
+                <option value="">Unset</option>
+                <option value={String(HOST_OS.windows)}>Windows</option>
+                <option value={String(HOST_OS.mac)}>macOS</option>
+              </select>
+            </Row>
+            <div className="text-xs text-muted-foreground">
+              Shows the queued op — the device never reports its host OS back. The reply is
+              never inspected (ACK shape unproven): a rejected write stays queued and the
+              flash reports partial.
+            </div>
           </div>
         </CardContent>
       </Card>
