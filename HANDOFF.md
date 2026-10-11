@@ -249,8 +249,9 @@ build, host-table name resolution); file gate: `sdk/src/importers.ts`
   records, 483-byte chunk budget) behind the `MODULE_ADDR` addressing seam;
   vendored field maps + the profile model in `module-fields.ts`/
   `module-profiles.ts` (overlay/axis/compare, `openflow.module-profile`
-  import/export); slot planner + draft ops in `module-planner.ts`
-  (`queueModuleConfig`/`ListAdd`/`ListDelete`/`BayAssignment`, `ModuleCfgOp`/
+  import/export); slot planner in `module-planner.ts`; queue helpers in
+  `sdk/src/queue.ts` (`queueModuleConfig`/`ListAdd`/`ListDelete`/
+  `BayAssignment`), op types in `sdk/src/draft.ts` (`ModuleCfgOp`/
   `ModuleListOp`); read side in `module-read.ts` (30/1009 `parseModuleList`,
   `matchSlots` content match, `captureFromSlots` capture-on-read,
   `repointBays`). **5a core done — 5b UI pending** (ModulesTab editing, bay

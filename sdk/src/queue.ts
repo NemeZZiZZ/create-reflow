@@ -22,6 +22,7 @@ import {
   bayRecord,
   encodeListAdd,
   encodeListDelete,
+  encodeModuleConfig,
   fitsChunkBudget,
 } from './module-wire';
 import type { PlanListEntry } from './module-planner';
@@ -346,7 +347,7 @@ export function queueModuleConfig(
   records: Uint8Array[],
   label: string,
 ): { queued: boolean; error?: string } {
-  const payload = Uint8Array.from([slot & 0xff, ...records.flatMap((r) => [...r])]);
+  const payload = encodeModuleConfig(slot, records);
   if (!fitsChunkBudget(payload)) {
     const error = 'module config exceeds the 483-byte two-frame ceiling';
     draft.addDrop({ reason: error, effect: 'the module keeps its stored configuration' });

@@ -125,14 +125,21 @@ export function encodeListDelete(slot: number): Uint8Array {
   return Uint8Array.from([...moduleAddr(slot), 0x00, 0x00, 0x00]);
 }
 
-/** Full blank module config (30/100C): [slot] + 40 records [f, 00, 00]
- * = 121 bytes. The short write leaves the previous module's tail — the
- * NayaFlow removal idiom. */
+/** Full module config payload (30/100C): [slot] + records joined flat.
+ * 100C opens with the bare slot byte (NO 0x00 prefix — the one verb that
+ * breaks the MODULE_ADDR pattern; see header note). All 100C senders build
+ * their payload through here so the addressing knowledge stays in this
+ * file. */
+export function encodeModuleConfig(slot: number, records: Uint8Array[]): Uint8Array {
+  return Uint8Array.from([slot & 0xff, ...records.flatMap((r) => [...r])]);
+}
+
+/** Full blank module config (30/100C): encodeModuleConfig over 40 empty
+ * records [f, 00, 00] = 121 bytes. The short write leaves the previous
+ * module's tail — the NayaFlow removal idiom. */
 export function encodeBlankConfig(slot: number): Uint8Array {
-  const out = new Uint8Array(1 + 40 * 3);
-  out[0] = slot & 0xff; // 100C opens with the bare slot byte (no 0x00 prefix)
-  for (let f = 0; f < 40; f++) out[1 + f * 3] = f; // records are zero-filled
-  return out;
+  const records = Array.from({ length: 40 }, (_, f) => Uint8Array.from([f, 0, 0]));
+  return encodeModuleConfig(slot, records);
 }
 
 /** Module bay positions in the layer data (30/1004 record form). */

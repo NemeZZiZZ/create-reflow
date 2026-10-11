@@ -44,7 +44,7 @@ import { BAY_LED_RANGES, queueBayColor, queueFillLayer } from '@create-reflow/sd
 import { chunkStatus, probeDraft } from '@create-reflow/sdk';
 import {
   MODULE_ADDR, moduleAddr, MODULE_TYPE_CODE,
-  encodeListAdd, encodeListDelete, encodeBlankConfig,
+  encodeListAdd, encodeListDelete, encodeBlankConfig, encodeModuleConfig,
   encodeModuleField, encodeTwoWord, encodeMouseMask, MOUSE_MASK,
   bayRecord, BAY_POSITIONS, BAY_INHERIT,
   fitsChunkBudget, chunkBudget,
@@ -2946,6 +2946,11 @@ void (async () => {
   eq(blank57[0], 3, '57 blank opens with the slot byte');
   eq(toHex(blank57.slice(1, 4)), '00 00 00', '57 blank first record [0, 0, 0]');
   eq(toHex(blank57.slice(118)), '27 00 00', '57 blank last record [0x27, 0, 0]');
+  eq(toHex(encodeModuleConfig(5, [Uint8Array.from([0x00, 0x01, 0x01, 0x0a])])), '05 00 01 01 0a',
+    '57 encodeModuleConfig = bare slot byte + records joined (the 100C seam)');
+  eq(toHex(blank57),
+    toHex(encodeModuleConfig(3, Array.from({ length: 40 }, (_, f) => Uint8Array.from([f, 0, 0])))),
+    '57 blank config = encodeModuleConfig + 40 empty records (single source)');
   eq(toHex(encodeModuleField(0x00, 'none')), '00 07 00', '57 none record = type 0x07 empty');
   eq(toHex(encodeModuleField(0x00, 'setting', 72)), '00 01 01 48', '57 setting record 00 01 01 48 (=72)');
   eq(toHex(encodeModuleField(0x05, 'keypress', Uint8Array.from([0x01, 0x04, 0x04, 0x00, 0x07, 0x00]))),
@@ -3398,6 +3403,17 @@ void (async () => {
   const qdEdge59 = new Draft();
   eq(queueModuleConfig(qdEdge59, 1, [new Uint8Array(482)], 'edge').queued, true,
     '59 queueModuleConfig: exactly 483B (slot + record) still fits');
+
+  /* --- reconcile keeps module ops (no readback path) ---------------------- */
+  const qr59 = new Draft();
+  queueModuleConfig(qr59, 2, [recA59], 'cfg keep');
+  queueModuleListAdd(qr59, {
+    slot: 2, id: 2, flag: MODULE_TYPE_CODE.TRACK, uuid16: '00112233445566778899aabbccddeeff',
+  });
+  eq(qr59.reconcile([], []) === 0 && qr59.size === 2
+    && qr59.ops.some((o) => o.kind === 'moduleCfg')
+    && qr59.ops.some((o) => o.kind === 'moduleList'), true,
+    '59 reconcile keeps moduleCfg + moduleList (no readback — both kinds survive)');
 
   /* --- queueModuleListAdd/Delete ----------------------------------------------------- */
   const ql59 = new Draft();
