@@ -7,7 +7,10 @@ import { dirname, resolve } from 'node:path';
 
 export default {
   input: 'scripts/smoke.tsx',
-  output: { format: 'cjs', file: '/tmp/smoke.cjs' },
+  // codeSplitting:false keeps the bundle single-file (node /tmp/smoke.cjs):
+  // the app-shortcuts loader's dynamic JSON import would otherwise split a
+  // second chunk, which output.file forbids.
+  output: { format: 'cjs', file: '/tmp/smoke.cjs', codeSplitting: false },
   plugins: [
     {
       name: 'raw-loader',

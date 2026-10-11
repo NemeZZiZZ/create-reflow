@@ -10,6 +10,10 @@ import {
 import {
   POS_KEY, POS_SHAPE, SHAPES,
 } from '../src/lib/kb-data';
+import {
+  loadAppShortcuts, detectPlatform, bindOf, appShortcutActionDef, rankAppHits,
+} from '../src/lib/app-shortcuts';
+import type { AppEntry, ShortcutEntry } from '../src/lib/app-shortcuts';
 import * as fs from 'fs';
 import * as path from 'path';
 import { keyIconName, shortLabel } from '../src/lib/key-icon-map';
@@ -4759,6 +4763,70 @@ void (async () => {
     eq(toHex(toggles[toggles.length - 1]!.payload), '00',
       '65 listen: mid-stream abort STILL sends OFF [00]');
   }
+})();
+
+// §66 app-shortcuts dictionary, part 1 (loader lib): corpus integrity,
+// bytes→body equivalence, platform swap, slot gate, ranker pins.
+void (async () => {
+  const db66 = await loadAppShortcuts();
+  eq(db66.apps.length, 150, '66 corpus: 150 apps');
+  eq(new Set(db66.apps.map((a) => a.cat)).size, 16, '66 corpus: 16 unique categories');
+  eq(db66.byName.size, 150, '66 corpus: byName index covers all 150 apps');
+  eq(db66.apps.reduce((t, a) => t + a.actions.length, 0), 19853,
+    '66 corpus: 19853 actions total');
+
+  const pw66 = db66.byName.get('1Password');
+  eq(pw66?.cat, 'Productivity', "66 corpus: 1Password cat 'Productivity'");
+  eq(pw66?.actions.length, 58, '66 corpus: 1Password has 58 actions');
+
+  const sqa66 = pw66!.actions.find((e) => e.name === 'Show Quick Access')!;
+  eq(bindOf(sqa66, 'windows')!.bytes, '2c000703', "66 binds: Show Quick Access win bytes '2c000703'");
+  eq(bindOf(sqa66, 'mac')!.bytes, '2c00070a', "66 binds: Show Quick Access mac bytes '2c00070a'");
+
+  const def66 = appShortcutActionDef(pw66!, sqa66, 'windows')!;
+  eq(JSON.stringify(def66.body()), JSON.stringify([0x01, 0x04, 0x2c, 0x00, 0x07, 0x03]),
+    '66 body: windows [01 04 2c 00 07 03] — OF param [usageLo,usageHi,page,mods] byte-identity');
+  const defMac66 = appShortcutActionDef(pw66!, sqa66, 'mac')!;
+  eq(JSON.stringify(defMac66.body()), JSON.stringify([0x01, 0x04, 0x2c, 0x00, 0x07, 0x0a]),
+    '66 body: mac [01 04 2c 00 07 0a]');
+  eq(JSON.stringify(defMac66.body().slice(0, 5)), JSON.stringify(def66.body().slice(0, 5)),
+    '66 body: mac ≡ windows through the page byte');
+  eq(defMac66.body()[5] !== def66.body()[5], true,
+    '66 body: windows/mac bodies differ only at the mods byte');
+
+  eq(def66.label, 'Show Quick Access (LCTRL + LSHIFT + SPACE)',
+    '66 def: label = entry name + chord');
+  eq(def66.id, 'app:windows:1Password::Show Quick Access',
+    '66 def: id app:windows:1Password::Show Quick Access');
+  eq(def66.category, 'Applications', "66 def: category 'Applications'");
+
+  eq(describeRecord(buildRecord(0, def66.body())).includes('Space'), true,
+    '66 readback: describeRecord(buildRecord(0, body)) contains Space (page 0x0007 + mods suffix)');
+  eq(hidPairOf(buildRecord(0, def66.body())), null,
+    '66 slot gate: hidPairOf(app record) null — mods ≠ 0 never feeds behavior slots');
+
+  let nullApp66: AppEntry | undefined;
+  let nullEntry66: ShortcutEntry | undefined;
+  for (const a of db66.apps) {
+    const e = a.actions.find((x) => x.win === null);
+    if (e) { nullApp66 = a; nullEntry66 = e; break; }
+  }
+  eq(bindOf(nullEntry66!, 'windows'), null, '66 null path: mac-only entry → windows bind null');
+  eq(appShortcutActionDef(nullApp66!, nullEntry66!, 'windows'), null,
+    '66 null path: mac-only entry → windows ActionDef null');
+
+  const hitsQA = rankAppHits(db66, 'quick access', 'windows');
+  eq(hitsQA[0]?.entry.name, 'Show Quick Access', "66 rank: 'quick access' top hit = Show Quick Access");
+  eq(hitsQA.every((h) => bindOf(h.entry, 'windows') !== null), true,
+    '66 rank: every hit carries a windows bind');
+
+  eq(rankAppHits(db66, 'zzz-no-such-shortcut', 'windows').length, 0,
+    "66 rank: 'zzz-no-such-shortcut' → no hits");
+
+  eq(rankAppHits(db66, 'ripple delete', 'windows')[0]?.entry.name, 'Ripple Delete',
+    "66 rank pin: 'ripple delete' top hit = Ripple Delete (Adobe Premiere Pro)");
+
+  eq(detectPlatform(), 'windows', '66 platform: node (no navigator) → windows guard');
 })();
 
 void main();
