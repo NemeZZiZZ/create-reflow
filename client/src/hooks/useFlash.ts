@@ -11,10 +11,13 @@ import { concat, encodeRestorePayload, isWriteAck, sleep, toHex } from '@create-
 import type { KeyRec, LayerEntry, LedRec, NayaSession, Side } from '@create-reflow/sdk';
 import { parseCmdPath } from '@create-reflow/sdk';
 import {
-  encodeModuleConfig, fitsChunkBudget, overlay, parseModuleList, planModuleLayout, recordsFromModuleBlob,
+  encodeModuleConfig, fitsChunkBudget, overlay, parseModuleList, planModuleLayout, planModuleOps,
+  queueModuleConfig, queueModuleListAdd, queueModuleListDelete, recordsFromModuleBlob,
   uuidToBytes,
 } from '@create-reflow/sdk';
-import type { BayAssignments, ConfigRecords, ModuleListEntry, ModuleProfile } from '@create-reflow/sdk';
+import type {
+  BayAssignments, ConfigRecords, LiveSlotState, ModuleListEntry, ModulePlan, ModuleProfile,
+} from '@create-reflow/sdk';
 import { readInventory } from './useLayers';
 import type { LayerDump } from './useLayers';
 import type { ModuleSlotLive } from './useModuleProfiles';
@@ -172,7 +175,9 @@ export function useFlash({
     // re-probe would under-report what this flash carried.
     const drops = collectDrops(d);
     setFlashState({ phase: 'running', done: 0, total: d.size, message: null, drops });
-    const total = d.size;
+    // `let` — the module producer (below) may inject ops into the draft
+    // before the first write; the progress totals must move with it.
+    let total = d.size;
     let done = 0;
     let layersNack = false;
     try {
@@ -200,150 +205,211 @@ export function useFlash({
       else if (bk.reason === 'storage')
         log('err', 'auto-backup: storage unavailable/full — continuing without');
       await ses.handshake();
-      // Module pre-step (Phase 5b Task 2, BINDING precondition): while
-      // module writes are queued, plan the slot layout against the live
-      // device state and read EVERY template source BEFORE the first
-      // write — a new slot's config is seeded from a same-type slot's raw
-      // records (overlay's unmodeled passthrough), and reading after the
-      // list write would seed from bytes this same flash is about to
-      // overwrite (the proven overwrite hazard). Runs only when the draft
-      // holds module ops — a keymap-only flash must not demand docked
-      // modules or spend device reads — and only when the caller passed
-      // the modules option (without it there is no live state to plan
-      // from; the pre-step is skipped, not invented).
-      const hasModuleOps = d.ops.some(
+      // Module pre-step (Phase 5b Task 2, BINDING precondition; the final
+      // fix added THE PRODUCER): plan the slot layout against the live
+      // device state, GENERATE the structural ops the plan implies
+      // (planModuleOps: list deletes for reclaimed slots, list adds where
+      // the slot's uuid is not the assigned profile, diff-based config
+      // writes) into the draft, and read EVERY template source BEFORE the
+      // first write — a new slot's config is seeded from a same-type
+      // slot's raw records (overlay's unmodeled passthrough), and reading
+      // after the list write would seed from bytes this same flash is
+      // about to overwrite (the proven overwrite hazard). A keymap-only
+      // flash with an empty profile store must not demand docked modules
+      // or spend device reads; without the modules option there is no
+      // live state to plan from and the pre-step is skipped, not invented.
+      const queuedModuleOps = d.ops.some(
         (o) => o.kind === 'moduleCfg' || o.kind === 'moduleList',
       );
-      if (modules !== undefined && hasModuleOps) {
+      if (modules !== undefined && (queuedModuleOps || modules.profiles.length > 0)) {
         const { profiles, bays, live } = modules;
         // Carries [v]: an empty live map means the board was never read
         // this session — but 'not read' and 'nothing docked' are different
         // problems with different fixes. One safe list read (before ANY
-        // write) tells them apart; either way the flash aborts — planning
-        // against an unseen board would allocate slots it cannot see.
+        // write) tells them apart; with module ops already queued the
+        // flash aborts — planning against an unseen board would allocate
+        // slots it cannot see. Without queued ops there is nothing to
+        // plan against either — skip (never invent); the Modules tab's
+        // read flow is the fix.
         if (Object.keys(live).length === 0) {
-          let entries: ModuleListEntry[] = [];
-          try {
-            entries = parseModuleList(await ses.readModuleList());
-          } catch {
+          if (queuedModuleOps) {
+            let entries: ModuleListEntry[] = [];
+            try {
+              entries = parseModuleList(await ses.readModuleList());
+            } catch {
+              throw new Error(
+                'module writes are queued but the keyboard has not been read this session and the module list could not be read — open the Modules tab and press "Read from keyboard" first; nothing was written',
+              );
+            }
+            if (entries.length === 0) {
+              throw new Error(
+                'module writes are queued but no module is docked on the board — dock the module first; nothing was written',
+              );
+            }
             throw new Error(
-              'module writes are queued but the keyboard has not been read this session and the module list could not be read — open the Modules tab and press "Read from keyboard" first; nothing was written',
+              `module writes are queued but the keyboard has not been read this session ` +
+                `(${entries.length} module slot(s) on board) — open the Modules tab and press ` +
+                `"Read from keyboard" first so the plan sees the real slots; nothing was written`,
+            );
+          } else {
+            log(
+              'inf',
+              'module plan: skipped — the keyboard has not been read this session, so no ' +
+                'module writes are planned (open the Modules tab and press "Read from keyboard")',
             );
           }
-          if (entries.length === 0) {
-            throw new Error(
-              'module writes are queued but no module is docked on the board — dock the module first; nothing was written',
-            );
-          }
-          throw new Error(
-            `module writes are queued but the keyboard has not been read this session ` +
-              `(${entries.length} module slot(s) on board) — open the Modules tab and press ` +
-              `"Read from keyboard" first so the plan sees the real slots; nothing was written`,
-          );
         }
-        // Live device list from the T1 read verdicts; bay references from
-        // the store's picks (every profile id a bay points at).
-        const deviceList = Object.values(live).map((m) => ({
-          slot: m.slot,
-          uuid: m.uuid,
-          type: m.type,
-        }));
-        const references = Object.values(bays).flatMap((row) => Object.values(row));
-        const plan = planModuleLayout(profiles, deviceList, references);
-        if ('error' in plan) {
-          // Dock-first / >8 refusals: ABORT before ANY write — the catch
-          // below does the toast + log + fail phase with this message.
-          throw new Error(plan.error);
-        }
-        // Carries [vi]: the queued ops were planned when they were queued;
-        // the store may have drifted since. A stale module-list add would
-        // label one profile's slot with another profile's uuid (the config
-        // replace below writes the NEW plan's bytes, so the pair would end
-        // up half-A half-B on the board). Compare every queued module op
-        // against THIS plan before anything goes out.
-        for (const o of d.ops) {
-          if (o.kind === 'moduleList') {
-            const slot = o.payload[1];
-            const a = plan.assignments.find((x) => x.slot === slot);
-            if (a === undefined) {
-              throw new Error(
-                `module plan drift: a queued module-list op targets slot ${slot}, which this flash's plan does not assign — review the module changes and flash again; nothing was written`,
-              );
-            }
-            if (o.payload.length > 5 && o.payload[4] === 0x10) {
-              // Add entry: the profile uuid rides payload[5..20] and must
-              // be the one the plan just assigned to this slot.
-              const want = uuidToBytes(a.listEntry.uuid16);
-              for (let i = 0; i < 16; i++) {
-                if (o.payload[5 + i] !== want[i]) {
-                  throw new Error(
-                    `module plan drift: the queued module-list add for slot ${slot} carries another profile's uuid than the plan assigns — review the module changes and flash again; nothing was written`,
-                  );
-                }
-              }
-            } else if (o.payload.length === 5 && !plan.reclaimed.includes(slot)) {
-              throw new Error(
-                `module plan drift: a queued module-list delete targets slot ${slot}, which this flash's plan keeps — review the module changes and flash again; nothing was written`,
-              );
-            }
-          } else if (o.kind === 'moduleCfg') {
-            if (!plan.assignments.some((x) => x.slot === o.slot)) {
-              throw new Error(
-                `module plan drift: a queued module config write targets slot ${o.slot}, which this flash's plan does not assign — review the module changes and flash again; nothing was written`,
-              );
-            }
+        // THE PRODUCER (final fix F1): nothing in the UI queues
+        // moduleCfg/moduleList ops directly — profile edits live in the
+        // store, and this is where they become wire ops. planModuleOps is
+        // diff-based (zero diff → zero ops); its ops ride the SAME plan
+        // and encoders as the pre-step below, so they pass the drift
+        // validator BY CONSTRUCTION — the validator stays for any future
+        // producer.
+        let plan: ModulePlan | null = null;
+        if (Object.keys(live).length !== 0) {
+          // Live device list from the T1 read verdicts; bay references from
+          // the store's picks (every profile id a bay points at).
+          const deviceList = Object.values(live).map((m) => ({
+            slot: m.slot,
+            uuid: m.uuid,
+            type: m.type,
+          }));
+          const references = Object.values(bays).flatMap((row) => Object.values(row));
+          const p = planModuleLayout(profiles, deviceList, references);
+          if ('error' in p) {
+            // Dock-first / >8 refusals: ABORT before ANY write — the catch
+            // below does the toast + log + fail phase with this message.
+            throw new Error(p.error);
           }
-        }
-        // ALL template reads first (deduped per source slot), none after
-        // a write has gone out.
-        const templates = new Map<string, ConfigRecords>(); // profileId → overlaid
-        const readSlots = new Map<number, ConfigRecords>(); // source slot → records
-        for (const a of plan.assignments) {
-          const src = plan.templateSources[a.profileId];
-          if (src === null || src === undefined) continue; // kept slot — records already there
-          let template = readSlots.get(src);
-          if (template === undefined) {
-            const { blob } = await ses.readModuleConfig(src);
-            template = recordsFromModuleBlob(blob);
-            readSlots.set(src, template);
+          plan = p;
+          const liveSlots: Record<number, LiveSlotState> = {};
+          for (const m of Object.values(live)) {
+            liveSlots[m.slot] = { uuid: m.uuid, records: m.records };
           }
-          const profile = profiles.find((p) => p.id === a.profileId);
-          if (profile === undefined) continue; // unreachable: the planner assigns store profiles
-          templates.set(a.profileId, overlay(template, profile, profile.type));
+          const generated = planModuleOps(plan, profiles, liveSlots);
+          let listOps = 0;
+          let cfgOps = 0;
+          for (const op of generated) {
+            if (op.kind === 'listDelete') {
+              if (queueModuleListDelete(d, op.slot, op.label).queued) listOps++;
+            } else if (op.kind === 'listAdd') {
+              if (queueModuleListAdd(d, op.entry, op.label).queued) listOps++;
+            } else if (queueModuleConfig(d, op.slot, op.records, op.label).queued) {
+              cfgOps++;
+            } // else: over budget — queueModuleConfig already ledger-dropped it
+          }
+          const skipped = plan.assignments.length -
+            generated.filter((o) => o.kind === 'config').length;
           log(
             'inf',
-            `module plan: slot ${a.slot} template read from slot ${src} ("${profile.name}")`,
+            `module plan: ${listOps} list ops, ${cfgOps} cfg ops (${skipped} skipped — no diff)`,
           );
+          if (listOps + cfgOps > 0) {
+            // The dialog's totals were fixed before the injection — move
+            // them so progress never reads done > total (done is still 0).
+            total = d.size;
+            setFlashState({ phase: 'running', done: 0, total, message: null, drops });
+          }
         }
-        // REPLACE the queued moduleCfg records with the overlaid ones —
-        // payloads re-encoded through the queueModuleConfig encoder
-        // (encodeModuleConfig owns 100C addressing; no hand-rolled join).
-        for (let i = 0; i < d.ops.length; i++) {
-          const o = d.ops[i];
-          if (o.kind !== 'moduleCfg') continue;
-          const a = plan.assignments.find((x) => x.slot === o.slot);
-          const recs = a !== undefined ? templates.get(a.profileId) : undefined;
-          if (recs === undefined) continue; // kept/unplanned slot — the queued records stand
-          const recArr = [...recs.values()];
-          const payload = encodeModuleConfig(o.slot, recArr);
-          if (!fitsChunkBudget(payload)) {
-            throw new Error(
-              `slot ${o.slot} overlaid config exceeds the 483-byte two-frame ceiling — nothing was written`,
+        // Landed tail — drift conformance, template reads, record
+        // replacement, plan summary. Reached only when the draft holds
+        // module ops (queued before this flash, or injected by the
+        // producer above); plan is then non-null by construction.
+        const hasModuleOps = d.ops.some(
+          (o) => o.kind === 'moduleCfg' || o.kind === 'moduleList',
+        );
+        if (plan !== null && hasModuleOps) {
+          // Carries [vi]: the queued ops were planned when they were queued;
+          // the store may have drifted since. A stale module-list add would
+          // label one profile's slot with another profile's uuid (the config
+          // replace below writes the NEW plan's bytes, so the pair would end
+          // up half-A half-B on the board). Compare every queued module op
+          // against THIS plan before anything goes out.
+          for (const o of d.ops) {
+            if (o.kind === 'moduleList') {
+              const slot = o.payload[1];
+              const a = plan.assignments.find((x) => x.slot === slot);
+              if (a === undefined) {
+                throw new Error(
+                  `module plan drift: a queued module-list op targets slot ${slot}, which this flash's plan does not assign — review the module changes and flash again; nothing was written`,
+                );
+              }
+              if (o.payload.length > 5 && o.payload[4] === 0x10) {
+                // Add entry: the profile uuid rides payload[5..20] and must
+                // be the one the plan just assigned to this slot.
+                const want = uuidToBytes(a.listEntry.uuid16);
+                for (let i = 0; i < 16; i++) {
+                  if (o.payload[5 + i] !== want[i]) {
+                    throw new Error(
+                      `module plan drift: the queued module-list add for slot ${slot} carries another profile's uuid than the plan assigns — review the module changes and flash again; nothing was written`,
+                    );
+                  }
+                }
+              } else if (o.payload.length === 5 && !plan.reclaimed.includes(slot)) {
+                throw new Error(
+                  `module plan drift: a queued module-list delete targets slot ${slot}, which this flash's plan keeps — review the module changes and flash again; nothing was written`,
+                );
+              }
+            } else if (o.kind === 'moduleCfg') {
+              if (!plan.assignments.some((x) => x.slot === o.slot)) {
+                throw new Error(
+                  `module plan drift: a queued module config write targets slot ${o.slot}, which this flash's plan does not assign — review the module changes and flash again; nothing was written`,
+                );
+              }
+            }
+          }
+          // ALL template reads first (deduped per source slot), none after
+          // a write has gone out.
+          const templates = new Map<string, ConfigRecords>(); // profileId → overlaid
+          const readSlots = new Map<number, ConfigRecords>(); // source slot → records
+          for (const a of plan.assignments) {
+            const src = plan.templateSources[a.profileId];
+            if (src === null || src === undefined) continue; // kept slot — records already there
+            let template = readSlots.get(src);
+            if (template === undefined) {
+              const { blob } = await ses.readModuleConfig(src);
+              template = recordsFromModuleBlob(blob);
+              readSlots.set(src, template);
+            }
+            const profile = profiles.find((p) => p.id === a.profileId);
+            if (profile === undefined) continue; // unreachable: the planner assigns store profiles
+            templates.set(a.profileId, overlay(template, profile, profile.type));
+            log(
+              'inf',
+              `module plan: slot ${a.slot} template read from slot ${src} ("${profile.name}")`,
             );
           }
-          d.ops[i] = { ...o, records: recArr, payload };
+          // REPLACE the queued moduleCfg records with the overlaid ones —
+          // payloads re-encoded through the queueModuleConfig encoder
+          // (encodeModuleConfig owns 100C addressing; no hand-rolled join).
+          for (let i = 0; i < d.ops.length; i++) {
+            const o = d.ops[i];
+            if (o.kind !== 'moduleCfg') continue;
+            const a = plan.assignments.find((x) => x.slot === o.slot);
+            const recs = a !== undefined ? templates.get(a.profileId) : undefined;
+            if (recs === undefined) continue; // kept/unplanned slot — the queued records stand
+            const recArr = [...recs.values()];
+            const payload = encodeModuleConfig(o.slot, recArr);
+            if (!fitsChunkBudget(payload)) {
+              throw new Error(
+                `slot ${o.slot} overlaid config exceeds the 483-byte two-frame ceiling — nothing was written`,
+              );
+            }
+            d.ops[i] = { ...o, records: recArr, payload };
+          }
+          // Plan summary: slots allocated / reclaimed / gaps.
+          const assigned = plan.assignments.map((a) => a.slot);
+          const gaps = [1, 2, 3, 4, 5, 6, 7].filter((s) => !assigned.includes(s));
+          log(
+            'inf',
+            `module plan: ${assigned.length} slot(s) allocated` +
+              (assigned.length > 0 ? ` [${assigned.join(', ')}]` : '') +
+              `, ${plan.reclaimed.length} reclaimed` +
+              (plan.reclaimed.length > 0 ? ` [${plan.reclaimed.join(', ')}]` : '') +
+              `, gaps [${gaps.join(', ')}]`,
+          );
         }
-        // Plan summary: slots allocated / reclaimed / gaps.
-        const assigned = plan.assignments.map((a) => a.slot);
-        const gaps = [1, 2, 3, 4, 5, 6, 7].filter((s) => !assigned.includes(s));
-        log(
-          'inf',
-          `module plan: ${assigned.length} slot(s) allocated` +
-            (assigned.length > 0 ? ` [${assigned.join(', ')}]` : '') +
-            `, ${plan.reclaimed.length} reclaimed` +
-            (plan.reclaimed.length > 0 ? ` [${plan.reclaimed.join(', ')}]` : '') +
-            `, gaps [${gaps.join(', ')}]`,
-        );
       }
       // Snapshot iteration: settings ops self-remove from d.ops on ACK.
       for (const o of [...d.ops]) {

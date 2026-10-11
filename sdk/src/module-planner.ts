@@ -36,7 +36,12 @@
 import type { ModuleType } from './module-fields';
 import { MODULE_TYPE_CODE } from './module-wire';
 import type { ModuleTypeCode } from './module-wire';
-import { BAY_POSITIONS, bayRecord, encodeBlankConfig, encodeListDelete } from './module-wire';
+import {
+  BAY_POSITIONS, bayRecord, encodeBlankConfig, encodeListAdd, encodeListDelete,
+  encodeModuleConfig,
+} from './module-wire';
+import { compareRecords, overlay } from './module-profiles';
+import type { ConfigRecords, ModuleProfile } from './module-profiles';
 
 /** A profile to place: id + module type + optional capture origin. */
 export interface PlanProfile {
@@ -68,16 +73,19 @@ export interface PlanAssignment {
   listEntry: PlanListEntry;
 }
 
+/** The planner's success result: where each profile lands, which slots
+ * were reclaimed to make room, and where each profile's template records
+ * come from. */
+export interface ModulePlan {
+  assignments: PlanAssignment[];
+  reclaimed: number[];
+  templateSources: Record<string, number | null>;
+}
+
 /** templateSources: per profile, the device slot to read template records
  * from — null when the profile keeps an existing slot (uuid-keep or
  * capture-claim: its records are already there). */
-export type PlanResult =
-  | {
-      assignments: PlanAssignment[];
-      reclaimed: number[];
-      templateSources: Record<string, number | null>;
-    }
-  | { error: string };
+export type PlanResult = ModulePlan | { error: string };
 
 /** The module list's total window (slots 0..7; slot 0 reserved for the
  * blank template). */
@@ -279,6 +287,108 @@ export function orphanGcOps(
   }
   for (const slot of orphans) {
     out.push({ kind: 'blank', slot, payload: encodeBlankConfig(slot) });
+  }
+  return out;
+}
+
+/* --- flash producer (final fix F1): plan → structural wire ops ------------- */
+
+/** One live module slot as the producer sees it: the device-list uuid at
+ * that slot (30/100A as last read) plus its raw config records (30/100B).
+ * This is the module-profile store's per-slot read verdict, flattened to
+ * what the bytes need. */
+export interface LiveSlotState {
+  uuid: string;
+  records: ConfigRecords;
+}
+
+/** One structural op the producer generated, carrying its ready-to-send
+ * wire payload (built through the module-wire encoders — the same bytes
+ * the queue helpers encode). Array order IS send order: list deletes for
+ * reclaimed slots first, then list adds, then per-slot config writes
+ * (slot ascending within each group). */
+export type ModuleOpDesc =
+  | { kind: 'listAdd'; slot: number; entry: PlanListEntry; payload: Uint8Array; label: string }
+  | { kind: 'listDelete'; slot: number; payload: Uint8Array; label: string }
+  | {
+      kind: 'config';
+      slot: number;
+      profileId: string;
+      records: Uint8Array[];
+      payload: Uint8Array;
+      label: string;
+    };
+
+/** Generate the module ops one flash must send to realize `plan` against
+ * the live board, DIFF-BASED — the producer exists so profile edits can
+ * reach the device (before it, the whole landed executor path was dead
+ * code w.r.t. the UI):
+ *   - list DELETEs for `plan.reclaimed` (a slot leaves the list before the
+ *     entry that reuses it is added);
+ *   - list ADDs for assignments whose slot's device uuid is NOT the
+ *     assigned profile id — uuid-keep slots are already labeled; new and
+ *     capture-claimed slots are not (a claimed slot still holds the
+ *     capturedFrom uuid and its entry must be rewritten);
+ *   - per-slot cfg writes ONLY where the profile overlaid onto its
+ *     template differs from the slot's live records (byte truth via the
+ *     shared compare path — zero diff → zero ops). A kept slot's template
+ *     is its own live records; a new slot's is its template-source slot's
+ *     records.
+ * Pure: no device access, no React. The output conforms to the flash
+ * pre-step's drift validator BY CONSTRUCTION (same plan, same encoders). */
+export function planModuleOps(
+  plan: ModulePlan,
+  profiles: readonly ModuleProfile[],
+  liveSlots: Record<number, LiveSlotState>,
+): ModuleOpDesc[] {
+  const byId = new Map(profiles.map((p) => [p.id, p]));
+  const out: ModuleOpDesc[] = [];
+
+  // 1. list deletes — reclaimed slots, ascending.
+  for (const slot of [...plan.reclaimed].sort((a, b) => a - b)) {
+    out.push({
+      kind: 'listDelete',
+      slot,
+      payload: encodeListDelete(slot),
+      label: `reclaim module slot ${slot}`,
+    });
+  }
+
+  // 2. list adds — slots whose uuid is not the assigned profile's.
+  const ordered = [...plan.assignments].sort((a, b) => a.slot - b.slot);
+  for (const a of ordered) {
+    const live = liveSlots[a.slot];
+    if (live !== undefined && live.uuid === a.profileId) continue; // uuid-keep
+    const name = byId.get(a.profileId)?.name ?? a.profileId;
+    out.push({
+      kind: 'listAdd',
+      slot: a.slot,
+      entry: a.listEntry,
+      payload: encodeListAdd(a.listEntry.slot, a.listEntry.id, a.listEntry.flag, a.listEntry.uuid16),
+      label: `assign module slot ${a.slot} → "${name}"`,
+    });
+  }
+
+  // 3. per-slot config writes — only where the overlay differs.
+  for (const a of ordered) {
+    const profile = byId.get(a.profileId);
+    if (profile === undefined) continue; // unplanned id — nothing to project
+    const live = liveSlots[a.slot];
+    const src = plan.templateSources[a.profileId];
+    const template =
+      src === null || src === undefined ? live?.records : liveSlots[src]?.records;
+    if (template === undefined) continue; // no live template — nothing to overlay
+    const overlaid = overlay(template, profile, profile.type);
+    if (live !== undefined && compareRecords(overlaid, live.records)) continue; // zero diff
+    const records = [...overlaid.values()];
+    out.push({
+      kind: 'config',
+      slot: a.slot,
+      profileId: a.profileId,
+      records,
+      payload: encodeModuleConfig(a.slot, records),
+      label: `write module slot ${a.slot} config ("${profile.name}")`,
+    });
   }
   return out;
 }

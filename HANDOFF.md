@@ -348,8 +348,9 @@ refs for `special:1` — an imported MO(2) is counted `unknown` on re-export
    explicit user pick — safe by construction).
 3. Bigger backlog (unranked): LED strips/bays UI coverage (74-96) — done,
    Phase 3 (item 5); module gesture editing beyond donor-copy (blocked by
-   1-byte payload same-length rule), macros (wire format still unknown —
-   NayaFlow `macro_data` param exists, nothing decoded).
+   1-byte payload same-length rule) — done, Phase 5b (item 8), macros (wire
+   format still unknown — NayaFlow `macro_data` param exists, nothing
+   decoded).
 4. **Layer management + lighting restore (Phase 2)** — ✅ DONE 2026-10-10
    (commits 20c04e7..d853965 + the docs commit marking this). Dynamic 0-7
    layer window: inventory parse + add/delete/restore encoders

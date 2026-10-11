@@ -20,14 +20,22 @@
  * the halves ('A - B', minus first).
  *
  * Invert: axis rows only, TRACK profiles only, never while split (a split
- * binds the halves outright — there is nothing left to swap). */
+ * binds the halves outright — there is nothing left to swap).
+ *
+ * Unsplit guard: a dial whose halves hold non-key bindings (mouse M1-M5,
+ * value, shortcut) must NOT merge — the rebuild would produce a combined
+ * 'M1 - M2' code typed as a key pair, keypressBody resolves null for it,
+ * and the flash would write zero pair fields with no drift badge to tell
+ * the user. The unsplit control is disabled while either half is non-key;
+ * rebinding both halves to keys re-enables it. Axis rows are exempt: their
+ * close rebuilds the remembered motion pair, never the halves' strings. */
 
 import { useState } from 'react';
 import { Badge } from '../../ui/badge';
 import { Button } from '../../ui/button';
 import { Checkbox } from '../../ui/checkbox';
 import { AXIS_HALVES, FIRMWARE_DEFAULTS, splitPair } from '@create-reflow/sdk';
-import type { DiffRow, ModuleType, ProfileBinding } from '@create-reflow/sdk';
+import type { DiffRow, ModuleType, ProfileBinding, SplitHalf } from '@create-reflow/sdk';
 import type { BindingEdit } from '../../../hooks/useModuleProfiles';
 import { describeBinding, driftDeviceLabel, fieldsOfGesture } from './bindings';
 import type { GestureRowModel } from './bindings';
@@ -74,6 +82,18 @@ export default function GestureRow({
   const showInvert = row.kind === 'axis' && type === 'TRACK' && !splitOpen;
   const value = describeBinding(binding);
   const drift = live.drift.get(row.gesture) ?? null;
+  // Unsplit guard (dial only — axis close rebuilds the motion pair, never
+  // the halves): a half bound to a non-key action (mouse M1-M5, value,
+  // shortcut, LED) would merge into a dead combined 'M1 - M2' key pair —
+  // keypressBody resolves null for it, so the flash writes nothing and no
+  // drift badge ever fires. Disable the unsplit control; the tooltip says
+  // the way out. An UNBOUND half (undefined — written empty) merges fine:
+  // splitPair handles the missing side.
+  const halfKeyish = (h: SplitHalf | undefined) =>
+    h === undefined || h.actionType === 'key' || h.actionType === 'modifier';
+  const unsplitBlocked =
+    splitOpen && !half &&
+    !(halfKeyish(binding?.split?.['-']) && halfKeyish(binding?.split?.['+']));
 
   function toggleSplit(checked: boolean) {
     if (busy) return;
@@ -165,10 +185,20 @@ export default function GestureRow({
             </label>
           )}
           {showSplit && (
-            <label className="flex cursor-pointer items-center gap-1 text-xs text-muted-foreground">
+            <label
+              className={cn(
+                'flex items-center gap-1 text-xs text-muted-foreground',
+                !unsplitBlocked && 'cursor-pointer',
+              )}
+              title={
+                unsplitBlocked
+                  ? 'halves with non-key bindings (e.g. mouse M1-M5) cannot merge into a key pair — keep split or rebind both halves to keys'
+                  : undefined
+              }
+            >
               <Checkbox
                 checked={splitOpen}
-                disabled={busy}
+                disabled={busy || unsplitBlocked}
                 onCheckedChange={(v) => toggleSplit(v === true)}
               />
               Split

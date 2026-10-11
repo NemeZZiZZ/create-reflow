@@ -60,7 +60,7 @@ import {
   parseModuleProfileFile, buildModuleProfileFile,
 } from '@create-reflow/sdk';
 import {
-  planModuleLayout, missingBaseBays, orphanGcOps,
+  planModuleLayout, planModuleOps, missingBaseBays, orphanGcOps,
   queueModuleConfig, queueModuleListAdd, queueModuleListDelete, queueBayAssignment,
 } from '@create-reflow/sdk';
 import {
@@ -3930,6 +3930,139 @@ void (async () => {
     true,
     '61 chunkBudget↔stats parity: a 5B moduleList delete counts 1 frame — same formula',
   );
+}
+
+// §62 module flash producer (final fix F1): planModuleOps turns a plan +
+// the live slot records into the structural ops the flash pre-step injects
+// into the draft — list deletes for reclaimed slots, list adds where the
+// slot's device uuid is not the assigned profile id (uuid-keep slots are
+// already labeled; capture-claimed slots still hold capturedFrom), and
+// per-slot config writes ONLY where the profile overlaid onto its template
+// differs from the live records (byte truth via compareRecords; zero diff
+// → zero ops). Payload bytes ride the §57 encoders; op shapes are exactly
+// what the useFlash drift validator accepts, and the landed queue helpers
+// re-encode to the same bytes.
+{
+  const U62 = {
+    a: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaa0001', // TRACK profile, on board at slot 3
+    b: 'bbbbbbbbbbbbbbbbbbbbbbbbbbbb0002', // TUNE profile, planned onto slot 4
+    c: 'cccccccccccccccccccccccccccc0003', // old TUNE module on slot 2 (template source)
+    d: 'dddddddddddddddddddddddddddd0004', // old module on slot 4 (reclaimed)
+  };
+  const bytes62 = (u: string) => (u.match(/../g) ?? []).join(' ');
+
+  const profA62 = {
+    id: U62.a, name: 'Fix A', type: 'TRACK' as const,
+    settings: { pointer_speed: 10, scroll_speed: 10, pointer_accel: 50, pointer_accel_on: 1 },
+    bindings: { 'tap:track:button_1': { actionType: 'mouse', actionCode: 'M1' } },
+  };
+  // Slot 3's live records = the projection of profA62 + one unmodeled
+  // record overlay must carry through untouched.
+  const liveA62 = overlay(new Map<number, Uint8Array>(), profA62, 'TRACK');
+  liveA62.set(0x2a, Uint8Array.from([0x2a, 0x00, 0x00]));
+  const live62 = { 3: { uuid: U62.a, records: liveA62 } };
+  const plan62 = {
+    assignments: [{
+      profileId: U62.a, slot: 3,
+      listEntry: { slot: 3, id: 3, flag: MODULE_TYPE_CODE.TRACK, uuid16: U62.a },
+    }],
+    reclaimed: [] as number[],
+    templateSources: { [U62.a]: null } as Record<string, number | null>,
+  };
+
+  /* --- uuid-keep + zero diff → zero ops ------------------------------------ */
+  const none62 = planModuleOps(plan62, [profA62], live62);
+  eq(none62.length, 0, '62 zero-diff keep: a uuid-kept byte-identical slot generates ZERO ops');
+  eq(none62.some((o) => o.kind === 'config'), false,
+    '62 zero-diff keep: no cfg op where the overlay equals the live records');
+
+  /* --- kept slot with an overlay diff → one cfg op, bytes pinned ----------- */
+  const profA2_62 = { ...profA62, settings: { ...profA62.settings, pointer_speed: 20 } };
+  const cfg62 = planModuleOps(plan62, [profA2_62], live62);
+  eq(cfg62.length, 1, '62 cfg diff: exactly one op for an edited kept slot');
+  eq(cfg62[0].kind === 'config' && cfg62[0].slot === 3, true,
+    '62 cfg diff: the op is a config write at the kept slot');
+  eq(cfg62[0].kind === 'config' && toHex(cfg62[0].payload),
+    '03 00 01 01 14 01 01 01 0a 02 01 01 32 03 01 01 01 0b 0f 08 03 00 00 00 01 00 00 00 2a 00 00',
+    '62 cfg diff: payload = slot byte + overlaid records (speed 20=0x14, M1 mask, unmodeled 2a carried)');
+  eq(cfg62[0].kind === 'config' && cfg62[0].records.length, 6,
+    '62 cfg diff: the desc carries 6 records (4 settings + M1 mask + unmodeled)');
+
+  /* --- reclaim + new slot: delete → add → cfg, in send order --------------- */
+  const profB62 = {
+    id: U62.b, name: 'Fix B', type: 'TUNE' as const,
+    settings: {
+      pointer_speed: 10, scroll_speed: 10, pointer_accel: 50, pointer_accel_on: 1,
+      ticks_per_rotation: 72, tick_strength: 75, toggle_ticks: 1,
+    },
+    bindings: {},
+  };
+  const tuneRecs62 = overlay(new Map<number, Uint8Array>(), profB62, 'TUNE');
+  const junk62 = new Map<number, Uint8Array>([
+    [0x00, Uint8Array.from([0x00, 0x07, 0x00])],
+    [0x01, Uint8Array.from([0x01, 0x01, 0x63])],
+  ]);
+  const planB62 = {
+    assignments: [{
+      profileId: U62.b, slot: 4,
+      listEntry: { slot: 4, id: 4, flag: MODULE_TYPE_CODE.TUNE, uuid16: U62.b },
+    }],
+    reclaimed: [4],
+    templateSources: { [U62.b]: 2 } as Record<string, number | null>,
+  };
+  const gen62 = planModuleOps(planB62, [profB62], {
+    2: { uuid: U62.c, records: tuneRecs62 },
+    4: { uuid: U62.d, records: junk62 },
+  });
+  eq(gen62.length, 3, '62 reclaim: three ops (delete, add, cfg)');
+  eq(`${gen62[0].kind}/${gen62[1].kind}/${gen62[2].kind}`, 'listDelete/listAdd/config',
+    '62 reclaim: send order is delete → add → cfg');
+  eq(gen62[0].kind === 'listDelete' && gen62[0].slot === 4 && toHex(gen62[0].payload) === '00 04 00 00 00',
+    true, '62 reclaim: delete payload is the captured 00 [slot] 00 00 00 form');
+  eq(gen62[1].kind === 'listAdd' && gen62[1].entry.slot === 4 && gen62[1].entry.id === 4 &&
+      gen62[1].entry.flag === MODULE_TYPE_CODE.TUNE && gen62[1].entry.uuid16 === U62.b,
+    true, '62 reclaim: add entry mirrors slot, TUNE flag, profile uuid');
+  eq(gen62[1].kind === 'listAdd' &&
+      toHex(gen62[1].payload) === `00 04 04 02 10 ${bytes62(U62.b)}`,
+    true, '62 reclaim: add payload is the captured 00 [slot][id][flag] 10 <uuid16> form');
+  eq(gen62[2].kind === 'config' && toHex(gen62[2].payload),
+    '04 00 01 01 0a 01 01 01 0a 02 01 01 32 03 01 01 01 05 01 01 05 06 01 01 4b 07 01 01 01',
+    '62 reclaim: cfg payload = slot 4 + template-overlaid TUNE records (72 detents → wire 5)');
+
+  /* --- byte-equal reused slot: delete + add but NO cfg (zero diff) --------- */
+  const same62 = planModuleOps(planB62, [profB62], {
+    2: { uuid: U62.c, records: tuneRecs62 },
+    4: { uuid: U62.d, records: new Map(tuneRecs62) },
+  });
+  eq(same62.length, 2, '62 zero-diff reuse: byte-equal slot → delete + add only');
+  eq(same62.some((o) => o.kind === 'config'), false,
+    '62 zero-diff reuse: no cfg op even though the slot changes identity');
+
+  /* --- shapes the flash pre-step's drift validator accepts + the landed
+       queue helpers re-encode to the same bytes ----------------------------- */
+  eq(gen62.every((o) =>
+    (o.kind === 'listAdd' && o.payload.length === 21 && o.payload[4] === 0x10) ||
+    (o.kind === 'listDelete' && o.payload.length === 5 && o.payload[2] === 0 && o.payload[3] === 0 && o.payload[4] === 0) ||
+    (o.kind === 'config' && o.payload[0] === o.slot),
+  ), true, '62 shapes: add 21B with 0x10 marker, delete 5B zeros, cfg opens with the slot byte');
+  eq(gen62[1].kind === 'listAdd' && toHex(gen62[1].payload.slice(5)) === toHex(uuidToBytes(gen62[1].entry.uuid16)),
+    true, '62 shapes: add carries the entry uuid16 bytes verbatim (drift validator equality)');
+  eq(planB62.reclaimed.includes(gen62[0].slot), true,
+    '62 shapes: delete targets a slot the plan reclaims (drift validator allow-list)');
+  const d62 = new Draft();
+  for (const op of gen62) {
+    if (op.kind === 'listAdd') queueModuleListAdd(d62, op.entry, op.label);
+    else if (op.kind === 'listDelete') queueModuleListDelete(d62, op.slot, op.label);
+    else queueModuleConfig(d62, op.slot, op.records, op.label);
+  }
+  eq(`${d62.ops[0].kind},${d62.ops[1].kind},${d62.ops[2].kind}`,
+    'moduleList,moduleList,moduleCfg',
+    '62 injection: the landed queue helpers file the ops as moduleList/moduleList/moduleCfg');
+  eq(d62.ops.length === 3 &&
+      toHex(d62.ops[0].payload) === toHex(gen62[0].payload) &&
+      toHex(d62.ops[1].payload) === toHex(gen62[1].payload) &&
+      toHex(d62.ops[2].payload) === toHex(gen62[2].payload),
+    true, '62 injection: queue-helper payloads are byte-identical to the producer payloads');
 }
 
 void main();
