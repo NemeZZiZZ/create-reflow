@@ -5,15 +5,22 @@
  * whole session (an interleaved cmd() would flush the RX buffer and
  * destroy queued events), so start() refuses while a flash/dump/read is in
  * flight (busyRef) or while the draft queue is non-empty, then holds
- * busyRef.current true until the listen settles. The SDK listener holds
- * its own tail mutex for the same span — this ref is the client-side half.
+ * busyRef.current true until the session settles. The SDK listener holds
+ * its own tail mutex within each window — this ref is the client-side
+ * half, held across ALL windows.
+ *
+ * Windows: the session is a persistent toggle — the runner renews
+ * keyscanListen in a loop of LISTEN_WINDOW_MS windows (each window keeps
+ * the SDK's safety deadline); the loop exits only via the abort flag, and
+ * a reader error throws out of the loop (no renewal after an error).
  *
  * Exits: the SDK listener ALWAYS sends fe/1008 OFF in its own finally —
  * the hook never sends OFF itself. Aborts ride the listener's caller-abort
- * channel (a throw from onEvent ends the stream): Escape and unmount set
- * an abort flag, and the next event (or the deadline) ends the session.
- * A dead port surfaces as a reader error the SDK rethrows after OFF;
- * caught here → toast + error log (auto-exit on disconnect).
+ * channel (a throw from onEvent ends the window): Escape and unmount set
+ * an abort flag, and the next event (or the current window's deadline,
+ * ≤10 s) ends the session — the loop then sees the flag and does not
+ * renew. A dead port surfaces as a reader error the SDK rethrows after
+ * OFF; caught here → toast + error log (auto-exit on disconnect).
  */
 
 import { useCallback, useEffect, useRef, useState } from 'react';
@@ -35,6 +42,11 @@ export interface KeyscanEvent {
 /** Live-tail length: the panel shows the last ~64 events, older fall off. */
 const EVENTS_TAIL = 64;
 
+/** One listen-window length: each keyscanListen call keeps the SDK's 10 s
+ * safety deadline, but the hook renews the window until aborted — test
+ * mode is a persistent toggle, not a silent 10 s timer (final review). */
+const LISTEN_WINDOW_MS = 10_000;
+
 export function useKeyscan({
   sesRef,
   busyRef,
@@ -54,7 +66,8 @@ export function useKeyscan({
   const [running, setRunning] = useState(false);
   const [events, setEvents] = useState<KeyscanEvent[]>([]);
   // Caller-abort flag: set by stop()/Escape/unmount, the next onEvent
-  // throws on it and the SDK listener ends the stream (OFF in its finally).
+  // throws on it, the SDK listener ends the window (OFF in its finally)
+  // and the renew-loop check refuses to open another one.
   const abortRef = useRef(false);
   // Mirrors `running` inside the async runner (re-entry guard before state
   // commits, same pattern as connRef in useSessions).
@@ -76,8 +89,8 @@ export function useKeyscan({
   }, [running, stop]);
 
   // Unmount auto-exit: flag the abort; the listener still holds busyRef
-  // until the stream actually ends (next event or deadline) so no other
-  // traffic can slip in under it. Bounded by the listen duration.
+  // until the current window actually ends (next event or deadline) so no
+  // other traffic can slip in under it. Bounded by the window (≤10 s).
   useEffect(
     () => () => {
       abortRef.current = true;
@@ -86,7 +99,7 @@ export function useKeyscan({
   );
 
   const start = useCallback(
-    (durationMs?: number) => {
+    () => {
       if (runningRef.current) {
         toast.warning('Keyscan test already running');
         return;
@@ -115,31 +128,41 @@ export function useKeyscan({
       log('inf', `keyscan: test mode ON (${side}) — other device traffic locked`);
       void (async () => {
         try {
-          await ses.keyscanListen((ev) => {
-            // Caller-abort channel: a throw here ends the stream; the
-            // listener's finally sends OFF either way.
-            if (abortRef.current) throw new Error('aborted');
-            setPressed((prev) => {
-              const next = new Set(prev);
-              const key = `${ev.row}:${ev.col}`;
-              if (ev.pressed) next.add(key);
-              else next.delete(key);
-              return next;
-            });
-            setEvents((prev) => {
-              const next = [
-                ...prev,
-                { row: ev.row, col: ev.col, pressed: ev.pressed, t: Date.now() },
-              ];
-              return next.length > EVENTS_TAIL
-                ? next.slice(next.length - EVENTS_TAIL)
-                : next;
-            });
-            log(
-              'inf',
-              `keyscan ${side}: r${ev.row} c${ev.col} ${ev.pressed ? 'PRESS' : 'RELEASE'}`,
-            );
-          }, durationMs === undefined ? undefined : { durationMs });
+          // Renew-loop: each window is the SDK's 10 s safety bound, but the
+          // session is a persistent toggle — windows renew until
+          // stop()/Escape/unmount set the abort flag. busyRef is held
+          // across ALL windows (set above, released once in the finally);
+          // between windows the SDK mutex is briefly free — harmless,
+          // busyRef still blocks all other client traffic. A reader error
+          // throws out of the loop: no renewal after an error.
+          while (!abortRef.current) {
+            await ses.keyscanListen((ev) => {
+              // Caller-abort channel: a throw here ends the window; the
+              // listener's finally sends OFF either way, and the loop
+              // check then refuses to renew.
+              if (abortRef.current) throw new Error('aborted');
+              setPressed((prev) => {
+                const next = new Set(prev);
+                const key = `${ev.row}:${ev.col}`;
+                if (ev.pressed) next.add(key);
+                else next.delete(key);
+                return next;
+              });
+              setEvents((prev) => {
+                const next = [
+                  ...prev,
+                  { row: ev.row, col: ev.col, pressed: ev.pressed, t: Date.now() },
+                ];
+                return next.length > EVENTS_TAIL
+                  ? next.slice(next.length - EVENTS_TAIL)
+                  : next;
+              });
+              log(
+                'inf',
+                `keyscan ${side}: r${ev.row} c${ev.col} ${ev.pressed ? 'PRESS' : 'RELEASE'}`,
+              );
+            }, { durationMs: LISTEN_WINDOW_MS });
+          }
         } catch (e) {
           // Dead port / mid-stream reader failure — the SDK has already
           // sent OFF before rethrowing.
@@ -147,11 +170,14 @@ export function useKeyscan({
           toast.error(`Keyscan test ended with an error: ${msg}`);
           log('err', `keyscan ${side}: ${msg}`);
         } finally {
+          // Exactly one release for the whole session, on every path.
           const aborted = abortRef.current;
           runningRef.current = false;
           abortRef.current = false;
           busyRef.current = false;
           setRunning(false);
+          // 'stopped' = user/unmount abort (the only normal exit of the
+          // renew-loop); 'ended' now means an error path.
           log(
             'inf',
             `keyscan: test mode OFF (${side}) — ${aborted ? 'stopped' : 'ended'}, traffic unlocked`,

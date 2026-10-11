@@ -839,7 +839,24 @@ export class NayaSession {
           }
         }
         if (f.type !== 0xfe || f.c0 !== 0x10 || f.c1 !== 0x09) continue;
-        if (f.payload.length < 3) continue; // row/col/state all required
+        if (f.payload.length < 3) {
+          // Short frame — row/col/state all required. Logged and skipped,
+          // symmetric with the extra-bytes note below.
+          try {
+            this.ioLog.push({
+              dir: '<',
+              type: f.type,
+              c0: f.c0,
+              c1: f.c1,
+              len: 0,
+              hex: '',
+              err: `keyscan frame too short (${f.payload.length} byte(s)) — skipped`,
+            });
+          } catch {
+            /* observational */
+          }
+          continue;
+        }
         if (f.payload.length > 3) {
           // Extra bytes: logged, never parsed (OF first-3-bytes parity).
           try {

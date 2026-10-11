@@ -327,6 +327,10 @@ export default function BindingsTab({
           </CardHeader>
           <CardContent>
             <p className="mb-2 text-xs text-muted-foreground">{HEDGE_COPY}</p>
+            <p className="mb-2 text-xs text-muted-foreground">
+              Keys report from the left half only — the left port owns the
+              keymap/data plane.
+            </p>
             {keyscan.events.length === 0 ? (
               <p className="text-xs text-muted-foreground">
                 Press keys on the keyboard — wire events (row/column,
