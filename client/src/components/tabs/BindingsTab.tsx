@@ -10,16 +10,37 @@ import LayoutTable, { type MergedRow } from "../LayoutTable";
 import SelectionPanel from "../SelectionPanel";
 import { ACTIONS, buildRecord, type ActionDef } from '@create-reflow/sdk';
 import { behaviorSetOf, hidPairOf, type BehaviorSet, type Slot } from '@create-reflow/sdk';
+import type { NayaSession, Side } from '@create-reflow/sdk';
 import { POS_KEY } from "../../lib/kb-data";
 import { shortLabel } from "../../lib/key-icon-map";
 import type { KeyRec, LayerEntry } from '@create-reflow/sdk';
 import { hex2 } from '@create-reflow/sdk';
 import { X } from "lucide-react";
 import type { HsColor } from "../../hooks/useCustomColors";
+import type { LogFn } from "../../hooks/useLog";
+import { useKeyscan } from "../../hooks/useKeyscan";
 import type { SelKey } from '@create-reflow/sdk';
 import type { EditorView } from "../ViewLayerTabs";
 import type { useModuleProfiles } from "../../hooks/useModuleProfiles";
 import BayPicker from "./modules/BayPicker";
+import { Button } from "../ui/button";
+import { Card, CardContent, CardHeader, CardTitle } from "../ui/card";
+
+// KK-keyed test-press overlay for the Keyboard: stays EMPTY until a
+// verified row/col→KK mapping exists (Phase-10 probe) — guessing a matrix
+// is forbidden, the raw row/col panel below carries the live truth.
+const PRESSED_KKS_EMPTY: ReadonlySet<number> = new Set();
+
+// Mandated hedge copy, verbatim (plan T4 / T3-review carry).
+const HEDGE_COPY =
+  "Test mode locks other device traffic; keys may still reach your computer.";
+
+/** Wall-clock stamp for one raw keyscan event, ms precision. */
+function clockTime(t: number): string {
+  const d = new Date(t);
+  const p = (n: number, w = 2) => String(n).padStart(w, "0");
+  return `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}.${p(d.getMilliseconds(), 3)}`;
+}
 
 export default function BindingsTab({
   view,
@@ -65,6 +86,10 @@ export default function BindingsTab({
   onSetNote,
   ledCount,
   modules,
+  sesRef,
+  busyRef,
+  draftSize,
+  log,
 }: {
   view: EditorView;
   onView: (v: EditorView) => void;
@@ -123,6 +148,12 @@ export default function BindingsTab({
   /** module-profile store: the per-layer bay picker edits it through
    * setBay (Task 4) — the hook queues the wire ops. */
   modules: ReturnType<typeof useModuleProfiles>;
+  /** live keyscan test session (left half) — the hook owns the safety
+   * exits and the raw event tail */
+  sesRef: React.RefObject<Map<Side, NayaSession>>;
+  busyRef: React.RefObject<boolean>;
+  draftSize: number;
+  log: LogFn;
 }) {
   // Right-click context popover target (keymap mode only; LED paint mode
   // keeps its own pointer semantics).
@@ -148,6 +179,24 @@ export default function BindingsTab({
     }
     return m;
   }, [notes, layer]);
+
+  // Keyscan live test (phase 7): the hook owns pressed state + safety exits
+  // (Escape, unmount, errors all end the session); this component renders
+  // the toggle and the raw row/col tail. The keymap editor is the LEFT half.
+  const keyscan = useKeyscan({ sesRef, busyRef, draftSize, side: "left", log });
+  // busyRef is non-reactive by design — its flips land mid-render only via
+  // collateral state changes (flashing, dumpStat …); start() re-checks with
+  // a toast, so this gate is UI affordance, not the safety mechanism. While
+  // a session runs the hook holds busyRef, so the disabled gate must not
+  // apply — unticking the toggle is one of the ways to stop.
+  const testKeysDisabled = !keyscan.running && (draftSize > 0 || busyRef.current);
+  const testKeysHint = keyscan.running
+    ? HEDGE_COPY
+    : draftSize > 0
+      ? "Flash or discard the queued changes first — test mode locks other device traffic."
+      : busyRef.current
+        ? "Device busy — wait for the current operation to finish."
+        : HEDGE_COPY;
 
   function hidLabel(hid: number): string {
     const a = ACTIONS.find(
@@ -206,6 +255,11 @@ export default function BindingsTab({
           onDump={onDump}
           ledMode={ledMode}
           onLedMode={onLedMode}
+          testKeys={keyscan.running}
+          onTestKeys={(v) => (v ? keyscan.start() : keyscan.stop())}
+          testKeysDisabled={testKeysDisabled}
+          testKeysHint={testKeysHint}
+          pressedKks={PRESSED_KKS_EMPTY}
           kbBoxRef={kbBoxRef}
           kbStageRef={kbStageRef}
           kbScale={kbScale}
@@ -239,6 +293,71 @@ export default function BindingsTab({
           onToggleKk={(kk) => toggleKk(layer, kk)}
           onToggleAll={() => toggleAllRowKks(layer, rows.map((r) => r.kk))}
         />
+      )}
+
+      {/* Raw keyscan tail (phase 7): the wire row/col is the only truth —
+          no KK mapping exists, so the caps overlay stays empty. The tail
+          stays visible after stop for review; the live badge is the only
+          running indicator (no pressed-derived implication once stopped). */}
+      {(keyscan.running || keyscan.events.length > 0) && (
+        <Card className="mb-3">
+          <CardHeader className="flex-wrap">
+            <CardTitle>
+              Keyscan test — raw rows/columns
+              {keyscan.running ? (
+                <span className="ml-2 inline-flex items-center gap-1.5 text-xs font-normal text-green-300">
+                  <span className="inline-block size-1.5 animate-pulse rounded-full bg-green-400" />
+                  live
+                </span>
+              ) : (
+                <span className="ml-2 text-xs font-normal text-muted-foreground">
+                  stopped
+                </span>
+              )}
+            </CardTitle>
+            <Button
+              variant="secondary"
+              size="sm"
+              className="ml-auto"
+              disabled={!keyscan.running}
+              onClick={keyscan.stop}
+            >
+              Stop
+            </Button>
+          </CardHeader>
+          <CardContent>
+            <p className="mb-2 text-xs text-muted-foreground">{HEDGE_COPY}</p>
+            {keyscan.events.length === 0 ? (
+              <p className="text-xs text-muted-foreground">
+                Press keys on the keyboard — wire events (row/column,
+                press/release) appear here.
+              </p>
+            ) : (
+              <div className="max-h-56 overflow-y-auto rounded-sm border border-border p-2 font-mono text-xs">
+                {keyscan.events.map((ev, i) => (
+                  <div
+                    key={i}
+                    className="flex items-baseline gap-3 whitespace-nowrap"
+                  >
+                    <span className="text-muted-foreground">
+                      {clockTime(ev.t)}
+                    </span>
+                    <span>
+                      row {ev.row} · col {ev.col}
+                    </span>
+                    <span
+                      className={
+                        ev.pressed ? "text-green-300" : "text-muted-foreground"
+                      }
+                    >
+                      {ev.pressed ? "PRESS" : "RELEASE"}
+                    </span>
+                  </div>
+                ))}
+              </div>
+            )}
+          </CardContent>
+        </Card>
       )}
 
       {/* Per-layer bay picker (Task 4): layer context exists here in both

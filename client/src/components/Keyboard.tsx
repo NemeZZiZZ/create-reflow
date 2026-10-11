@@ -92,9 +92,11 @@ interface KeyProps {
   onContext?: (kk: number, x: number, y: number) => void;
   /** host-side note for this key (UHK corner-marker pattern) */
   note?: string;
+  /** live test-mode press on this KK */
+  pressed?: boolean;
 }
 
-function Key({ pos, rec, led, ledMode, selected, dirty, onSelect, onPaintDown, onPaintEnter, onPaintClick, onContext, note }: KeyProps) {
+function Key({ pos, rec, led, ledMode, selected, dirty, pressed, onSelect, onPaintDown, onPaintEnter, onPaintClick, onContext, note }: KeyProps) {
   const kk = pos; // positionId == KK index (proven: 0=Esc/LA1, 0x30=Z/LC4 …)
   const label = rec ? shortLabel(rec) : (POS_KEY[String(pos)] ?? "");
   // action glyph for non-standard keys (currentColor => follows legend color);
@@ -104,9 +106,18 @@ function Key({ pos, rec, led, ledMode, selected, dirty, onSelect, onPaintDown, o
   // LED fills get readability-driven ink + (when selected) a max-delta ring
   // instead of the hardcoded white-fill selection (UHK a11y pattern).
   const ledFill = ledMode && led ? ledCss(led.h, led.s) : null;
-  const fill = ledFill ?? (selected ? "#ffffff" : "transparent");
-  const ink = ledFill ? readableInk(ledFill) : null;
-  const stroke = ledFill && selected ? contrastStroke(ledFill) : "#E5E1E6";
+  // Test-mode press overlay (KK-keyed; stays EMPTY until a verified
+  // row/col→KK mapping exists — Phase-10 probe): translucent green fill +
+  // ring, winning over LED paint and selection so a live press stays
+  // legible in either mode.
+  const pressedFill = pressed ? "rgba(74, 222, 128, 0.55)" : null; // green-400 @ 55%
+  const fill = pressedFill ?? ledFill ?? (selected ? "#ffffff" : "transparent");
+  const ink = pressedFill ? null : ledFill ? readableInk(ledFill) : null;
+  const stroke = pressedFill
+    ? "#4ade80"
+    : ledFill && selected
+      ? contrastStroke(ledFill)
+      : "#E5E1E6";
   // UHK-style hover tooltip: full action breakdown (slot lines + raw hex),
   // in LED mode the color row leads.
   const desc = rec ? describeRecord(rec) : null;
@@ -166,9 +177,11 @@ function Key({ pos, rec, led, ledMode, selected, dirty, onSelect, onPaintDown, o
           className="kb-key"
           data-pos={pos}
           style={
-            selected && ledFill
-              ? { outline: `2px solid ${contrastStroke(ledFill)}`, outlineOffset: 1 }
-              : undefined
+            pressed
+              ? { outline: "2px solid #4ade80", outlineOffset: 1 }
+              : selected && ledFill
+                ? { outline: `2px solid ${contrastStroke(ledFill)}`, outlineOffset: 1 }
+                : undefined
           }
           onClick={
             onPaintDown
@@ -231,6 +244,8 @@ interface StripDotProps {
   kk: number;
   led?: LedVal;
   selected: boolean;
+  /** live test-mode press on this KK */
+  pressed?: boolean;
   dirty?: boolean;
   onSelect: (
     pos: number,
@@ -251,6 +266,7 @@ function StripDot({
   kk,
   led,
   selected,
+  pressed,
   dirty,
   onSelect,
   onPaintDown,
@@ -266,13 +282,15 @@ function StripDot({
           aria-label={`LED strip ${kk}`}
           className="relative h-4 w-2 shrink-0 rounded-[3px] border border-border hover:brightness-125"
           style={
-            selected && fill
-              ? {
-                  background: fill,
-                  outline: `2px solid ${contrastStroke(fill)}`,
-                  outlineOffset: 1,
-                }
-              : { background: fill ?? "transparent" }
+            pressed
+              ? { background: "#4ade80", outline: "2px solid #4ade80", outlineOffset: 1 }
+              : selected && fill
+                ? {
+                    background: fill,
+                    outline: `2px solid ${contrastStroke(fill)}`,
+                    outlineOffset: 1,
+                  }
+                : { background: fill ?? "transparent" }
           }
           onClick={
             onPaintDown
@@ -350,6 +368,10 @@ interface KeyboardProps {
   onContext?: (kk: number, x: number, y: number) => void;
   /** per-key notes of the viewed layer — amber corner-triangle marker */
   keyNotes?: Map<number, string>;
+  /** KK-keyed live test presses. Stays EMPTY until a verified row/col→KK
+   *  mapping exists (Phase-10 probe) — the caps overlay then shows nothing
+   *  and the raw row/col panel carries the truth. */
+  pressed?: ReadonlySet<number>;
 }
 
 export default function Keyboard({
@@ -365,6 +387,7 @@ export default function Keyboard({
   cursorClass,
   onContext,
   keyNotes,
+  pressed,
 }: KeyboardProps) {
   const paintingRef = useRef(false);
   const lastPtrPaint = useRef(0);
@@ -414,6 +437,7 @@ export default function Keyboard({
       onPaintEnter={paintEnter}
       onPaintClick={paintClick}
       note={keyNotes?.get(pos)}
+      pressed={pressed?.has(pos) ?? false}
       onContext={onPaint ? undefined : onContext}
     />
   );
@@ -433,6 +457,7 @@ export default function Keyboard({
           kk={kk}
           led={ledmap.get(kk)}
           selected={sel.has(kk)}
+          pressed={pressed?.has(kk) ?? false}
           dirty={dirty?.has(kk) ?? false}
           onSelect={pick}
           onPaintDown={paintDown}

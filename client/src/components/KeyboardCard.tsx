@@ -22,6 +22,11 @@ export default function KeyboardCard({
   onDump,
   ledMode,
   onLedMode,
+  testKeys,
+  onTestKeys,
+  testKeysDisabled,
+  testKeysHint,
+  pressedKks,
   kbBoxRef,
   kbStageRef,
   kbScale,
@@ -44,6 +49,17 @@ export default function KeyboardCard({
   onDump: () => void;
   ledMode: boolean;
   onLedMode: (v: boolean) => void;
+  /** live keyscan test running (the raw row/col panel lives in BindingsTab) */
+  testKeys: boolean;
+  onTestKeys: (v: boolean) => void;
+  /** disabled while the draft queue is non-empty or the device is busy —
+   *  the hook's start() re-checks with a toast (belt and suspenders) */
+  testKeysDisabled: boolean;
+  /** toggle tooltip: why it's disabled, or the running hedge copy */
+  testKeysHint: string;
+  /** KK-keyed test-press overlay for the Keyboard (empty today — no
+   *  verified row/col→KK mapping exists) */
+  pressedKks?: ReadonlySet<number>;
   kbBoxRef: React.RefObject<HTMLDivElement | null>;
   kbStageRef: React.RefObject<HTMLDivElement | null>;
   kbScale: number;
@@ -82,6 +98,18 @@ export default function KeyboardCard({
             onCheckedChange={(v) => onLedMode(v === true)}
           />
           <Label htmlFor="ledmode">LED colors on keys</Label>
+          <span
+            className="ml-2 inline-flex items-center gap-1.5"
+            title={testKeysHint}
+          >
+            <Checkbox
+              id="testkeys"
+              checked={testKeys}
+              onCheckedChange={(v) => onTestKeys(v === true)}
+              disabled={testKeysDisabled}
+            />
+            <Label htmlFor="testkeys">Test keys</Label>
+          </span>
         </ViewLayerTabs>
       </CardHeader>
       <CardContent>
@@ -102,15 +130,18 @@ export default function KeyboardCard({
               onSelect={onSelect}
               disabled={!leftOn}
               dirty={dirtyKks}
+              pressed={pressedKks}
               onContext={onContext}
               keyNotes={keyNotes}
             />
           </div>
         </div>
         <p className="mt-2 text-xs text-muted-foreground">
-          {leftOn
-            ? "Click a key to select it, Shift+click for multi-select, Alt+click selects the key on all layers. Right-click a key to configure it in place — or use the panel below. Changes queue up, nothing writes until Flash."
-            : "Connect the LEFT half — legends and colors load automatically."}
+          {testKeys
+            ? "Test mode locks other device traffic; keys may still reach your computer. Escape stops the session."
+            : leftOn
+              ? "Click a key to select it, Shift+click for multi-select, Alt+click selects the key on all layers. Right-click a key to configure it in place — or use the panel below. Changes queue up, nothing writes until Flash."
+              : "Connect the LEFT half — legends and colors load automatically."}
         </p>
       </CardContent>
     </Card>

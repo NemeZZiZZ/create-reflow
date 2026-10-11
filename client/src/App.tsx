@@ -851,6 +851,10 @@ export default function App() {
               }}
               ledCount={ledsByLayer[layer]?.length ?? 0}
               modules={moduleProfiles}
+              sesRef={sesRef}
+              busyRef={busyRef}
+              draftSize={draftSize}
+              log={log}
             />
           )}
 
