@@ -254,8 +254,8 @@ build, host-table name resolution); file gate: `sdk/src/importers.ts`
   `BayAssignment`), op types in `sdk/src/draft.ts` (`ModuleCfgOp`/
   `ModuleListOp`); read side in `module-read.ts` (30/1009 `parseModuleList`,
   `matchSlots` content match, `captureFromSlots` capture-on-read,
-  `repointBays`). **5a core done — 5b UI pending** (ModulesTab editing, bay
-  picker, flash dispatch, import/export).
+  `repointBays`). 5a core done — the 5b UI followed the same day (next
+  bullet).
   - **ADDRESSING PIN**: the module verbs 30/1009/100A/100B/100C all take
     their addressing bytes from the single `MODULE_ADDR` seam in
     `sdk/src/module-wire.ts`, whose live-proven `[0x00, index]` convention
@@ -269,6 +269,35 @@ build, host-table name resolution); file gate: `sdk/src/importers.ts`
     `sdk/src/stock-module-profiles.source.json` are verbatim vendored copies
     with attribution (same pattern as `host-table.source.txt`) — pure
     reference, never imported at runtime.
+
+- **Module profiles UI (Phase 5b, 2026-10-11)**: the store + editing UI on
+  top of the 5a core. Two localStorage stores on the useCustomColors
+  persistence pattern (lazy validated parse at mount + explicit sync save on
+  every mutation; corrupt JSON degrades to an empty store, never a crash):
+  `naya-module-profiles` (the profile list) and `naya-module-bays`
+  (layer → pos → profile id) in `client/src/hooks/useModuleProfiles.ts`.
+  ModulesTab edits the STORE only — gesture rows incl split/invert and
+  firmware-locked rows, settings "use the keyboard's value" adoption — the
+  Draft receives module ops only from the flash pre-step, which runs when
+  the queue holds module ops: plan the slot layout against the live read
+  verdicts, then read ALL `templateSources` slots (deduped) and overlay the
+  store profiles onto them BEFORE any moduleCfg write goes out (reading
+  after the list write would seed new slots from bytes this same flash is
+  about to overwrite). The module-write ACK gate (`isModuleAck`) is
+  deliberately UNPINNED — no measured 30/100a/100c ACK capture exists yet;
+  the conservative shape (leading 00 or slot echo, 0xEA-guarded) stands
+  until the Phase-10 live probe settles the real bytes.
+  `openflow.module-profile` files import as ALWAYS a new profile (a fresh
+  id is minted — the file's own id would collide with the original entry on
+  round-trips) and report unknown gestures in the success toast (skipped,
+  not fatal; settings-only files are valid); export writes
+  `<name>.openflow-module-profile.json` straight from the store, no device
+  traffic. Bay picks are deferred-until-live: a pick naming a profile not
+  yet on the keyboard is stored but queues nothing — read the keyboard,
+  then re-pick the bay to queue its write (nothing re-runs deferred picks);
+  inherit is refused on layer 0, the queue-time value window is
+  0/0x78/1-7 (ledger drop otherwise), and the base-bay gap warning never
+  blocks a flash.
 
 Known limitation (binding shape): OpenFlow bindings are
 `{behavior, actionType, actionCode, context: null}` — there is no slot for
@@ -348,9 +377,18 @@ refs for `special:1` — an imported MO(2) is counted `unknown` on re-export
    OpenFlow's module-profile system ported at the SDK level: wire encoders +
    the `MODULE_ADDR` addressing seam, vendored field maps + profile model
    (`openflow.module-profile` io), slot planner + module draft ops, and the
-   1009 list read with content-match + capture-on-read. 5a core done —
-   5b UI pending (ModulesTab editing, bay picker, flash dispatch,
-   import/export). See the module profiles note in "Native format" above.
+   1009 list read with content-match + capture-on-read. 5b UI followed the
+   same day (item 8). See the module profiles note in "Native format"
+   above.
+8. **Module profiles UI (Phase 5b)** — ✅ DONE 2026-10-11 (commits
+   874cb4e..60f49a0 + the plan commit 4adf842 + this docs commit). The
+   module phase complete, end to end: the profile store hook with
+   capture-on-read (`naya-module-profiles`/`naya-module-bays` stores), the
+   flash executor's moduleCfg/moduleList dispatch with the template-read
+   ordering pre-step, ModulesTab editing (gesture rows incl split/invert +
+   locked rows, settings adoption), the per-layer bay picker with
+   window/slot-0 guards, and `openflow.module-profile` import/export. See
+   the module profiles notes in "Native format" above.
 
 ## Ecosystem / diplomacy context
 
