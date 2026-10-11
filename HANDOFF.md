@@ -243,6 +243,32 @@ build, host-table name resolution); file gate: `sdk/src/importers.ts`
   one non-throwing case (idempotent write, the restore echo re-sends the
   full table) → partial with a "layer-list write not acked" note.
 
+- **Module profiles (Phase 5a, 2026-10-11)**: OpenFlow's module-profile
+  system ported at the SDK level — the app UI is untouched. Write side:
+  `sdk/src/module-wire.ts` (30/100A list add/delete, 100C blank config, bay
+  records, 483-byte chunk budget) behind the `MODULE_ADDR` addressing seam;
+  vendored field maps + the profile model in `module-fields.ts`/
+  `module-profiles.ts` (overlay/axis/compare, `openflow.module-profile`
+  import/export); slot planner + draft ops in `module-planner.ts`
+  (`queueModuleConfig`/`ListAdd`/`ListDelete`/`BayAssignment`, `ModuleCfgOp`/
+  `ModuleListOp`); read side in `module-read.ts` (30/1009 `parseModuleList`,
+  `matchSlots` content match, `captureFromSlots` capture-on-read,
+  `repointBays`). **5a core done — 5b UI pending** (ModulesTab editing, bay
+  picker, flash dispatch, import/export).
+  - **ADDRESSING PIN**: the module verbs 30/1009/100A/100B/100C all take
+    their addressing bytes from the single `MODULE_ADDR` seam in
+    `sdk/src/module-wire.ts`, whose live-proven `[0x00, index]` convention
+    is the default (100A add/delete open `[0x00, slot]`; the 1009/100B
+    multipart reads send `[part, index]` in the same `[flag, index]` shape;
+    100C's blank config opens with the bare slot byte, as documented there).
+    OpenFlow's captured single-byte `[index]` alternative is recorded in
+    that file's header; a Phase-10 live probe settles which the firmware
+    build expects — if wrong, only that one seam closure moves.
+  - **Vendor provenance**: `sdk/src/module-field-map.source.json` +
+    `sdk/src/stock-module-profiles.source.json` are verbatim vendored copies
+    with attribution (same pattern as `host-table.source.txt`) — pure
+    reference, never imported at runtime.
+
 Known limitation (binding shape): OpenFlow bindings are
 `{behavior, actionType, actionCode, context: null}` — there is no slot for
 behavior parameters, so term ≠ 200 ms and non-zero unknown flag bytes do NOT
@@ -316,6 +342,14 @@ refs for `special:1` — an imported MO(2) is counted `unknown` on re-export
    reads distinguish empty from unsupported/unknown, and verdicts grade as
    ok/cannot-verify/partial/fail. See the flash capability note in
    "Native format" above.
+7. **Module profiles core (Phase 5a)** — ✅ DONE 2026-10-11 (commits
+   d6fa97e..e59db99 + the plan commit 88662a3 + this docs commit).
+   OpenFlow's module-profile system ported at the SDK level: wire encoders +
+   the `MODULE_ADDR` addressing seam, vendored field maps + profile model
+   (`openflow.module-profile` io), slot planner + module draft ops, and the
+   1009 list read with content-match + capture-on-read. 5a core done —
+   5b UI pending (ModulesTab editing, bay picker, flash dispatch,
+   import/export). See the module profiles note in "Native format" above.
 
 ## Ecosystem / diplomacy context
 
