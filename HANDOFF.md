@@ -394,8 +394,11 @@ refs for `special:1` — an imported MO(2) is counted `unknown` on re-export
    7e93199..2f8ac89 + the plan commit 4d92949 + this docs commit). BLE
    verbs (1002/1005/1008/1009/100A/100C) with read-back-verify, the 239B
    be/100C status decode, 4-state pairing verdicts, the fw-keyed
-   negative-only capability cache, a per-session device I/O log, and the
-   Devices-tab BLE slot panel with confirm gating. See the BLE notes below.
+   negative-only capability cache (wired into EVERY client aux read —
+   30s sweep, manual refresh, connect-time — via the shared
+   `client/src/lib/bleCaps.ts` instance), a per-session device I/O log,
+   and the Devices-tab BLE slot panel with confirm gating. See the BLE
+   notes below.
 
 ## BLE notes (Phase 6) — wire provenance & known limitations
 

@@ -17,6 +17,7 @@ import {
 import type { FrameHandler, Side } from '@create-reflow/sdk';
 import { emptyHalf, readAux } from '@create-reflow/sdk';
 import type { HalfSnapshot } from '@create-reflow/sdk';
+import { bleCaps } from '../lib/bleCaps';
 import { usePersistentFlag } from './usePersistentFlag';
 import type { LogFn } from './useLog';
 
@@ -145,7 +146,13 @@ export function useSessions({
         const kept = ses;
         ses = null;
         log('inf', `${side} session up — reading aux…`);
-        setHalf(side, { connected: true, ...(await readAux(kept, side)) });
+        setHalf(
+          side,
+          {
+            connected: true,
+            ...(await readAux(kept, side, undefined, bleCaps)),
+          },
+        );
         if (side === 'left') await autoFetch(kept);
       } catch (e) {
         if (ses) {

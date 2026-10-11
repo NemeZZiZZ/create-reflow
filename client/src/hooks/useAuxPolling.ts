@@ -14,6 +14,7 @@ import { modPresence } from '@create-reflow/sdk';
 import type { NayaSession, Side } from '@create-reflow/sdk';
 import { readAux } from '@create-reflow/sdk';
 import type { HalfSnapshot } from '@create-reflow/sdk';
+import { bleCaps } from '../lib/bleCaps';
 import type { LogFn } from './useLog';
 
 export function useAuxPolling({
@@ -56,7 +57,7 @@ export function useAuxPolling({
             const saved = ses.onFrame;
             ses.onFrame = null;
             try {
-              const aux = await readAux(ses, side, busyRef);
+              const aux = await readAux(ses, side, busyRef, bleCaps);
               setHalves((prev) =>
                 prev[side].connected
                   ? { ...prev, [side]: { ...prev[side], ...aux } }
@@ -143,7 +144,7 @@ export function useAuxPolling({
         const saved = ses.onFrame;
         ses.onFrame = null;
         try {
-          const aux = await readAux(ses, side);
+          const aux = await readAux(ses, side, undefined, bleCaps);
           setHalves((prev) => ({ ...prev, [side]: { ...prev[side], ...aux } }));
           log(
             'inf',
