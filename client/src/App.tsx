@@ -32,6 +32,7 @@ import { useSelection } from "./hooks/useSelection";
 import { useDraft } from "./hooks/useDraft";
 import { useFlash } from "./hooks/useFlash";
 import { useCustomColors } from "./hooks/useCustomColors";
+import { useModuleProfiles } from "./hooks/useModuleProfiles";
 import { useKbFit } from "./hooks/useKbFit";
 import { queueAction, queueBehaviorSet, queueColor, queueFillLayer, queueLayerAdd, queueLayerDelete, pendingLayerAddIdxs, mintLayerUuid, encodeRestorePayload, Draft, type SelKey } from '@create-reflow/sdk';
 import { FLAVOR_BYTES, flavorById, type FlavorId } from '@create-reflow/sdk';
@@ -59,6 +60,12 @@ export default function App() {
   const { logs, logRef, logCats, setLogCats, log, onFrame, clearLogs } =
     useLog();
   const busyRef = useRef(false); // user op in flight (polling yields to it)
+  // useModuleProfiles' live-read verdicts are the one in-memory transient
+  // (profiles + bay picks persist); they clear with the rest of the
+  // left-half state on disconnect. Ref indirection because onLeftCleared
+  // runs inside useSessions while the hook itself (needing its sesRef) is
+  // wired after it — same render-phase ref write as useSessions' autoRef.
+  const clearModuleLiveRef = useRef<() => void>(() => {});
   const [logOpen, toggleLog] = usePersistentFlag("naya-logopen", false);
   // Per-key free-text notes (UHK #8): host-side only — localStorage, carried
   // through exports and auto-backups, never flashed to the device.
@@ -144,6 +151,9 @@ export default function App() {
     onLeftCleared: () => {
       layers.clearLayers();
       selection.clearSelection();
+      // Module profiles and bay picks persist across disconnects; only the
+      // in-memory read verdicts die with the session.
+      clearModuleLiveRef.current();
     },
   });
   const { sesRef, halves, connecting, failed, autoConn } = sessions;
@@ -184,6 +194,11 @@ export default function App() {
     log,
   });
   const { customColors, saveCustomColors } = useCustomColors();
+  // Module profile store (Phase 5b): profiles + bay picks persist in
+  // localStorage; readAll() captures unmatched slots on read. ModulesTab
+  // consumes this hook in a later task — wired here only.
+  const moduleProfiles = useModuleProfiles({ sesRef, busyRef, log });
+  clearModuleLiveRef.current = moduleProfiles.clearLive;
   // 'off' when the Bindings tab is hidden: the keyboard card unmounts on tab
   // switch, and useKbFit must re-attach its observer when it comes back.
   const { kbBoxRef, kbStageRef, kbScale } = useKbFit(
