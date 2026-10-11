@@ -5,8 +5,8 @@
 // layers only: on layer 0 the option is a mute '—', 0x78 points AT the base
 // layer), and `Disabled` (0x00). A live badge names the matched profile +
 // slot when a read verdict knows it; a stored pick for a profile that is
-// not on the keyboard yet says so — the pick is kept, its write joins after
-// the next read.
+// not on the keyboard yet says so — the pick is kept, and queueing its
+// write means reading the keyboard, then re-picking the bay.
 //
 // Picks go through the hook's setBay mutator: the store is the planner's
 // source of truth and the hook queues the wire op (queueBayAssignment, a
@@ -100,7 +100,7 @@ export default function BayPicker({
                     )}
                     {pickedProfile && !liveMatch && (
                       <Badge
-                        title="Not on the keyboard yet (or not read this session) — the bay write queues after the next read"
+                        title="Not on the keyboard yet (or not read this session) — read the keyboard, then re-pick to queue the bay write"
                       >
                         not on device
                       </Badge>

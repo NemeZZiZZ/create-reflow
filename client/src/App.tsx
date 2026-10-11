@@ -38,11 +38,12 @@ import { queueAction, queueBehaviorSet, queueColor, queueFillLayer, queueLayerAd
 import { FLAVOR_BYTES, flavorById, type FlavorId } from '@create-reflow/sdk';
 import { buildOpenFlowLayer, animOp, ANIM_NAMES } from '@create-reflow/sdk';
 import { saveJson } from './lib/save';
-import { diffSnapshotToDraft, parseSnapshotFile } from '@create-reflow/sdk';
+import { diffSnapshotToDraft, parseSnapshotFile, buildModuleProfileFile, parseModuleProfileFile } from '@create-reflow/sdk';
 import type { ParseFileResult, SnapMaps } from '@create-reflow/sdk';
 import { listAutoBackups, loadAutoBackup } from '@create-reflow/sdk';
 import type { ActionDef } from '@create-reflow/sdk';
 import type { BehaviorSet } from '@create-reflow/sdk';
+import type { ModuleProfile } from '@create-reflow/sdk';
 import {
   assertWireAllowed,
   type TroubleAction,
@@ -313,6 +314,19 @@ export default function App() {
     for (const L of exportIdxs) exportLayer(L);
   }
 
+  // Module-profile export: the openflow.module-profile v1 interchange doc,
+  // built straight from the profile store — no device traffic, no read
+  // needed (the Save menu lists one item per stored profile).
+  function exportModuleProfile(p: ModuleProfile) {
+    const fileName = `${p.name}.openflow-module-profile.json`;
+    saveJson(fileName, buildModuleProfileFile(p));
+    log(
+      'inf',
+      `export: ${fileName}: ${Object.keys(p.bindings).length} binding(s), ` +
+        `${Object.keys(p.settings).length} setting(s)`,
+    );
+  }
+
   // Add layer: queue an inventory add (30/1002) for the next free slot
   // (max idx + 1, window 0..7) with a fresh uuid and the Solid stored
   // animation. The new tab appears after the flash — the post-flash dump
@@ -511,11 +525,10 @@ export default function App() {
     else log("inf", "import: device already matches the snapshot");
   }
 
-  async function importSnapshotFile(f: File) {
-    if (!hasRead) {
-      log("err", "import: no device state read yet — Refresh first (diff needs live state)");
-      return;
-    }
+  // Single hidden-input flow: parse once, then route on the file's format
+  // marker — 'openflow.module-profile' feeds the profile store (no device
+  // state needed), anything else is the layer-snapshot flow unchanged.
+  async function importFile(f: File) {
     let obj: unknown;
     try {
       obj = JSON.parse(await f.text());
@@ -523,12 +536,61 @@ export default function App() {
       log("err", `import: '${f.name}' is not valid JSON`);
       return;
     }
+    if (
+      typeof obj === "object" &&
+      obj !== null &&
+      (obj as { format?: unknown }).format === "openflow.module-profile"
+    ) {
+      importModuleProfile(obj, f.name);
+      return;
+    }
+    importSnapshotFile(obj, f.name);
+  }
+
+  async function importSnapshotFile(obj: unknown, name: string) {
+    if (!hasRead) {
+      log("err", "import: no device state read yet — Refresh first (diff needs live state)");
+      return;
+    }
     const snap = parseSnapshotFile(obj);
     if ("error" in snap) {
       log("err", `import: ${snap.error}`);
       return;
     }
-    applySnap(snap, f.name);
+    applySnap(snap, name);
+  }
+
+  // Module-profile import: ALWAYS a new profile. parseModuleProfileFile
+  // keeps the file's own id — a round-tripped file would collide with the
+  // original entry and a bay pick would silently follow both — so the
+  // handler mints a fresh uuid and the store append never overwrites.
+  // Leniency: an empty/missing bindings object is a valid settings-only
+  // profile (the gestures can be edited in afterwards); gestures the
+  // module does not have come back in the skipped list — reported, not
+  // fatal.
+  function importModuleProfile(obj: unknown, fileName: string) {
+    const r = parseModuleProfileFile(obj);
+    if ("error" in r) {
+      toast.error(r.error);
+      log("err", `import '${fileName}': ${r.error}`);
+      return;
+    }
+    const p: ModuleProfile = { ...r.profile, id: mintLayerUuid() };
+    if (moduleProfiles.importProfile(p) === null) return; // busy — the hook logged
+    const bindings = Object.keys(p.bindings).length;
+    if (bindings === 0)
+      toast.info(
+        `Imported ${p.name} — the file carries no gesture bindings (settings only)`,
+      );
+    else if (r.skipped.length > 0)
+      toast.success(`Imported ${p.name} — ${r.skipped.length} unknown gesture(s) skipped`);
+    else toast.success(`Imported ${p.name}`);
+    log(
+      "inf",
+      `import '${fileName}': module profile "${p.name}" (${p.type}) — ` +
+        `${bindings} binding(s)` +
+        (r.skipped.length > 0 ? `, skipped: ${r.skipped.join(", ")}` : ""),
+    );
   }
 
   function restoreBackup(id: string) {
@@ -640,8 +702,10 @@ export default function App() {
     <SaveMenu
       leftOn={leftOn}
       layers={exportIdxs}
+      profiles={moduleProfiles.profiles}
       onExportLayer={exportLayer}
       onExportAll={exportAllLayers}
+      onExportProfile={exportModuleProfile}
       onImport={() => importRef.current?.click()}
       onBackups={() => setBackupsOpen(true)}
     />
@@ -847,7 +911,7 @@ export default function App() {
           onChange={(e) => {
             const f = e.target.files?.[0];
             e.target.value = "";
-            if (f) void importSnapshotFile(f);
+            if (f) void importFile(f);
           }}
         />
         <BackupsDialog

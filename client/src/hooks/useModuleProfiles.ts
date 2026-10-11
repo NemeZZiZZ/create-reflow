@@ -368,8 +368,9 @@ export function useModuleProfiles({
    *     (inherit refused on layer 0: 0x78 points AT the base layer, so on
    *     the base layer itself it resolves to nothing);
    *   - a profile id → its live matched slot — a profile not on the
-   *     keyboard yet has no slot byte until the next read plans one, so
-   *     the pick is stored and the queue touched only after a read.
+   *     keyboard yet has no slot byte until a read plans one, so the pick
+   *     is stored and nothing is queued: read the keyboard, then re-pick
+   *     to queue the bay write (nothing re-runs deferred picks).
    * Bay ops are plain key ops at KK 0x4A-0x51 (queueBayAssignment) — they
    * ride the existing executor/preview, no executor change. Clearing to
    * null never un-queues a previously queued op — the queue is reviewed
@@ -401,7 +402,7 @@ export function useModuleProfiles({
           const name = profiles.find((p) => p.id === pick)?.name ?? pick;
           log(
             'inf',
-            `modules: bay pick "${name}" stored — the profile is not on the keyboard yet, its bay write is queued after the next read`,
+            `modules: bay pick "${name}" stored — the profile is not on the keyboard yet; read the keyboard, then re-pick to queue the bay write`,
           );
           return;
         }
@@ -434,6 +435,21 @@ export function useModuleProfiles({
       next.name = trimmed !== '' ? trimmed : `${stock.name} copy`;
       saveProfiles([...profiles, next]);
       return next;
+    },
+    [profiles, saveProfiles, busyGated],
+  );
+
+  /** Store an IMPORTED profile as a new entry — an append, never an
+   * overwrite (the caller mints a fresh id first: parseModuleProfileFile
+   * keeps the file's own id, which would collide on round-trips). Same
+   * busy gate as every mutator — a mid-read append would be clobbered by
+   * the read's own saveProfiles. Returns the stored profile, or null
+   * when the gate dropped it. */
+  const importProfile = useCallback(
+    (profile: ModuleProfile): ModuleProfile | null => {
+      if (busyGated()) return null;
+      saveProfiles([...profiles, profile]);
+      return profile;
     },
     [profiles, saveProfiles, busyGated],
   );
@@ -481,6 +497,7 @@ export function useModuleProfiles({
     setSetting,
     setBay,
     addProfile,
+    importProfile,
     deleteProfile,
     renameProfile,
     clearLive,
