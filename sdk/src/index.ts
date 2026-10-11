@@ -16,6 +16,8 @@ export * from './troubleshooting';
 export * from './host-table';
 export * from './layers';
 export * from './module-wire';
+export * from './module-fields';
+export * from './module-profiles';
 // OpenFlow layer docs — the only export/import format since the
 // legacy-snapshot clean break (exporters.ts is gone).
 export * from './openflow';

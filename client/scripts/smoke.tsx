@@ -50,6 +50,15 @@ import {
   fitsChunkBudget, chunkBudget,
 } from '@create-reflow/sdk';
 import type { DraftDrop, GestureBinding } from '@create-reflow/sdk';
+import {
+  MODULE_TYPES, FIELD_MAP, AXIS_HALVES, SETTING_FIELDS,
+  FIRMWARE_DEFAULTS, LOCKED_GESTURES, PAIRED_GESTURES,
+  splitPair, conventionSign, conventionOf, ticksToWire, ticksFromWire,
+  halfSelector, gestureField, moduleTypeOfGesture,
+  STOCK_PROFILES, StockProfiles,
+  overlay, encodeAxisBinding, compareRecords, diffProfile,
+  parseModuleProfileFile, buildModuleProfileFile,
+} from '@create-reflow/sdk';
 import type { LayerDump } from '../src/hooks/useLayers';
 
 let n = 0;
@@ -2950,6 +2959,275 @@ void (async () => {
   eq(fitsChunkBudget(new Uint8Array(483)), true, '57 483B payload fits the chunk budget');
   eq(fitsChunkBudget(new Uint8Array(484)), false, '57 484B payload over budget (3rd frame hangs fw 3.28.7)');
   eq(chunkBudget(new Uint8Array(300)), 2, '57 chunkBudget 300B = 2 frames under 242B chunking');
+}
+
+// §58 module field maps + profile model: vendored FIELD_MAP/AXIS_HALVES
+// tables, tick conversion (SCRUM-50 degrees-per-detent), firmware locks,
+// pair splitting, the convention flip, stock profiles, overlay/compare/
+// diff, and openflow.module-profile v1 io. Facts are vendor-captured
+// (see sdk/src/module-fields.ts provenance header).
+{
+  // FIELD_MAP — the vendor-captured per-field tables.
+  eq(MODULE_TYPES.join(','), 'TOUCH,TRACK,TUNE,FLOAT', '58 MODULE_TYPES');
+  const b1 = FIELD_MAP.TRACK[0x0b];
+  eq(b1.kind === 'mouse_button' && b1.mask === 1 && b1.gesture === 'tap:track:button_1', true,
+    '58 Track 0x0b = button 1, mask 1 (M1)');
+  eq(FIELD_MAP.TRACK[0x0c].mask, 4, '58 Track 0x0c mask 4 (M3)');
+  eq(FIELD_MAP.TRACK[0x0d].mask, 2, '58 Track 0x0d mask 2 (M2)');
+  eq(FIELD_MAP.TRACK[0x0e].mask, 8, '58 Track 0x0e mask 8 (M4)');
+  const ta = FIELD_MAP.TUNE[0x0a];
+  eq(`${ta.axis}/${ta.direction}/${ta.gesture}`, '4/-1/vertical:tune:1_finger',
+    '58 Tune 0x0a = cat 4, selector -1, VERTICAL (axes the other way round from field order)');
+  const t13 = FIELD_MAP.TOUCH[0x13];
+  eq(t13.kind === 'mouse_button' && t13.mask === 4 && t13.gesture === 'tap:touch:3_fingers', true,
+    '58 Touch 0x13 = 3-finger tap, M3 mask (cat-3 shape like a Track button)');
+  eq(Object.keys(FIELD_MAP.FLOAT).length, 0, '58 FLOAT has no field map yet (no device read)');
+
+  // AXIS_HALVES — explicit per gesture (a category is NOT unique within a
+  // module); selector belongs to the HALF, not the sign.
+  const tv = AXIS_HALVES.TUNE['vertical:tune:1_finger'];
+  eq(`${tv.minus.toString(16)}/${tv.plus.toString(16)}/${tv.category}`, 'a/b/4',
+    '58 Tune vertical = 0x0a/0x0b cat 4');
+  const th = AXIS_HALVES.TUNE['horizontal:tune:1_finger'];
+  eq(`${th.minus.toString(16)}/${th.plus.toString(16)}/${th.category}`, 'c/d/6',
+    '58 Tune horizontal = 0x0c/0x0d cat 6');
+  const tr = AXIS_HALVES.TRACK['rotate:track'];
+  eq(`${tr.minus.toString(16)}/${tr.plus.toString(16)}/${tr.category}`, 'a/9/4',
+    '58 Track rotate = 0x0a(-)/0x09(+) cat 4 — field order reversed vs sign');
+  const tv2 = AXIS_HALVES.TOUCH['vertical:touch:2_fingers'];
+  const th2 = AXIS_HALVES.TOUCH['horizontal:touch:2_fingers'];
+  eq(`${tv2.minus.toString(16)}/${tv2.plus.toString(16)}/${tv2.category} ${th2.minus.toString(16)}/${th2.plus.toString(16)}/${th2.category}`,
+    'd/e/4 f/10/6', '58 Touch 2-finger vert 0x0d/0x0e cat 4, horiz 0x0f/0x10 cat 6');
+  eq(halfSelector(tv, '-') === -1 && halfSelector(tv, '+') === 1 && tv.selectors === undefined,
+    true, '58 halfSelector defaults to the sign (vendored halves are ordinary)');
+
+  // SETTING_FIELDS + tick conversion: the app stores detents per turn, the
+  // wire byte is DEGREES per detent = round(360/n) (SCRUM-50, live 2026-09-16).
+  eq(SETTING_FIELDS.TUNE.ticks_per_rotation, 0x05, '58 Tune ticks_per_rotation = field 0x05');
+  eq(Object.keys(SETTING_FIELDS.FLOAT).length, 0, '58 FLOAT has no writable settings');
+  eq(ticksToWire(5), 72, '58 ticksToWire(5) = 72 (5 detents = 72 deg/detent)');
+  eq(ticksToWire(10), 36, '58 ticksToWire(10) = 36');
+  eq(ticksToWire(4), 90, '58 ticksToWire(4) = 90');
+  eq(ticksFromWire(72), 5, '58 ticksFromWire(72) = 5 detents');
+  eq(ticksFromWire(0), null, '58 ticksFromWire(0) = null (0 degrees means nothing)');
+
+  // FIRMWARE_DEFAULTS + LOCKED — Touch 1/2-finger tap + 1-finger cursor:
+  // empty IS the default on the wire; always written empty; drift never counted.
+  eq(FIRMWARE_DEFAULTS.TOUCH?.['tap:touch:1_finger'], 'M1', '58 firmware default: 1-finger tap = M1');
+  eq(FIRMWARE_DEFAULTS.TOUCH?.['vertical:touch:1_finger'], 'mouse - MOUSE_DOWN - MOUSE_UP',
+    '58 firmware default: 1-finger cursor vertical');
+  eq(LOCKED_GESTURES.TOUCH.size === 4 && LOCKED_GESTURES.TOUCH.has('tap:touch:2_fingers')
+    && LOCKED_GESTURES.TOUCH.has('horizontal:touch:1_finger'), true,
+    '58 LOCKED_TOUCH = the 4 firmware-driven gestures');
+  eq(LOCKED_GESTURES.TRACK.size === 0 && LOCKED_GESTURES.TUNE.size === 0, true,
+    '58 Track/Tune have no locked gestures');
+
+  // splitPair — LAST TWO parts, both spellings; PAIRED dial halves.
+  eq(JSON.stringify(splitPair('mouse - SCROLL_UP - SCROLL_DOWN')),
+    JSON.stringify(['SCROLL_UP', 'SCROLL_DOWN']), '58 splitPair drops the leading kind');
+  eq(JSON.stringify(splitPair('C_VOL_DOWN - C_VOL_UP')),
+    JSON.stringify(['C_VOL_DOWN', 'C_VOL_UP']), '58 splitPair parses the dial form (no leading kind)');
+  eq(JSON.stringify(splitPair('M1')), JSON.stringify([null, null]), '58 splitPair: no pair → nulls');
+  eq(gestureField('TUNE', PAIRED_GESTURES.TUNE!['rotate:tune:dial'].minus) === 0x23
+    && gestureField('TUNE', PAIRED_GESTURES.TUNE!['rotate:tune:dial'].plus) === 0x22, true,
+    '58 dial pair: minus half = 0x23 (CCW), plus half = 0x22 (CW)');
+  eq(moduleTypeOfGesture('vertical:track') === 'TRACK' && moduleTypeOfGesture('no:such:gesture') === null,
+    true, '58 moduleTypeOfGesture claims and unknowns');
+
+  // Convention flip (SCRUM-62): FLIPPED_ON_WINDOWS = {4} only.
+  eq(conventionSign(4, 1, 'windows'), -1, '58 conventionSign cat 4 flips on windows');
+  eq(conventionSign(4, -1, 'mac'), -1, '58 conventionSign cat 4 untouched on mac');
+  eq(conventionSign(8, 1, 'windows') === 1 && conventionSign(6, -1, 'windows') === -1, true,
+    '58 cat 6 and cat 8 are NOT flipped (zoom is measured unflipped)');
+  eq(conventionOf({ scroll_convention: 1 }) === 'windows' && conventionOf({}) === 'mac', true,
+    '58 conventionOf: 1 = windows, absent = mac');
+
+  // Stock profiles — 4, ported verbatim from the vendored stock source.
+  eq(STOCK_PROFILES.length, 4, '58 four stock profiles');
+  eq(Object.keys(StockProfiles).join(','), 'TOUCH_WINDOWS,TRACK_LEFT,TRACK_RIGHT,TUNE',
+    '58 StockProfiles keyed by id');
+  eq(Object.keys(StockProfiles.TOUCH_WINDOWS.bindings).length, 16,
+    '58 TOUCH_WINDOWS ships 16 bindings');
+  const tuneStock = StockProfiles.TUNE;
+  eq(Object.keys(tuneStock.bindings).length === 13
+    && tuneStock.bindings['rotate:tune:dial'].actionCode === 'C_VOL_DOWN - C_VOL_UP', true,
+    '58 TUNE ships 13 bindings incl the combined dial row');
+  eq(['tap:track:button_1', 'tap:track:button_2', 'tap:track:button_3', 'tap:track:button_4']
+    .map((g) => StockProfiles.TRACK_LEFT.bindings[g].actionCode).join(','),
+    'M1,M3,M2,M4', '58 TRACK_LEFT buttons M1/M3/M2/M4');
+  eq(['tap:track:button_1', 'tap:track:button_2', 'tap:track:button_3', 'tap:track:button_4']
+    .map((g) => StockProfiles.TRACK_RIGHT.bindings[g].actionCode).join(','),
+    'M4,M2,M3,M1', '58 TRACK_RIGHT buttons M4/M2/M3/M1 (asymmetric module)');
+  const ledSwipe = tuneStock.bindings['swipe_up:tune:3_fingers'];
+  eq(ledSwipe.actionType === 'LED' && ledSwipe.actionCode === 'LED_BRIGHTNESS_UP', true,
+    '58 TUNE 3-finger up swipe = LED brightness');
+
+  // encodeAxisBinding — invert = SELECTOR SWAP (no flag on the device).
+  eq(toHex(encodeAxisBinding(4, -1, 0)), '04 00 00 00 ff ff ff ff',
+    '58 axis half (4, -1) twoWord value');
+  eq(toHex(encodeAxisBinding(4, -1, 1)), '04 00 00 00 01 00 00 00',
+    '58 axis invert swaps the selector (writes +1)');
+
+  // compareRecords — byte truth.
+  const tuneOverlay = overlay(new Map<number, Uint8Array>(), tuneStock, 'TUNE');
+  eq(compareRecords(tuneOverlay, new Map(tuneOverlay)), true, '58 compareRecords: same bytes → true');
+  const corrupted58 = new Map(tuneOverlay);
+  corrupted58.set(0x00, Uint8Array.from([0x00, 0x01, 0x01, 0x0b]));
+  eq(compareRecords(tuneOverlay, corrupted58), false, '58 compareRecords: one byte off → false');
+  corrupted58.delete(0x23);
+  eq(compareRecords(tuneOverlay, corrupted58), false, '58 compareRecords: missing record → false');
+
+  // overlay — template-copy + modeled fields only; never invents fields.
+  const template58 = new Map<number, Uint8Array>([
+    [0x30, Uint8Array.from([0x30, 0x01, 0x01, 0x2a])], // beyond every Tune field
+  ]);
+  const over58 = overlay(template58, tuneStock, 'TUNE');
+  eq(toHex(over58.get(0x30)!), '30 01 01 2a', '58 overlay carries unmodeled records byte-exact');
+  eq(over58.has(0x08), false, '58 overlay never invents fields (unbound 0x08 stays absent)');
+  eq(toHex(over58.get(0x0a)!), '0a 0f 08 04 00 00 00 ff ff ff ff',
+    '58 overlay: vertical minus half = twoWord (4, -1) under mac');
+  eq(toHex(over58.get(0x23)!), '23 04 06 01 04 ea 00 0c 00',
+    '58 dial minus half: 0x23 = keypress C_VOL_DOWN');
+  eq(toHex(over58.get(0x22)!), '22 04 06 01 04 e9 00 0c 00',
+    '58 dial plus half: 0x22 = keypress C_VOL_UP');
+  eq(toHex(over58.get(0x05)!), '05 01 01 05',
+    '58 overlay: ticks 72 detents → wire byte 5 (degrees per detent)');
+  eq(toHex(over58.get(0x00)!), '00 01 01 0a', '58 overlay: pointer speed 10 → 00 01 01 0a');
+
+  // Locked rows are written EMPTY even when the profile binds them and the
+  // template holds garbage.
+  const touchTemplate58 = new Map<number, Uint8Array>([
+    [0x0b, Uint8Array.from([0x0b, 0x04, 0x06, 0x01, 0x04, 0x04, 0x00, 0x07, 0x00])],
+  ]);
+  const touchOver58 = overlay(touchTemplate58, StockProfiles.TOUCH_WINDOWS, 'TOUCH');
+  eq(toHex(touchOver58.get(0x0b)!), '0b 07 00',
+    '58 locked tap field written EMPTY over template garbage (profile binds M1 there)');
+
+  // Convention flip reaches the wire through overlay.
+  const winTune58: typeof tuneStock = {
+    ...tuneStock,
+    settings: { ...tuneStock.settings, scroll_convention: 1 },
+  };
+  const winOver58 = overlay(new Map<number, Uint8Array>(), winTune58, 'TUNE');
+  eq(toHex(winOver58.get(0x0a)!), '0a 0f 08 04 00 00 00 01 00 00 00',
+    '58 windows convention: vertical minus half carries +1');
+  eq(toHex(winOver58.get(0x0c)!), '0c 0f 08 06 00 00 00 ff ff ff ff',
+    '58 windows convention: horizontal (cat 6) untouched');
+
+  // diffProfile — byte truth under a convention; locks never count.
+  eq(diffProfile(tuneStock, tuneOverlay, 'mac').length, 0, '58 diff: stock vs own overlay → no drift');
+  const drift58 = new Map(tuneOverlay);
+  drift58.set(0x0e, Uint8Array.from([0x0e, 0x04, 0x06, 0x01, 0x04, 0x2c, 0x00, 0x0c, 0x00]));
+  const rows58 = diffProfile(tuneStock, drift58, 'mac');
+  eq(rows58.length === 1 && rows58[0].gesture === 'tap:tune:2_fingers' && rows58[0].field === 0x0e,
+    true, '58 diff: keypress drift counted, row names gesture + field');
+  const touchDrift58 = new Map(touchOver58);
+  touchDrift58.set(0x0b, Uint8Array.from([0x0b, 0x04, 0x06, 0x01, 0x04, 0x04, 0x00, 0x07, 0x00]));
+  eq(diffProfile(StockProfiles.TOUCH_WINDOWS, touchDrift58, 'mac').length, 0,
+    '58 diff: locked row drift NEVER counted');
+  const maskDrift58 = new Map(touchOver58);
+  maskDrift58.set(0x13, Uint8Array.from([0x13, 0x07, 0x00]));
+  const maskRows58 = diffProfile(StockProfiles.TOUCH_WINDOWS, maskDrift58, 'mac');
+  eq(maskRows58.length === 1 && maskRows58[0].gesture === 'tap:touch:3_fingers', true,
+    '58 diff: mask (3-finger tap M3) drift counted');
+  const convRows58 = diffProfile(tuneStock, tuneOverlay, 'windows');
+  eq(convRows58.length === 1 && convRows58[0].gesture === 'vertical:tune:1_finger', true,
+    '58 diff: comparing mac bytes under windows flags only the cat-4 axis');
+  const emptyRows58 = diffProfile(tuneStock, new Map(), 'mac');
+  eq(emptyRows58.length, 11, '58 diff: empty slot → 11 encodable bindings drift (LED rows not judged)');
+  eq(emptyRows58.some((r) => r.gesture === 'tap:tune:2_fingers' && r.got === '(absent)'), true,
+    '58 diff: missing record reported as (absent)');
+
+  // openflow.module-profile v1 io — parse validates, never infers, round-trips.
+  eq('error' in parseModuleProfileFile(null), true, '58 parse: not an object → error');
+  eq('error' in parseModuleProfileFile({ format: 'nope' }), true, '58 parse: foreign format → error');
+  const mtMissing58 = parseModuleProfileFile({ format: 'openflow.module-profile', version: 1 });
+  eq('error' in mtMissing58 && mtMissing58.error === 'unknown module type — this app reads TOUCH/TRACK/TUNE/FLOAT',
+    true, '58 parse: missing moduleType → exact refusal message');
+  const mtUnknown58 = parseModuleProfileFile({ format: 'openflow.module-profile', version: 1, moduleType: 'KEYPAD' });
+  eq('error' in mtUnknown58 && mtUnknown58.error === 'unknown module type — this app reads TOUCH/TRACK/TUNE/FLOAT',
+    true, '58 parse: unknown moduleType → same refusal (never inferred)');
+  const touchFile58 = buildModuleProfileFile(StockProfiles.TOUCH_WINDOWS);
+  const misfiled58 = parseModuleProfileFile({ ...touchFile58, moduleType: 'TRACK' });
+  eq('error' in misfiled58 && misfiled58.error.includes('belongs to another type'), true,
+    '58 parse: Touch gestures filed as TRACK → refused (all-foreign)');
+  const partial58 = parseModuleProfileFile({
+    format: 'openflow.module-profile',
+    version: 1,
+    moduleType: 'TUNE',
+    bindings: {
+      'tap:tune:2_fingers': { actionType: 'key', actionCode: 'C_PLAY_PAUSE' },
+      'tap:touch:1_finger': { actionType: 'mouse', actionCode: 'M1' },
+      'bogus:gesture': { actionType: 'key', actionCode: 'X' },
+    },
+  });
+  eq('profile' in partial58 && Object.keys(partial58.profile.bindings).length === 1
+    && JSON.stringify(partial58.skipped) === JSON.stringify(['tap:touch:1_finger', 'bogus:gesture']),
+    true, '58 parse: partial foreign gestures kept out via skipped list');
+  const round58 = parseModuleProfileFile(buildModuleProfileFile(tuneStock));
+  eq('profile' in round58
+    && round58.profile.id === 'TUNE'
+    && round58.profile.name === 'Naya Tune Mac/Win'
+    && round58.profile.type === 'TUNE'
+    && round58.profile.settings.ticks_per_rotation === 72
+    && round58.profile.bindings['rotate:tune:dial'].actionCode === 'C_VOL_DOWN - C_VOL_UP'
+    && round58.skipped.length === 0, true,
+    '58 round-trip: stock TUNE file parses back identical');
+  const splitProfile58 = {
+    ...tuneStock,
+    id: 'split-dial',
+    name: 'Split dial',
+    bindings: {
+      ...tuneStock.bindings,
+      'rotate:tune:dial': {
+        actionType: 'value',
+        actionCode: 'C_VOL_DOWN - C_VOL_UP',
+        split: {
+          '-': { actionType: 'key', actionCode: 'F23' },
+          '+': { actionType: 'key', actionCode: 'F24' },
+        },
+      },
+    },
+  };
+  const splitFile58 = buildModuleProfileFile(splitProfile58);
+  eq(splitFile58.bindings!['rotate:tune:dial'].split?.['-']?.actionCode === 'F23'
+    && splitFile58.bindings!['rotate:tune:dial'].split?.['+']?.actionCode === 'F24', true,
+    '58 build: split halves nest under split (F23/F24)');
+  const splitBack58 = parseModuleProfileFile(splitFile58);
+  eq('profile' in splitBack58
+    && splitBack58.profile.bindings['rotate:tune:dial'].split?.['-']?.actionCode === 'F23', true,
+    '58 parse: split nesting survives into the profile');
+  eq('profile' in splitBack58
+    && JSON.stringify(buildModuleProfileFile(splitBack58.profile)) === JSON.stringify(splitFile58),
+    true, '58 round-trip: build∘parse∘build is byte-stable (split + settings + order)');
+  // Split dial reaches the WIRE through overlay (the PAIRED_GESTURES branch
+  // honors split like the axis branch): 0x23/0x22 carry the F23/F24
+  // keypress halves from split, NOT the combined C_VOL_DOWN/C_VOL_UP pair.
+  // Usages derived from the host table, not hand-typed (0x72/0x73 page 7).
+  const splitOver58 = overlay(new Map<number, Uint8Array>(), splitProfile58, 'TUNE');
+  const f23u58 = nameToUsage('F23')!;
+  const f24u58 = nameToUsage('F24')!;
+  eq(f23u58.usage === 0x72 && f23u58.page === 0x07 && f24u58.usage === 0x73 && f24u58.page === 0x07,
+    true, '58 host-table: F23/F24 = 0x0072/0x0073 on page 7');
+  eq(toHex(splitOver58.get(0x23)!), '23 04 06 01 04 72 00 07 00',
+    '58 split dial: minus half 0x23 = keypress F23 (split beats combined)');
+  eq(toHex(splitOver58.get(0x22)!), '22 04 06 01 04 73 00 07 00',
+    '58 split dial: plus half 0x22 = keypress F24 (no consumer record)');
+  eq(toHex(over58.get(0x23)!) === '23 04 06 01 04 ea 00 0c 00'
+    && toHex(over58.get(0x22)!) === '22 04 06 01 04 e9 00 0c 00', true,
+    '58 unsplit dial (regression): overlay still writes the combined C_VOL pair');
+  const coerced58 = parseModuleProfileFile({
+    format: 'openflow.module-profile',
+    version: 1,
+    moduleType: 'TUNE',
+    settings: { pointer_speed: '50', pointer_accel_on: 'true', scroll_convention: 'windows' },
+    bindings: { 'tap:tune:2_fingers': { actionType: 'key', actionCode: 'C_PLAY_PAUSE' } },
+  });
+  eq('profile' in coerced58
+    && coerced58.profile.settings.pointer_speed === 50
+    && coerced58.profile.settings.pointer_accel_on === 1
+    && conventionOf(coerced58.profile.settings) === 'windows', true,
+    '58 parse: string settings coerce (number / true / windows)');
 }
 
 void main();
