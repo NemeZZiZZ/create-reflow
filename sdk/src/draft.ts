@@ -48,7 +48,7 @@ export interface KeySetOp {
 }
 export interface SettingsOp {
   kind: 'settings';
-  path: string;           // 'ed/1011' | 'ed/1012' | 'ed/1013' | 'ed/1014' | 'fe/100a'
+  path: string;           // 'ed/1011' | 'ed/1012' | 'ed/1013' | 'ed/1014' | 'fe/100a' | 'fe/1005'
   payload: Uint8Array;    // frame params (e.g. [target, value] for ED)
   label: string;
 }

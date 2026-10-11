@@ -10,6 +10,8 @@
 import { moduleAddr } from './module-wire';
 import type { IoLog, IoLogEntry } from './io-log';
 import { createIoLog, hexHead } from './io-log';
+import { parseKeyScanEvent } from './keyscan';
+import type { KeyScanEvent } from './keyscan';
 
 export const DST_LEFT = 0x50;
 export const DST_RIGHT = 0x51;
@@ -752,6 +754,134 @@ export class NayaSession {
     if (p.length !== 13) throw new Error('timeouts payload must be 13 bytes');
     const f = await this.cmd(0xfe, 0x10, 0x0a, p);
     return f.payload;
+  }
+
+  // Keyscan live test mode — fe/1008 ON, then a raw fe/1009 event-stream
+  // listen until the duration elapses. NOT a cmd(): the events are
+  // UNSOLICITED (no request owns them), so this holds the tail mutex for
+  // the WHOLE session — a concurrent cmd() would run its RX-buffer flush
+  // (fr.clear + drain) and destroy queued events; the mutex is what keeps
+  // them alive. Wire facts (OF service.py parity): only fe/10/09 frames
+  // with ≥3B payload are events ([row, col, state, ...] — STATE 0 = PRESS,
+  // inverted; parse the FIRST 3 bytes only, extra bytes logged, never
+  // parsed); foreign frames are ignored silently. The roundtrip ioLog tap
+  // never sees stream frames (it lives inside roundtrip), so every frame
+  // is pushed into ioLog manually — strictly observational, try/catch-
+  // wrapped, mirroring the tap's record shape.
+  //
+  // Ends: deadline elapsed → resolve; caller abort (onEvent throws) →
+  // resolve; dead reader (pumpError) → rethrow AFTER the OFF. finally
+  // ALWAYS sends OFF fe/1008 [00] and releases the mutex.
+  async keyscanListen(
+    onEvent: (ev: KeyScanEvent) => void,
+    opts?: { durationMs?: number },
+  ): Promise<void> {
+    // Same mutex pattern as cmd(): chain onto the tail, park newcomers.
+    const prev = this.tail;
+    let release!: () => void;
+    this.tail = new Promise<void>((res) => {
+      release = res;
+    });
+    await prev;
+    let listenErr: unknown = null;
+    try {
+      // ON with a LENIENT matcher — OF counts any valid frame as the ack
+      // (service.py never inspects the reply). No frame at all → warn and
+      // listen anyway (OF tolerate-unmatched parity).
+      try {
+        await roundtrip(
+          this.writeFn,
+          this.fr,
+          buildFrame(this.dst, 0xfe, 0x10, 0x08, new Uint8Array([0x01])),
+          6,
+          this.onFrame,
+          () => true,
+          this.ioLog,
+        );
+      } catch (e) {
+        console.warn(
+          '[keyscanListen] fe/1008 ON unanswered — listening anyway:',
+          (e as Error).message,
+        );
+      }
+      const endAt = Date.now() + (opts?.durationMs ?? 10_000);
+      for (;;) {
+        const remaining = endAt - Date.now();
+        if (remaining <= 0) break;
+        let f: Frame | null = null;
+        try {
+          f = await this.fr.readFrame(Math.min(remaining, 5000));
+        } catch {
+          /* no complete frame in this window — classified below */
+        }
+        if (!f) {
+          // A dead port surfaces as pumpError on the byte pump; a live-but-
+          // quiet device is just a readFrame timeout. Only the former is fatal.
+          if (this.fr.pumpError) {
+            listenErr = this.fr.pumpError;
+            break;
+          }
+          continue;
+        }
+        // Manual RX tap — stream frames bypass the roundtrip tap entirely.
+        if (this.ioLog) {
+          try {
+            this.ioLog.push({
+              dir: '<',
+              type: f.type,
+              c0: f.c0,
+              c1: f.c1,
+              len: f.payload.length,
+              hex: hexHead(f.payload),
+            });
+          } catch {
+            /* logging must never break a listen */
+          }
+        }
+        if (f.type !== 0xfe || f.c0 !== 0x10 || f.c1 !== 0x09) continue;
+        if (f.payload.length < 3) continue; // row/col/state all required
+        if (f.payload.length > 3) {
+          // Extra bytes: logged, never parsed (OF first-3-bytes parity).
+          try {
+            this.ioLog.push({
+              dir: '<',
+              type: f.type,
+              c0: f.c0,
+              c1: f.c1,
+              len: 0,
+              hex: '',
+              err: `keyscan event +${f.payload.length - 3} extra byte(s) ignored`,
+            });
+          } catch {
+            /* observational */
+          }
+        }
+        const ev = parseKeyScanEvent(f.payload);
+        if (!ev) continue;
+        try {
+          onEvent(ev);
+        } catch {
+          break; // caller abort → end the session (OFF still runs in finally)
+        }
+      }
+    } finally {
+      // ALWAYS OFF — even on abort or throw — then release the mutex.
+      try {
+        await roundtrip(
+          this.writeFn,
+          this.fr,
+          buildFrame(this.dst, 0xfe, 0x10, 0x08, new Uint8Array([0x00])),
+          6,
+          this.onFrame,
+          () => true,
+          this.ioLog,
+        );
+      } catch {
+        /* OFF is best-effort */
+      }
+      release();
+    }
+    if (listenErr !== null) throw listenErr;
   }
 
   async close(): Promise<void> {

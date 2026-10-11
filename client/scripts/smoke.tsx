@@ -20,7 +20,8 @@ import type { KeyRec, LedRec } from '@create-reflow/sdk';
 import { parseSnapshotFile, diffSnapshotToDraft, hexToBytes } from '@create-reflow/sdk';
 import type { SnapMaps } from '@create-reflow/sdk';
 import { timeoutsMs, timeoutsPayload } from '@create-reflow/sdk';
-import { parseKeyScanEvent, hostOsOp } from '@create-reflow/sdk';
+import { parseKeyScanEvent, hostOsOp, sleep } from '@create-reflow/sdk';
+import type { KeyScanEvent } from '@create-reflow/sdk';
 import Keyboard from '../src/components/Keyboard';
 import {
   saveAutoBackup,
@@ -4604,5 +4605,160 @@ void (async () => {
   eq(throws65(() => assertWireAllowed(0xfe, 0x10, 0x05)), false,
     '65 guard allows fe/1005 (host-OS setting — plain SET write)');
 }
+
+// §65 part 2 — keyscanListen end-to-end on a scripted §56-style device:
+// ON/OFF bytes at the writer, state inversion on pushed events, stray-frame
+// immunity, guaranteed OFF on a mid-stream abort, and the tail mutex held
+// for the WHOLE session (a concurrent cmd() must stay parked — its RX flush
+// would eat queued events, which is exactly what the mutex prevents).
+void (async () => {
+  // §56 duplex fake: writer verifyFrame's each request and answers after 5 ms;
+  // onReq lets the test push UNSOLICITED frames into the RX queue (keyscan
+  // events arrive without a matching request). Unsolicited frames flow AFTER
+  // the ack — a real device starts streaming once ON is acked, not before.
+  const scripted65 = (
+    reply: (rq: Frame) => Uint8Array,
+    onReq?: (rq: Frame, push: (f: Uint8Array) => void) => void,
+  ) => {
+    const queue: Uint8Array[] = [];
+    let waiter: (() => void) | null = null;
+    const push = (f: Uint8Array) => {
+      queue.push(f);
+      const w = waiter; waiter = null; w?.();
+    };
+    const reader = {
+      async read(): Promise<{ value?: Uint8Array; done?: boolean }> {
+        for (;;) {
+          const c = queue.shift();
+          if (c) return { value: c, done: false };
+          await new Promise<void>((res) => { waiter = res; });
+        }
+      },
+      cancel() { const w = waiter; waiter = null; w?.(); },
+      releaseLock() {},
+    };
+    const writer = {
+      async write(b: Uint8Array) {
+        const rq = verifyFrame(Uint8Array.from(b));
+        const resp = buildFrame(0x50, rq.type, rq.c0, rq.c1, reply(rq));
+        verifyFrame(resp);
+        setTimeout(() => { push(resp); onReq?.(rq, push); }, 5);
+      },
+      releaseLock() {},
+    };
+    const port = {
+      readable: { locked: false, getReader: () => reader },
+      writable: { getWriter: () => writer },
+      async open() {}, async setSignals() {}, async close() {},
+    };
+    return {
+      session() {
+        const r = port.readable.getReader() as unknown as ReadableStreamDefaultReader<Uint8Array>;
+        const w = port.writable.getWriter() as unknown as WritableStreamDefaultWriter<Uint8Array>;
+        return new NayaSession(
+          port as unknown as SerialPort, 0x50,
+          new FrameReader(r), w, r,
+          async (b) => { await w.write(b); }, null,
+        );
+      },
+    };
+  };
+  const isToggle65 = (rq: Frame) => rq.type === 0xfe && rq.c0 === 0x10 && rq.c1 === 0x08;
+  const evFrame65 = (p: number[]) =>
+    buildFrame(0x50, 0xfe, 0x10, 0x09, Uint8Array.from(p));
+
+  // --- A: normal session — ON, events parsed with inversion, a stray
+  // fe/1002 ignored mid-stream, OFF at the deadline, mutex held throughout.
+  {
+    const reqs65: Frame[] = [];
+    const events65: KeyScanEvent[] = [];
+    const dev = scripted65(
+      () => Uint8Array.from([0x00]),
+      (rq, push) => {
+        reqs65.push(rq);
+        if (isToggle65(rq) && rq.payload[0] === 0x01) {
+          push(evFrame65([3, 5, 0]));
+          push(buildFrame(0x50, 0xfe, 0x10, 0x02, Uint8Array.from([0x00]))); // stray
+          push(evFrame65([3, 5, 1]));
+          push(evFrame65([9, 9, 0, 0xff])); // extra 4th byte — log, never parse
+        }
+      },
+    );
+    const ses = dev.session();
+    let err65 = '';
+    const listenP = ses.keyscanListen((ev) => { events65.push(ev); }, { durationMs: 350 });
+    // Concurrent probe: cmd() must stay parked while the listen holds the
+    // tail mutex, and run once the session releases it.
+    let probeDone = false;
+    const probe = ses.cmd(0x30, 0x10, 0x01, new Uint8Array([0, 0]))
+      .then(() => { probeDone = true; }, () => {});
+    await sleep(200); // mid-session: events delivered, probe still parked
+    eq(probeDone, false,
+      '65 listen: tail mutex held during session (concurrent cmd() parked)');
+    eq(events65.length, 3,
+      '65 listen: events stream past the parked probe (a cmd() flush would kill them)');
+    try { await listenP; } catch (e) { err65 = (e as Error).message; }
+    await probe;
+    eq(err65, '', '65 listen: session ends cleanly at the deadline (no throw)');
+    eq(probeDone, true, '65 listen: mutex released after session (parked cmd() ran)');
+    eq(events65.length, 3,
+      '65 listen: stray fe/1002 mid-stream ignored (no event, no crash)');
+    eq(JSON.stringify(events65), JSON.stringify([
+      { row: 3, col: 5, pressed: true },
+      { row: 3, col: 5, pressed: false },
+      { row: 9, col: 9, pressed: true },
+    ]), '65 listen: [3,5,0]→pressed:true, [3,5,1]→pressed:false (inverted); 4th byte logged, never parsed');
+    const toggles = reqs65.filter(isToggle65);
+    eq(toggles.length >= 2, true, '65 listen: writer saw ON and OFF fe/1008');
+    eq(toHex(toggles[0]!.payload), '01', '65 listen: first fe/1008 write is ON [01]');
+    eq(toHex(toggles[toggles.length - 1]!.payload), '00', '65 listen: last fe/1008 write is OFF [00]');
+    const rx65 = ses.ioLog.snapshot().filter((r) => r.dir === '<');
+    eq(rx65.some((r) => r.type === 0xfe && r.c1 === 0x09 && r.len === 3), true,
+      '65 listen: event frames logged to ioLog RX (manual tap — stream bypasses roundtrip)');
+    eq(rx65.some((r) => r.type === 0xfe && r.c1 === 0x02), true,
+      '65 listen: stray fe/1002 frame logged to ioLog RX, ignored silently');
+    eq(rx65.some((r) => r.type === 0xfe && r.c1 === 0x09 && r.len === 4), true,
+      '65 listen: extra-byte event logged whole (len 4) — parsed first-3 only');
+  }
+
+  // --- B: mid-stream abort — onEvent throws on the 2nd event; the session
+  // must stop dispatching, STILL send OFF, and RESOLVE (caller abort is a
+  // normal end, not a rejection).
+  {
+    const reqs65b: Frame[] = [];
+    const events65b: KeyScanEvent[] = [];
+    const dev = scripted65(
+      () => Uint8Array.from([0x00]),
+      (rq, push) => {
+        reqs65b.push(rq);
+        if (isToggle65(rq) && rq.payload[0] === 0x01) {
+          push(evFrame65([7, 1, 0]));
+          push(evFrame65([7, 2, 0]));
+          push(evFrame65([7, 3, 0]));
+        }
+      },
+    );
+    const ses = dev.session();
+    let err65b = '';
+    const t065b = Date.now();
+    try {
+      await ses.keyscanListen((ev) => {
+        events65b.push(ev);
+        if (events65b.length === 2) throw new Error('caller abort');
+      }, { durationMs: 5000 });
+    } catch (e) { err65b = (e as Error).message; }
+    const elapsed65b = Date.now() - t065b;
+    eq(err65b, '', '65 listen: caller abort (onEvent throws) RESOLVES, not rejects');
+    eq(elapsed65b < 2000, true,
+      '65 listen: abort ends the session early (well before the 5000ms deadline)');
+    eq(events65b.length, 2,
+      '65 listen: abort stops dispatch after the throwing call (3rd event never delivered)');
+    const toggles = reqs65b.filter(isToggle65);
+    eq(toggles.length >= 2 && toggles[0]!.payload[0] === 0x01, true,
+      '65 listen: abort session saw ON [01] first');
+    eq(toHex(toggles[toggles.length - 1]!.payload), '00',
+      '65 listen: mid-stream abort STILL sends OFF [00]');
+  }
+})();
 
 void main();
