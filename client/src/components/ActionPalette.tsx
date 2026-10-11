@@ -3,9 +3,16 @@
  * query is active every non-empty group is force-expanded and empty groups
  * are hidden. The Keyboard category renders as physical-layout rows
  * (UHK #7) with a custom-HID escape hatch; search falls back to a flat
- * grid for scanability. */
+ * grid for scanability.
+ *
+ * Two tabs: Actions (the original accordion) and Applications
+ * (AppShortcutPane — app picker + platform swap). The app-shortcuts corpus
+ * loads lazily on first switch to Applications, never on mount; once
+ * loaded, an active Actions-tab search also surfaces cross-app ranked
+ * hits (rankAppHits) above the accordion. The platform flag persists
+ * (usePersistentFlag) and is shared by the pane and the ranked rows. */
 
-import { useMemo, useState } from "react";
+import { useMemo, useRef, useState } from "react";
 import { Search } from "lucide-react";
 import {
   ACTIONS,
@@ -22,6 +29,15 @@ import {
   parseCustomHid,
 } from '@create-reflow/sdk';
 import { cn } from '../lib/utils';
+import { usePersistentFlag } from "../hooks/usePersistentFlag";
+import {
+  appShortcutActionDef,
+  detectPlatform,
+  loadAppShortcuts,
+  rankAppHits,
+  type AppShortcutDb,
+  type Platform,
+} from "../lib/app-shortcuts";
 import { Button } from "./ui/button";
 import {
   Accordion,
@@ -34,6 +50,7 @@ import {
   InputGroupAddon,
   InputGroupInput,
 } from "./ui/input-group";
+import AppShortcutPane, { AppShortcutRow } from "./AppShortcutPane";
 
 // Palette glyph = the same icon the keycap will show: build the record with
 // a dummy KK=0, describe it, resolve via the shared map. The mapping is
@@ -149,6 +166,37 @@ export default function ActionPalette({
   const [q, setQ] = useState("");
   const [open, setOpen] = useState<string[]>(["Keyboard"]);
 
+  // Applications tab. The corpus load fires only when the user switches
+  // to the tab (Decision 2 — no prefetch on mount); the platform flag is
+  // persisted and shared by the pane and the ranked section below.
+  const [tab, setTab] = useState<"actions" | "apps">("actions");
+  const [db, setDb] = useState<AppShortcutDb | null>(null);
+  const [dbLoading, setDbLoading] = useState(false);
+  const [dbErr, setDbErr] = useState(false);
+  const [mac, toggleMac] = usePersistentFlag(
+    "reflow.appsc.mac",
+    detectPlatform() === "mac",
+  );
+  const platform: Platform = mac ? "mac" : "windows";
+  const loadStarted = useRef(false);
+
+  const openApps = () => {
+    setTab("apps");
+    if (loadStarted.current) return;
+    loadStarted.current = true;
+    setDbLoading(true);
+    loadAppShortcuts().then(
+      (d) => {
+        setDb(d);
+        setDbLoading(false);
+      },
+      () => {
+        setDbErr(true);
+        setDbLoading(false);
+      },
+    );
+  };
+
   const needle = q.trim().toLowerCase();
   const groups = useMemo(
     () =>
@@ -178,91 +226,154 @@ export default function ActionPalette({
         : null,
     [needle, filter],
   );
+  // Cross-app ranked hits for the Actions tab — only with a needle and a
+  // loaded corpus; the corpus exists only after the user visited
+  // Applications, so the palette is untouched before that.
+  const hits = useMemo(
+    () => (db && needle ? rankAppHits(db, needle, platform) : []),
+    [db, needle, platform],
+  );
 
   return (
     <div className="flex flex-col gap-2">
-      <InputGroup className="h-8 text-xs">
-        <InputGroupAddon>
-          <Search />
-        </InputGroupAddon>
-        <InputGroupInput
-          placeholder="Search actions…"
-          value={q}
-          onChange={(e) => setQ(e.target.value)}
+      <div className="flex gap-1">
+        <Button
+          size="sm"
+          variant={tab === "actions" ? "default" : "outline"}
           className="text-xs"
+          onClick={() => setTab("actions")}
+        >
+          Actions
+        </Button>
+        <Button
+          size="sm"
+          variant={tab === "apps" ? "default" : "outline"}
+          className="text-xs"
+          onClick={openApps}
+        >
+          Applications
+        </Button>
+      </div>
+      {tab === "apps" ? (
+        <AppShortcutPane
+          db={db}
+          loading={dbLoading}
+          error={dbErr}
+          platform={platform}
+          onTogglePlatform={toggleMac}
+          onPick={onPick}
+          filter={filter}
         />
-      </InputGroup>
-      {groups.length === 0 && (
-        <div className="text-xs text-muted-foreground py-4 text-center">
-          No actions match.
-        </div>
-      )}
-      <Accordion
-        type="multiple"
-        value={value}
-        onValueChange={setOpen}
-        className="max-h-64 overflow-y-auto pr-1"
-      >
-        {groups.map((g) => (
-          <AccordionItem key={g.cat} value={g.cat}>
-            <div className="sticky top-0 bg-card">
-              <AccordionTrigger className="justify-start">
-                {g.cat}
-                <span className="ml-2 mr-auto font-mono text-xs text-muted-foreground">
-                  {g.items.length}
-                </span>
-              </AccordionTrigger>
+      ) : (
+        <>
+          <InputGroup className="h-8 text-xs">
+            <InputGroupAddon>
+              <Search />
+            </InputGroupAddon>
+            <InputGroupInput
+              placeholder="Search actions…"
+              value={q}
+              onChange={(e) => setQ(e.target.value)}
+              className="text-xs"
+            />
+          </InputGroup>
+          {hits.length > 0 && (
+            <div className="flex flex-col gap-1">
+              <div className="text-xs text-muted-foreground">
+                Application shortcuts
+              </div>
+              <div className="max-h-64 overflow-y-auto pr-1 flex flex-col gap-1">
+                {hits.map((h) => {
+                  const def = appShortcutActionDef(h.app, h.entry, platform);
+                  if (!def) return null;
+                  return (
+                    <AppShortcutRow
+                      key={def.id}
+                      app={h.app}
+                      entry={h.entry}
+                      platform={platform}
+                      def={def}
+                      onPick={onPick}
+                      filter={filter}
+                    />
+                  );
+                })}
+              </div>
             </div>
-            <AccordionContent>
-              {kbGroup && g.cat === "Keyboard" ? (
-                <>
-                  {kbGroup.rows.map((row, i) => (
-                    <div key={i} className="mb-1 flex flex-wrap gap-1">
-                      {row.map((a) => (
-                        <ActionBtn
-                          key={a.id}
-                          a={a}
-                          pickedId={pickedId}
-                          onPick={onPick}
-                          cls={rowCls(a.label)}
-                        />
+          )}
+          {groups.length === 0 && (
+            <div className="text-xs text-muted-foreground py-4 text-center">
+              No actions match.
+            </div>
+          )}
+          <Accordion
+            type="multiple"
+            value={value}
+            onValueChange={setOpen}
+            className="max-h-64 overflow-y-auto pr-1"
+          >
+            {groups.map((g) => (
+              <AccordionItem key={g.cat} value={g.cat}>
+                <div className="sticky top-0 bg-card">
+                  <AccordionTrigger className="justify-start">
+                    {g.cat}
+                    <span className="ml-2 mr-auto font-mono text-xs text-muted-foreground">
+                      {g.items.length}
+                    </span>
+                  </AccordionTrigger>
+                </div>
+                <AccordionContent>
+                  {kbGroup && g.cat === "Keyboard" ? (
+                    <>
+                      {kbGroup.rows.map((row, i) => (
+                        <div key={i} className="mb-1 flex flex-wrap gap-1">
+                          {row.map((a) => (
+                            <ActionBtn
+                              key={a.id}
+                              a={a}
+                              pickedId={pickedId}
+                              onPick={onPick}
+                              cls={rowCls(a.label)}
+                            />
+                          ))}
+                        </div>
                       ))}
-                    </div>
-                  ))}
-                  {kbGroup.rest.length > 0 && (
+                      {kbGroup.rest.length > 0 && (
+                        <div className="grid grid-cols-[repeat(auto-fill,minmax(44px,1fr))] gap-1">
+                          {kbGroup.rest.map((a) => (
+                            <ActionBtn
+                              key={a.id}
+                              a={a}
+                              pickedId={pickedId}
+                              onPick={onPick}
+                              cls="aspect-square"
+                            />
+                          ))}
+                        </div>
+                      )}
+                      <CustomHidRow onPick={onPick} />
+                    </>
+                  ) : (
                     <div className="grid grid-cols-[repeat(auto-fill,minmax(44px,1fr))] gap-1">
-                      {kbGroup.rest.map((a) => (
+                      {g.items.map((a) => (
                         <ActionBtn
                           key={a.id}
                           a={a}
                           pickedId={pickedId}
                           onPick={onPick}
-                          cls="aspect-square"
+                          cls={cn("aspect-square", {
+                            "text-xl": a.label.length < 4,
+                          })}
                         />
                       ))}
                     </div>
                   )}
-                  <CustomHidRow onPick={onPick} />
-                </>
-              ) : (
-                <div className="grid grid-cols-[repeat(auto-fill,minmax(44px,1fr))] gap-1">
-                  {g.items.map((a) => (
-                    <ActionBtn
-                      key={a.id}
-                      a={a}
-                      pickedId={pickedId}
-                      onPick={onPick}
-                      cls={cn("aspect-square", {
-                        "text-xl": a.label.length < 4,
-                      })}
-                    />
-                  ))}
-                </div>
-              )}
-            </AccordionContent>
-          </AccordionItem>
-        ))}
-      </Accordion>
+                </AccordionContent>
+              </AccordionItem>
+            ))}
+          </Accordion>
+        </>
+      )}
     </div>
   );
 }
