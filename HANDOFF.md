@@ -409,6 +409,19 @@ refs for `special:1` — an imported MO(2) is counted `unknown` on re-export
     (toggle + live raw row/col event tail), and the Behavior-tab fe/1005
     host-OS select (Windows/macOS) riding the settings draft path. See the
     keyscan notes below.
+11. **App-shortcuts dictionary (Phase 8)** — ✅ DONE 2026-10-12 (commits
+    18c021f..b91db5e + the plan commit 59b938b + this docs commit). The
+    action palette gains an Applications tab backed by an MIT-licensed
+    per-app shortcut corpus — 150 apps / 16 categories / 19,853 actions,
+    vendored verbatim from ShortcutMapper + CreateCompanion and compacted
+    by a deterministic codegen. The loader synthesizes family-0x01
+    KEY_PRESS ActionDefs straight from the vendored OpenFlow-style `bytes`
+    (zero SDK change), the corpus ships as a lazy dynamic-import chunk
+    loaded only on the first Applications-tab switch, chords are
+    platform-aware (UA default + persisted toggle), `hidPairOf` keeps
+    multi-key chords out of behavior slots (OF shortcut_alias parity), and
+    palette search gains a ranked scorer ported from OpenFlow. See the
+    app-shortcuts notes below.
 
 ## BLE notes (Phase 6) — wire provenance & known limitations
 
@@ -469,6 +482,54 @@ refs for `special:1` — an imported MO(2) is counted `unknown` on re-export
   (`busyRef` is held throughout; an AbortSignal rewrite is the later
   cleanup candidate); a key held at session end freezes in the pressed
   set (UI gated on `running`, so nothing implies live state after stop).
+
+## App shortcuts notes (Phase 8) — provenance & mechanics
+
+- **Provenance**: MIT. The corpus merges the ShortcutMapper export (Waldo
+  Bronchart, github.com/waldobronchart/ShortcutMapper), the CreateCompanion
+  curated catalog, and hand-authored entries — exactly what the vendored
+  `_meta` records (generated 2026-09-06). The SOURCE ships verbatim at
+  `client/src/data/app-shortcuts.source.json`; the compact runtime corpus
+  regenerates deterministically via
+  `node client/scripts/gen-app-shortcuts.mjs`; `ATTRIBUTION.md` at the repo
+  root credits the upstreams.
+- **Counts**: 150 apps / 16 categories / 19,853 actions — 17,373 Windows
+  chords, 15,765 macOS, 13,285 shared; zero entries missing chord or
+  bytes. Multi-step sequences and anything using Fn are dropped at
+  curation time: one binding is one record.
+- **Encoding equivalence — zero SDK change**: an OpenFlow `bytes` hex
+  `b0 b1 b2 b3` IS the KEY_PRESS param `[usageLo, usageHi, page, mods]`,
+  so the loader synthesizes the ActionDef body
+  `[0x01, 0x04, b0, b1, b2, b3]` — the identical family-0x01 payload
+  (`sdk/src/actions.ts`). `describeRecord` (`sdk/src/naya.ts:1037`) reads
+  the same records back, page 0x0007/0x000c + mods suffix.
+  Modifiers-only entries (page 0x00, the "(Hold)" gestures) bind as-is
+  and render no glyph.
+- **Platform semantics**: the default follows the user agent
+  (`detectPlatform()`); the pane-header toggle persists via
+  `usePersistentFlag` — `localStorage` key `reflow.appsc.mac`
+  (`client/src/components/ActionPalette.tsx:176`) — and is shared by the
+  pane and the ranked rows. Swapping platforms binds the OTHER platform's
+  bytes. `hidPairOf` (`sdk/src/t10.ts:217`) admits only page-0x0007 +
+  mods-0 single-key records into behavior slots, so multi-key chords stay
+  palette-only — OF shortcut_alias parity, pinned by a smoke assert.
+- **Lazy strategy**: the corpus loads through a dynamic import → its own
+  Vite chunk (`app-shortcuts-*.js`, ~1.76 MB), fetched ONLY on the first
+  switch to the Applications tab — no prefetch; the main chunk pays just
+  the filename (+0.94%). Ranked app hits in the palette activate only
+  once the corpus is loaded.
+- **Ranked search**: scoped port of OpenFlow's ActionPalette scorer —
+  whole-needle boundary word hits, first-hit-per-chord dedup, weights
+  name 40 / context 20 / chord 10 over bases exact 3 / word 2 /
+  startsWith 1 / contains 0, final = best×1000 + sum, top 20.
+  Zero RegExp.
+- **Known limitations**: the `codeFrom` page-parse quirk
+  (`client/src/components/tabs/modules/bindings.ts:205` reads the mods
+  byte as page-high) is NOTED, NOT FIXED — unreachable for app defs,
+  since the module dialog filters chords out; ranked search is scoped to
+  the palette (not OF's full unified-tabs sweep); per-app shortcut search
+  is substring, not ranked; a failed corpus load memoizes the rejection —
+  no retry until page reload.
 
 ## Ecosystem / diplomacy context
 
