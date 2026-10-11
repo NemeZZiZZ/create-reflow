@@ -390,6 +390,35 @@ refs for `special:1` — an imported MO(2) is counted `unknown` on re-export
    locked rows, settings adoption), the per-layer bay picker with
    window/slot-0 guards, and `openflow.module-profile` import/export. See
    the module profiles notes in "Native format" above.
+9. **BLE panel + device I/O log (Phase 6)** — ✅ DONE 2026-10-11 (commits
+   7e93199..2f8ac89 + the plan commit 4d92949 + this docs commit). BLE
+   verbs (1002/1005/1008/1009/100A/100C) with read-back-verify, the 239B
+   be/100C status decode, 4-state pairing verdicts, the fw-keyed
+   negative-only capability cache, a per-session device I/O log, and the
+   Devices-tab BLE slot panel with confirm gating. See the BLE notes below.
+
+## BLE notes (Phase 6) — wire provenance & known limitations
+
+- **be-GET param convention**: OUR BLE GETs send a single `[0x00]` param —
+  live-proven on be/1006 + be/100f (the aux sweep answers). OpenFlow sends
+  EMPTY payloads; the discrepancy is UNRESOLVED — the Phase-10 live probe
+  settles it. A flip touches 2 spots: `BLE_GET_PARAM`
+  (`sdk/src/ble.ts:27`) + the inline `[0]` params in `sdk/src/aux.ts`
+  `q()` (lines 92/106).
+- **be/1009 (Select) / be/100A (Clear & pair) never ran on live
+  hardware** — wire forms smoke-verified only; watch their first live use
+  in the I/O log viewer. The wire-guard blocks only be/1004 (UNPAIR ALL);
+  100A is caller-confirmed (window.confirm), slot 0 refused pre-wire
+  (dongle reserve).
+- **239B be/100C layout** pinned against two real captures; the vendor
+  nayactl parser's EXPERIMENTAL fields (conn interval/PHY/MTU etc.) are
+  deliberately NOT imported (known indexing bugs there).
+- **Phase-10 live-confirm**: negative-cache stickiness on transient
+  failures (M2 — any non-BusySkip error records the negative);
+  empty-payload replies count as ANSWERED by the cache (M3).
+- Stale wording, eventual cleanup: `firmware-mismatch.ts`'s "vendor
+  tooling" flash advice — this app flashes keymaps itself (FW flashing is
+  still external).
 
 ## Ecosystem / diplomacy context
 
