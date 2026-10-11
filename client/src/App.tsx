@@ -177,6 +177,12 @@ export default function App() {
     setLayer(below.length > 0 ? below[below.length - 1] : idxs[0]);
   }, [layerList, layer]);
 
+  // Module profile store (Phase 5b): profiles + bay picks persist in
+  // localStorage; readAll() captures unmatched slots on read. ModulesTab
+  // consumes this hook in a later task — wired here only. Declared BEFORE
+  // useFlash: the flash pre-step plans module writes against this state.
+  const moduleProfiles = useModuleProfiles({ sesRef, busyRef, log });
+  clearModuleLiveRef.current = moduleProfiles.clearLive;
   const { flashing, flashState, doFlashQueue } = useFlash({
     sesRef,
     busyRef,
@@ -189,16 +195,19 @@ export default function App() {
     },
     notes,
     anims: () => animByLayer.current,
+    // Module-profile state for the flash pre-step: when the queue holds
+    // module writes, the layout is planned and every template slot is
+    // read before the first write goes out.
+    modules: {
+      profiles: moduleProfiles.profiles,
+      bays: moduleProfiles.bays,
+      live: moduleProfiles.live,
+    },
     dumpAll: layers.dumpAll,
     bumpDraft,
     log,
   });
   const { customColors, saveCustomColors } = useCustomColors();
-  // Module profile store (Phase 5b): profiles + bay picks persist in
-  // localStorage; readAll() captures unmatched slots on read. ModulesTab
-  // consumes this hook in a later task — wired here only.
-  const moduleProfiles = useModuleProfiles({ sesRef, busyRef, log });
-  clearModuleLiveRef.current = moduleProfiles.clearLive;
   // 'off' when the Bindings tab is hidden: the keyboard card unmounts on tab
   // switch, and useKbFit must re-attach its observer when it comes back.
   const { kbBoxRef, kbStageRef, kbScale } = useKbFit(

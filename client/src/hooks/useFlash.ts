@@ -10,8 +10,13 @@ import type { Draft, DraftDrop, Op } from '@create-reflow/sdk';
 import { concat, encodeRestorePayload, isWriteAck, sleep, toHex } from '@create-reflow/sdk';
 import type { KeyRec, LayerEntry, LedRec, NayaSession, Side } from '@create-reflow/sdk';
 import { parseCmdPath } from '@create-reflow/sdk';
+import {
+  encodeModuleConfig, fitsChunkBudget, overlay, planModuleLayout, recordsFromModuleBlob,
+} from '@create-reflow/sdk';
+import type { BayAssignments, ConfigRecords, ModuleProfile } from '@create-reflow/sdk';
 import { readInventory } from './useLayers';
 import type { LayerDump } from './useLayers';
+import type { ModuleSlotLive } from './useModuleProfiles';
 import type { LogFn } from './useLog';
 
 export type FlashResult = 'ok' | 'cannot-verify' | 'partial' | 'fail';
@@ -38,6 +43,18 @@ function isLayerListAck(payload: Uint8Array): boolean {
   if (payload.length === 0) return false;
   const p0 = payload[0];
   return p0 === 0x00 || (p0 >= 0x01 && p0 <= 0x07);
+}
+
+/** Module-write ACK gate (30/100c config, 30/100a list): accepted when
+ * the reply opens 00 (the settings/module write convention) or echoes
+ * the addressed slot in payload[1]. UNPINNED, CONSERVATIVE — no measured
+ * module-write ACK capture exists yet; the shape is inferred from the
+ * 30/1002 layer-list gate and the 0xEA-rejection precedent. The Phase-10
+ * live probe settles the real byte shape. 0xEA = value rejected; an
+ * empty payload is not an ACK. */
+function isModuleAck(payload: Uint8Array, slot: number): boolean {
+  if (payload.length === 0) return false;
+  return payload[0] === 0x00 || payload[1] === slot;
 }
 
 /** Structured NACK abort message (flash capability model): the op summary
@@ -89,6 +106,7 @@ export function useFlash({
   layers,
   notes,
   anims,
+  modules,
   dumpAll,
   bumpDraft,
   log,
@@ -108,6 +126,17 @@ export function useFlash({
   /** last-known per-layer animations (lowercase animationId) read at flash
    * time — getter so the freshest ref value lands in the backup */
   anims?: () => Record<number, string>;
+  /** Module-profile state (Phase 5b): when the queue holds module writes,
+   * the pre-flash step plans the slot layout against this state and reads
+   * every template source BEFORE the first write. Omitted → no pre-step
+   * (there is no live state to plan from). */
+  modules?: {
+    profiles: ModuleProfile[];
+    bays: BayAssignments;
+    /** T1's per-slot read verdicts (30/1009 entries as last read) — the
+     * planner's live device list. */
+    live: Record<number, ModuleSlotLive>;
+  };
   dumpAll: (ses: NayaSession) => Promise<LayerDump | null>;
   bumpDraft: () => void;
   log: LogFn;
@@ -167,6 +196,87 @@ export function useFlash({
       else if (bk.reason === 'storage')
         log('err', 'auto-backup: storage unavailable/full — continuing without');
       await ses.handshake();
+      // Module pre-step (Phase 5b Task 2, BINDING precondition): while
+      // module writes are queued, plan the slot layout against the live
+      // device state and read EVERY template source BEFORE the first
+      // write — a new slot's config is seeded from a same-type slot's raw
+      // records (overlay's unmodeled passthrough), and reading after the
+      // list write would seed from bytes this same flash is about to
+      // overwrite (the proven overwrite hazard). Runs only when the draft
+      // holds module ops — a keymap-only flash must not demand docked
+      // modules or spend device reads — and only when the caller passed
+      // the modules option (without it there is no live state to plan
+      // from; the pre-step is skipped, not invented).
+      const hasModuleOps = d.ops.some(
+        (o) => o.kind === 'moduleCfg' || o.kind === 'moduleList',
+      );
+      if (modules !== undefined && hasModuleOps) {
+        const { profiles, bays, live } = modules;
+        // Live device list from the T1 read verdicts; bay references from
+        // the store's picks (every profile id a bay points at).
+        const deviceList = Object.values(live).map((m) => ({
+          slot: m.slot,
+          uuid: m.uuid,
+          type: m.type,
+        }));
+        const references = Object.values(bays).flatMap((row) => Object.values(row));
+        const plan = planModuleLayout(profiles, deviceList, references);
+        if ('error' in plan) {
+          // Dock-first / >8 refusals: ABORT before ANY write — the catch
+          // below does the toast + log + fail phase with this message.
+          throw new Error(plan.error);
+        }
+        // ALL template reads first (deduped per source slot), none after
+        // a write has gone out.
+        const templates = new Map<string, ConfigRecords>(); // profileId → overlaid
+        const readSlots = new Map<number, ConfigRecords>(); // source slot → records
+        for (const a of plan.assignments) {
+          const src = plan.templateSources[a.profileId];
+          if (src === null || src === undefined) continue; // kept slot — records already there
+          let template = readSlots.get(src);
+          if (template === undefined) {
+            const { blob } = await ses.readModuleConfig(src);
+            template = recordsFromModuleBlob(blob);
+            readSlots.set(src, template);
+          }
+          const profile = profiles.find((p) => p.id === a.profileId);
+          if (profile === undefined) continue; // unreachable: the planner assigns store profiles
+          templates.set(a.profileId, overlay(template, profile, profile.type));
+          log(
+            'inf',
+            `module plan: slot ${a.slot} template read from slot ${src} ("${profile.name}")`,
+          );
+        }
+        // REPLACE the queued moduleCfg records with the overlaid ones —
+        // payloads re-encoded through the queueModuleConfig encoder
+        // (encodeModuleConfig owns 100C addressing; no hand-rolled join).
+        for (let i = 0; i < d.ops.length; i++) {
+          const o = d.ops[i];
+          if (o.kind !== 'moduleCfg') continue;
+          const a = plan.assignments.find((x) => x.slot === o.slot);
+          const recs = a !== undefined ? templates.get(a.profileId) : undefined;
+          if (recs === undefined) continue; // kept/unplanned slot — the queued records stand
+          const recArr = [...recs.values()];
+          const payload = encodeModuleConfig(o.slot, recArr);
+          if (!fitsChunkBudget(payload)) {
+            throw new Error(
+              `slot ${o.slot} overlaid config exceeds the 483-byte two-frame ceiling — nothing was written`,
+            );
+          }
+          d.ops[i] = { ...o, records: recArr, payload };
+        }
+        // Plan summary: slots allocated / reclaimed / gaps.
+        const assigned = plan.assignments.map((a) => a.slot);
+        const gaps = [1, 2, 3, 4, 5, 6, 7].filter((s) => !assigned.includes(s));
+        log(
+          'inf',
+          `module plan: ${assigned.length} slot(s) allocated` +
+            (assigned.length > 0 ? ` [${assigned.join(', ')}]` : '') +
+            `, ${plan.reclaimed.length} reclaimed` +
+            (plan.reclaimed.length > 0 ? ` [${plan.reclaimed.join(', ')}]` : '') +
+            `, gaps [${gaps.join(', ')}]`,
+        );
+      }
       // Snapshot iteration: settings ops self-remove from d.ops on ACK.
       for (const o of [...d.ops]) {
         log('inf', `flash ${done + 1}/${total}: ${opSummary(o)}`);
@@ -214,6 +324,27 @@ export function useFlash({
             );
           }
           d.removeAt(d.ops.indexOf(o)); // self-remove like settings/module
+        } else if (o.kind === 'moduleCfg') {
+          // Full module config write (30/100c): params = [slot] + records,
+          // pre-encoded at queue time by encodeModuleConfig (the one verb
+          // WITHOUT the 00 MODULE_ADDR prefix). ACK gate is conservative/
+          // UNPINNED (see isModuleAck — Phase-10 live verification).
+          // Self-remove on ACK like settings/module: no GET exists, the
+          // ACK is the only verification.
+          const f = await ses.cmd(0x30, 0x10, 0x0c, o.payload);
+          if (!isModuleAck(f.payload, o.slot))
+            throw new Error(nackMessage(o, f.payload));
+          d.removeAt(d.ops.indexOf(o)); // no GET — ACK is the only verification
+        } else if (o.kind === 'moduleList') {
+          // Module-list write (30/100a): add entry or delete, payload from
+          // encodeListAdd/encodeListDelete — the addressed slot rides
+          // payload[1]. Same conservative ACK gate. NOT the layers
+          // continuation: adds/deletes are NOT idempotent (a blind resend
+          // after a moved slot hits the wrong entry) — a NACK throws.
+          const f = await ses.cmd(0x30, 0x10, 0x0a, o.payload);
+          if (!isModuleAck(f.payload, o.payload[1]))
+            throw new Error(nackMessage(o, f.payload));
+          d.removeAt(d.ops.indexOf(o)); // no GET — ACK is the only verification
         } else {
           throw new Error('unknown op kind');
         }
@@ -335,7 +466,7 @@ export function useFlash({
       busyRef.current = false;
       setFlashing(false);
     }
-  }, [sesRef, busyRef, draftRef, layers, notes, anims, dumpAll, bumpDraft, log]);
+  }, [sesRef, busyRef, draftRef, layers, notes, anims, modules, dumpAll, bumpDraft, log]);
 
   const doFlashQueue = useCallback((): Promise<FlashResult> => {
     if (inFlight.current) return inFlight.current;

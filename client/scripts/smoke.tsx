@@ -3867,4 +3867,44 @@ void (async () => {
   await ses60.close();
 })();
 
+// §61 chunk budget ↔ stats frames parity (5a binding condition [c]): the
+// executor's write and draft.stats() must count CDC frames with the SAME
+// formula — chunkBudget = ceil((len+1)/242), one framing byte per frame —
+// or the plan's frame total drifts from what the wire actually carries.
+// 483 stays the two-frame ceiling (a 3rd frame hangs fw 3.28.7).
+{
+  const lens61 = [1, 242, 243, 483, 484];
+  const want61 = [1, 2, 2, 2, 3]; // ceil((len+1)/242) at each length
+  const payloads61 = lens61.map((len) => new Uint8Array(len));
+  const drafts61 = payloads61.map((payload) => {
+    const d = new Draft();
+    d.ops.push({
+      kind: 'moduleCfg', slot: 2, records: [],
+      payload, label: '61 budget parity',
+    });
+    return d;
+  });
+  for (let i = 0; i < lens61.length; i++) {
+    eq(drafts61[i].stats().frames, want61[i],
+      `61 chunkBudget↔stats parity: ${lens61[i]}B moduleCfg payload → ${want61[i]} frame(s)`);
+  }
+  eq(
+    drafts61.every(
+      (_, i) =>
+        drafts61[i].stats().frames === chunkBudget(payloads61[i]) &&
+        drafts61[i].stats().frames === Math.ceil((lens61[i] + 1) / 242),
+    ),
+    true,
+    '61 chunkBudget↔stats parity: stats === chunkBudget === ceil((len+1)/242) at every length',
+  );
+  const dl61 = new Draft();
+  queueModuleListDelete(dl61, 5);
+  eq(
+    dl61.ops[0].kind === 'moduleList' && dl61.stats().frames === 1 &&
+      dl61.stats().frames === chunkBudget(encodeListDelete(5)),
+    true,
+    '61 chunkBudget↔stats parity: a 5B moduleList delete counts 1 frame — same formula',
+  );
+}
+
 void main();
