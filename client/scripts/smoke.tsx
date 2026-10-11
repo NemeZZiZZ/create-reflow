@@ -63,6 +63,9 @@ import {
   planModuleLayout, missingBaseBays, orphanGcOps,
   queueModuleConfig, queueModuleListAdd, queueModuleListDelete, queueBayAssignment,
 } from '@create-reflow/sdk';
+import {
+  parseModuleList, recordsFromModuleBlob, matchSlots, captureFromSlots, repointBays,
+} from '@create-reflow/sdk';
 import type { LayerDump } from '../src/hooks/useLayers';
 
 let n = 0;
@@ -3480,5 +3483,372 @@ void (async () => {
   queueModuleListDelete(pqClean, 1);
   eq(probeDraft(pqClean).length, 0, '59 probe: in-window moduleCfg/moduleList are clean');
 }
+
+// §60 module read path: 30/1009 list parse (byte-exact literal), per-slot
+// record mapping, content match (the uuid only orders equals — content
+// decides, each candidate compared under its OWN convention), capture-on-
+// read (numbered naming, device overrides, no inherited drift rows), bay
+// repoint scoped to one profile, and readModuleList through a scripted
+// device (request params ride the MODULE_ADDR seam: [0x00, 0x00]).
+const UUID60 = 'aabbccddeeff00112233445566778899';
+// Read-form entry = the write form minus its 00 flag byte:
+// [slot][id][flag][0x10][uuid16] — 20 bytes, the layer-list shape.
+const entry60 = (slot: number, flag: number, uuid: string) =>
+  encodeListAdd(slot, slot, flag as 0 | 1 | 2 | 3, uuid).slice(1);
+{
+  const list60 = Uint8Array.from([
+    0x00, 0x00, // [status][index echo] header — the 30/1001 model
+    ...entry60(5, MODULE_TYPE_CODE.TRACK, UUID60),
+    ...entry60(2, MODULE_TYPE_CODE.TUNE, '11223344556677889900aabbccddeeff'),
+    ...entry60(0, MODULE_TYPE_CODE.TOUCH, '00ff00ff00ff00ff00ff00ff00ff00ff'),
+    ...entry60(7, 0x7a, 'deadbeefdeadbeefdeadbeefdeadbeef'),
+  ]);
+
+  const parsed60 = parseModuleList(list60);
+  eq(parsed60.length, 4, '60 parse: header skipped, four entries');
+  const s5_60 = parsed60.find((e) => e.slot === 5)!;
+  eq(`${s5_60.id}/${s5_60.typeFlag}/${s5_60.type}/${s5_60.uuid}`,
+    `5/${MODULE_TYPE_CODE.TRACK}/TRACK/${UUID60}`,
+    '60 parse: slot 5 entry byte-exact ([05][05][01][10]<uuid16>, plain-hex uuid)');
+  const s2_60 = parsed60.find((e) => e.slot === 2)!;
+  eq(`${s2_60.type}/${s2_60.uuid}`, 'TUNE/11223344556677889900aabbccddeeff',
+    '60 parse: TUNE entry carries its list type');
+  const s7_60 = parsed60.find((e) => e.slot === 7)!;
+  eq(`${s7_60.type}/${s7_60.typeFlag}`, 'FLOAT/122',
+    '60 parse: unknown flag 0x7a → FLOAT fallback, raw byte carried');
+  eq(parsed60.some((e) => e.slot === 0 && e.uuid === '00ff00ff00ff00ff00ff00ff00ff00ff'), true,
+    '60 parse: slot 0 (blank template) parses like any entry');
+  eq(parseModuleList(Uint8Array.from([...list60, 0x99])).length, 4,
+    '60 parse: trailing fragment that forms no entry is ignored');
+  eq(parseModuleList(Uint8Array.from([
+    0x00, 0x00, 0x05, 0x05, 0x01, 0x08, ...Array.from({ length: 16 }, () => 0xaa),
+  ])).length, 0,
+    '60 parse: uuid-length byte ≠ 0x10 → entry skipped');
+
+  // Slot config blob → ConfigRecords: same universal record walk as
+  // parseModuleConfig ([field][type][len][body]), keyed by field.
+  const blob60 = Uint8Array.from([
+    0x00, 0x01, 0x01, 0x1e, // field 0x00, setting 30
+    0x05, 0x01, 0x01, 0x24, // field 0x05, setting 36 (ticks wire)
+    0x0e, 0x04, 0x06, 0x01, 0x04, 0xea, 0x00, 0x0c, 0x00, // field 0x0e keypress
+    0x0f, 0x07, 0x00, // field 0x0f empty
+    0x0f, // truncated tail — ignored
+  ]);
+  const recs60 = recordsFromModuleBlob(blob60);
+  eq(recs60.size, 4, '60 records: four records keyed by field');
+  eq(toHex(recs60.get(0x0e)!), '0e 04 06 01 04 ea 00 0c 00',
+    '60 records: record bytes kept verbatim ([field][type][len][body])');
+
+  /* --- matchSlots --------------------------------------------------------- */
+  const trackL60 = StockProfiles.TRACK_LEFT;
+  const trackR60 = StockProfiles.TRACK_RIGHT;
+  const leftOver60 = overlay(new Map<number, Uint8Array>(), trackL60, 'TRACK');
+  const rightOver60 = overlay(new Map<number, Uint8Array>(), trackR60, 'TRACK');
+  const driftOrig60 = { ...trackL60, id: 'u-orig', name: 'Drifted Left' };
+
+  const matchA60 = matchSlots(
+    [{ slot: 3, id: 3, typeFlag: MODULE_TYPE_CODE.TRACK, uuid: 'u-orig', type: 'TRACK' }],
+    { 3: leftOver60 },
+    [trackL60, trackR60, driftOrig60],
+  );
+  eq(matchA60.length === 1 && matchA60[0].slot === 3, true, '60 match: one slot in, one match out');
+  eq(matchA60[0].matched?.id, 'u-orig',
+    '60 match: the drifted original names its own entry (uuid tie among equal content)');
+  eq(`${matchA60[0].ranked[0].differs}/${matchA60[0].ranked[0].tie}`, '0/0',
+    '60 match: ranking is (differs, tie, name) — content first, uuid share only orders equals');
+
+  const matchB60 = matchSlots(
+    [{ slot: 4, id: 4, typeFlag: MODULE_TYPE_CODE.TRACK, uuid: 'u-foreign-uuid', type: 'TRACK' }],
+    { 4: rightOver60 },
+    [trackL60, trackR60],
+  );
+  eq(matchB60[0].matched?.id, 'TRACK_RIGHT',
+    '60 match: a uuid the app never wrote still matches by CONTENT (type from the list byte)');
+  eq(matchB60[0].uuid, 'u-foreign-uuid', '60 match: the entry carries the device uuid verbatim');
+
+  const uuidShared60 = {
+    ...trackL60,
+    id: 'u-tie-a',
+    name: 'Uuid Left',
+    bindings: {
+      ...trackL60.bindings,
+      'tap:track:button_1': { actionType: 'mouse', actionCode: 'M2' },
+    },
+  };
+  const matchC60 = matchSlots(
+    [{ slot: 6, id: 6, typeFlag: MODULE_TYPE_CODE.TRACK, uuid: 'u-tie-a', type: 'TRACK' }],
+    { 6: leftOver60 },
+    [uuidShared60, trackL60],
+  );
+  eq(matchC60[0].matched?.id, 'TRACK_LEFT',
+    '60 match: uuid never decides content — a drifted uuid-sharer loses to the matching profile');
+  eq(matchC60[0].ranked[0].tie, 2, '60 match: the content match ranks first even at tie 2');
+  eq(matchC60[0].differs, 0, '60 match: closest differs 0 → matched');
+
+  const byId60 = { ...trackL60, id: 'u-left', name: 'AAA One' };
+  const byFrom60 = { ...trackL60, id: 'zzz-id', name: 'Zzz One', capturedFrom: 'u-left' };
+  const matchD60 = matchSlots(
+    [{ slot: 1, id: 1, typeFlag: MODULE_TYPE_CODE.TRACK, uuid: 'u-left', type: 'TRACK' }],
+    { 1: leftOver60 },
+    [byFrom60, byId60],
+  );
+  eq(matchD60[0].ranked.map((r) => r.profile.id).join(','), 'u-left,zzz-id',
+    '60 match: among equal content the uuid sharer (tie 0) beats captured-from (tie 1)');
+
+  const matchE60 = matchSlots(
+    [{ slot: 1, id: 1, typeFlag: MODULE_TYPE_CODE.TRACK, uuid: 'nobody', type: 'TRACK' }],
+    { 1: leftOver60 },
+    [
+      { ...trackL60, id: 'm2', name: 'Mmm Two' },
+      { ...trackL60, id: 'a2', name: 'Aaa Two' },
+    ],
+  );
+  eq(matchE60[0].ranked[0].profile.name, 'Aaa Two',
+    '60 match: name breaks a full (differs, tie) tie — deterministic');
+
+  const winLeft60 = {
+    ...trackL60,
+    id: 'win',
+    name: 'Win Left',
+    settings: { ...trackL60.settings, scroll_convention: 1 },
+  };
+  const matchF60 = matchSlots(
+    [{ slot: 2, id: 2, typeFlag: MODULE_TYPE_CODE.TRACK, uuid: 'mac-slot', type: 'TRACK' }],
+    { 2: leftOver60 },
+    [winLeft60, trackL60],
+  );
+  eq(matchF60[0].matched?.id, 'TRACK_LEFT',
+    '60 match: each candidate compares under its OWN scroll convention');
+  eq(matchF60[0].ranked.find((r) => r.profile.id === 'win')!.differs > 0, true,
+    '60 match: the windows candidate sees cat-4 drift in mac bytes (not matched)');
+
+  const matchG60 = matchSlots(
+    [
+      { slot: 0, id: 0, typeFlag: MODULE_TYPE_CODE.TRACK, uuid: 'tpl', type: 'TRACK' },
+      { slot: 7, id: 7, typeFlag: MODULE_TYPE_CODE.TRACK, uuid: 'lonely', type: 'TRACK' },
+    ],
+    {},
+    [trackL60],
+  );
+  eq(matchG60.map((m) => m.slot).join(','), '7',
+    '60 match: slot 0 (blank template) is never matched');
+  eq(matchG60[0].matched === null && matchG60[0].differs > 0 && matchG60[0].closest !== null,
+    true, '60 match: no records → every row absent, nothing matched, closest still named');
+
+  /* --- captureFromSlots ----------------------------------------------------- */
+  const tuneStock60 = StockProfiles.TUNE;
+  const tuneOver60 = overlay(new Map<number, Uint8Array>(), tuneStock60, 'TUNE');
+  const muteUsage60 = nameToUsage('C_MUTE')!;
+  const driftedTune60 = new Map(tuneOver60);
+  driftedTune60.set(0x00, encodeModuleField(0x00, 'setting', 30));
+  driftedTune60.set(0x05, encodeModuleField(0x05, 'setting', 36)); // 36°/detent = 10 detents
+  driftedTune60.set(0x0e, encodeModuleField(0x0e, 'keypress', Uint8Array.from([
+    0x01, 0x04,
+    muteUsage60.usage & 0xff, (muteUsage60.usage >> 8) & 0xff,
+    muteUsage60.page & 0xff, (muteUsage60.page >> 8) & 0xff,
+  ])));
+
+  const capProfiles60 = [
+    tuneStock60,
+    { ...tuneStock60, id: 'aaa-capture', name: 'Aaa (on board) 5' },
+    { ...tuneStock60, id: 'nnn-capture', name: 'Naya Tune Mac/Win (on board)' },
+    { ...tuneStock60, id: 'nnn2-capture', name: 'Naya Tune Mac/Win (on board) 2' },
+  ];
+  const capEntries60 = [
+    { slot: 2, id: 2, typeFlag: MODULE_TYPE_CODE.TUNE, uuid: 'u-cap-tune', type: 'TUNE' },
+    { slot: 6, id: 6, typeFlag: MODULE_TYPE_CODE.TUNE, uuid: 'u-cap2', type: 'TUNE' },
+    { slot: 7, id: 7, typeFlag: MODULE_TYPE_CODE.TUNE, uuid: 'u-cap3', type: 'TUNE' },
+  ];
+  const cap60 = captureFromSlots(
+    capEntries60,
+    { 2: driftedTune60, 6: driftedTune60, 7: driftedTune60 },
+    capProfiles60,
+  );
+  eq(cap60.length, 3, '60 capture: three drifting slots, three captures');
+  eq(cap60.map((c) => c.slot).join(','), '2,6,7', '60 capture: slots carried');
+  const cap1_60 = cap60[0].profile;
+  eq(`${cap1_60.capturedFrom}/${cap1_60.type}`, 'u-cap-tune/TUNE',
+    '60 capture: capturedFrom = the device uuid, type from the list byte');
+  eq(/^[0-9a-f]{32}$/.test(cap1_60.id) && cap1_60.id !== 'u-cap-tune', true,
+    '60 capture: NEW uuid (mintLayerUuid shape), never the device one');
+  eq(cap60.map((c) => c.profile.name).join('|'),
+    'Aaa (on board) 2|Aaa (on board) 3|Aaa (on board) 4',
+    '60 capture: "<closest name> (on board)" numbered from the STRIPPED base — a capture of a capture counts on, never doubles the suffix');
+  eq(cap1_60.variant, 'TUNE', '60 capture: variant carried from the closest');
+  eq(`${cap1_60.settings.pointer_speed}/${cap1_60.settings.ticks_per_rotation}/${cap1_60.settings.pointer_accel}`,
+    '30/10/50',
+    '60 capture: device settings adopted (30 reads as 30; ticks wire 36 = 10 detents; agreed values carried)');
+  eq(cap1_60.settings.scroll_convention, undefined,
+    "60 capture: convention stays the closest profile's (never a device field)");
+  eq(`${cap1_60.bindings['tap:tune:2_fingers'].actionType}/${cap1_60.bindings['tap:tune:2_fingers'].actionCode}`,
+    'key/C_MUTE',
+    '60 capture: divergent rows rebuilt FROM THE DEVICE (keypress decodes back to its action)');
+  const agreeDial60 = cap1_60.bindings['rotate:tune:dial'];
+  eq(`${agreeDial60.actionCode}/${agreeDial60.split === undefined}`, 'C_VOL_DOWN - C_VOL_UP/true',
+    '60 capture: agreeing dial halves keep the seed row verbatim (combined kept, no split bolted on)');
+  eq(diffProfile(cap1_60, driftedTune60, conventionOf(cap1_60.settings)).length, 0,
+    '60 capture: the captured profile inherits NO drift rows');
+  eq(compareRecords(overlay(new Map<number, Uint8Array>(), cap1_60, 'TUNE'), driftedTune60), true,
+    '60 capture: byte truth — the capture re-encodes to exactly what the slot stores');
+
+  // Dial drift: gesturesOfType must YIELD the paired row, or a divergent
+  // dial keeps the seed binding verbatim and the capture inherits a diff
+  // row. The halves (0x23 CCW / 0x22 CW) hold C_MUTE / C_NEXT — the seed's
+  // combined C_VOL pair names neither.
+  const nextUsage60 = nameToUsage('C_NEXT')!;
+  const driftedDial60 = new Map(tuneOver60);
+  driftedDial60.set(0x23, encodeModuleField(0x23, 'keypress', Uint8Array.from([
+    0x01, 0x04,
+    muteUsage60.usage & 0xff, (muteUsage60.usage >> 8) & 0xff,
+    muteUsage60.page & 0xff, (muteUsage60.page >> 8) & 0xff,
+  ])));
+  driftedDial60.set(0x22, encodeModuleField(0x22, 'keypress', Uint8Array.from([
+    0x01, 0x04,
+    nextUsage60.usage & 0xff, (nextUsage60.usage >> 8) & 0xff,
+    nextUsage60.page & 0xff, (nextUsage60.page >> 8) & 0xff,
+  ])));
+  const capDial60 = captureFromSlots(
+    [{ slot: 3, id: 3, typeFlag: MODULE_TYPE_CODE.TUNE, uuid: 'u-cap-dial', type: 'TUNE' }],
+    { 3: driftedDial60 },
+    [tuneStock60],
+  );
+  eq(capDial60.length === 1 && capDial60[0].slot === 3, true,
+    '60 capture: the dial-drifted slot differs from the seed and is captured');
+  const dialB60 = capDial60[0].profile.bindings['rotate:tune:dial'];
+  eq(dialB60.split?.['-']?.actionCode, 'C_MUTE',
+    '60 capture: a divergent dial is REBUILT from its half fields (0x23 minus half → C_MUTE)');
+  eq(dialB60.split?.['+']?.actionCode, 'C_NEXT',
+    '60 capture: dial plus half 0x22 → C_NEXT');
+  eq(`${dialB60.actionType}/${dialB60.actionCode}`, 'value/C_MUTE - C_NEXT',
+    '60 capture: the rebuilt dial row reads the device halves combined (seed code replaced)');
+  eq(diffProfile(capDial60[0].profile, driftedDial60, conventionOf(capDial60[0].profile.settings)).length, 0,
+    '60 capture: dial drift does not survive the capture (0 diff rows)');
+  eq(compareRecords(overlay(new Map<number, Uint8Array>(), capDial60[0].profile, 'TUNE'), driftedDial60), true,
+    "60 capture: byte truth — the rebuilt dial re-encodes to exactly the slot's halves");
+
+  const driftedTrack60 = new Map(leftOver60);
+  driftedTrack60.set(0x0b, encodeModuleField(0x0b, 'mouseMask', MOUSE_MASK.M2));
+  const capSkip60 = captureFromSlots(
+    [
+      { slot: 0, id: 0, typeFlag: MODULE_TYPE_CODE.TRACK, uuid: 'tpl', type: 'TRACK' },
+      { slot: 4, id: 4, typeFlag: MODULE_TYPE_CODE.TRACK, uuid: 'u-foreign-uuid', type: 'TRACK' },
+      { slot: 5, id: 5, typeFlag: MODULE_TYPE_CODE.TRACK, uuid: 'u-drift', type: 'TRACK' },
+    ],
+    { 4: rightOver60, 5: driftedTrack60 },
+    [trackL60, trackR60],
+  );
+  eq(capSkip60.length === 1 && capSkip60[0].slot === 5, true,
+    '60 capture: content-matched slots (and slot 0) capture NOTHING');
+  eq(diffProfile(capSkip60[0].profile, driftedTrack60, 'mac').length, 0,
+    '60 capture: a mask drift decodes back too (mouse M2)');
+  eq(capSkip60[0].profile.name, 'Naya Track Left (on board)',
+    '60 capture: the name follows the closest by rank (here the drifted-from stock)');
+
+  const swappedTrack60 = new Map(leftOver60);
+  // A real swap moves the VALUE between the fields — each record keeps its
+  // own field byte ([field][type][len][body] is keyed by that byte).
+  swappedTrack60.set(0x0a, Uint8Array.from([0x0a, ...leftOver60.get(0x09)!.slice(1)]));
+  swappedTrack60.set(0x09, Uint8Array.from([0x09, ...leftOver60.get(0x0a)!.slice(1)]));
+  const capSwap60 = captureFromSlots(
+    [{ slot: 3, id: 3, typeFlag: MODULE_TYPE_CODE.TRACK, uuid: 'u-swap', type: 'TRACK' }],
+    { 3: swappedTrack60 },
+    [trackL60, trackR60],
+  );
+  eq(capSwap60.length, 1, '60 capture: an inverted axis is drift too');
+  eq(capSwap60[0].profile.bindings['rotate:track']?.invert, 1,
+    '60 capture: swapped selector halves rebuild as invert (a selector swap — no flag on the device)');
+  eq(diffProfile(capSwap60[0].profile, swappedTrack60, 'mac').length, 0,
+    '60 capture: the invert rebuild is byte-exact');
+
+  /* --- repointBays ----------------------------------------------------------- */
+  const bays60 = { 0: { 0x4a: 'dead-id', 0x4b: 'other-id' }, 1: { 0x4c: 'dead-id' } };
+  const rp60 = repointBays(bays60, 'dead-id', 'live-id');
+  eq(rp60.moved, 2, '60 repoint: both dead references move');
+  eq(`${rp60.bays[0][0x4a]}/${rp60.bays[0][0x4b]}/${rp60.bays[1][0x4c]}`,
+    'live-id/other-id/live-id',
+    "60 repoint: ONE profile scope — fromId follows the board, other profiles' picks untouched");
+  eq(bays60[0][0x4a], 'dead-id', '60 repoint: the input is never mutated');
+  const rpSelf60 = repointBays(bays60, 'dead-id', 'dead-id');
+  eq(rpSelf60.moved === 0 && rpSelf60.bays[0][0x4a] === 'dead-id', true,
+    '60 repoint: fromId === toId moves nothing');
+}
+
+// End-to-end: readModuleList through a scripted device (the §56 harness
+// shape) — request params must be MODULE_ADDR(0) = [0x00, 0x00], the part
+// byte advancing, the two reply parts stitching byte-exact.
+void (async () => {
+  const listBytes60 = Uint8Array.from([
+    0x00, 0x00,
+    ...entry60(5, MODULE_TYPE_CODE.TRACK, UUID60),
+    ...entry60(2, MODULE_TYPE_CODE.TUNE, '11223344556677889900aabbccddeeff'),
+  ]);
+  const reqs60: Frame[] = [];
+  const scripted60 = (reply: (rq: Frame) => Uint8Array) => {
+    const queue: Uint8Array[] = [];
+    let waiter: (() => void) | null = null;
+    const reader = {
+      async read(): Promise<{ value?: Uint8Array; done?: boolean }> {
+        for (;;) {
+          const c = queue.shift();
+          if (c) return { value: c, done: false };
+          await new Promise<void>((res) => { waiter = res; });
+        }
+      },
+      cancel() { const w = waiter; waiter = null; w?.(); },
+      releaseLock() {},
+    };
+    const writer = {
+      async write(b: Uint8Array) {
+        const rq = verifyFrame(Uint8Array.from(b));
+        const resp = buildFrame(0x50, rq.type, rq.c0, rq.c1, reply(rq));
+        verifyFrame(resp);
+        setTimeout(() => { queue.push(resp); const w = waiter; waiter = null; w?.(); }, 5);
+      },
+      releaseLock() {},
+    };
+    const port = {
+      readable: { locked: false, getReader: () => reader },
+      writable: { getWriter: () => writer },
+      async open() {}, async setSignals() {}, async close() {},
+    };
+    return {
+      session() {
+        const r = port.readable.getReader() as unknown as ReadableStreamDefaultReader<Uint8Array>;
+        const w = port.writable.getWriter() as unknown as WritableStreamDefaultWriter<Uint8Array>;
+        return new NayaSession(
+          port as unknown as SerialPort, 0x50,
+          new FrameReader(r), w, r,
+          async (b) => { await w.write(b); }, null,
+        );
+      },
+    };
+  };
+  const dev60 = scripted60((rq) => {
+    reqs60.push(rq);
+    if (rq.c1 !== 0x09) return Uint8Array.from([0x11]);
+    return rq.payload[0] === 0
+      ? Uint8Array.from([0x01, 0x00, ...listBytes60.slice(0, 8)])
+      : Uint8Array.from([0x00, 0x00, ...listBytes60.slice(8)]);
+  });
+  const ses60 = dev60.session();
+  let blobR60: Uint8Array | null = null;
+  let err60 = '';
+  try { blobR60 = await ses60.readModuleList(); } catch (e) { err60 = (e as Error).message; }
+  eq(err60, '', '60 readModuleList: no throw');
+  eq(blobR60 !== null && toHex(blobR60) === toHex(listBytes60), true,
+    '60 readModuleList: the two reply parts stitch byte-exact');
+  eq(reqs60.length, 2, '60 readModuleList: exactly part 0 + part 1 requested');
+  eq(toHex(Uint8Array.from([reqs60[0].type, reqs60[0].c0, reqs60[0].c1])), '30 10 09',
+    '60 readModuleList rides 30/10/09');
+  eq(toHex(reqs60[0].payload), '00 00',
+    '60 readModuleList part 0 params = MODULE_ADDR(0) — [flag, index] from the addressing seam');
+  eq(toHex(reqs60[1].payload), '01 00',
+    '60 readModuleList: the part byte advances, the seam index byte stays 0');
+  const liveList60 = parseModuleList(blobR60 ?? new Uint8Array(0));
+  eq(liveList60.length === 2 && liveList60[0].slot === 5 && liveList60[0].type === 'TRACK'
+    && liveList60[1].type === 'TUNE', true,
+    '60 readModuleList: the live blob parses into list entries');
+  await ses60.close();
+})();
 
 void main();

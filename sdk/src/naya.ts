@@ -7,6 +7,8 @@
 //   response: sender echoes dst, id = remaining-parts counter (multipart)
 //   XOR = xor of body bytes (C0..end of payload), LEN = len(C0 C1 PARAMS)
 
+import { moduleAddr } from './module-wire';
+
 export const DST_LEFT = 0x50;
 export const DST_RIGHT = 0x51;
 export const VID = 0x37d1;
@@ -342,6 +344,7 @@ export class NayaSession {
   private async readMultipart(
     c1: number,
     layer: number,
+    params?: (part: number) => Uint8Array,
   ): Promise<{ blob: Uint8Array; status: string }> {
     if (this.streamDirtyC1 === c1) {
       await this.drainStream(c1);
@@ -364,7 +367,7 @@ export class NayaSession {
           0x30,
           0x10,
           c1,
-          new Uint8Array([part, layer]),
+          params ? params(part) : new Uint8Array([part, layer]),
           undefined,
           accept,
         );
@@ -641,6 +644,20 @@ export class NayaSession {
     // 30/100b MODULE CONFIG DATA: same [part,layer] multipart shape.
     // 40 slots/layer, records [SLOT, FAMILY, LEN, payload].
     return this.readMultipart(0x0b, layer);
+  }
+
+  async readModuleList(): Promise<Uint8Array> {
+    // 30/1009 MODULE LIST read — the shared multipart loop at index 0, the
+    // readModuleConfig machinery. The request params flow through the
+    // MODULE_ADDR seam: [part, index] where the index byte IS moduleAddr(0)'s
+    // second byte (the same [flag, index] tail every module param payload
+    // opens with). Part 0 on the wire: 00 00 — byte-identical to
+    // moduleAddr(0); replies echo the index in their second byte
+    // (partMatcher keys on it, same as every 30/10xx multipart read).
+    const read = await this.readMultipart(0x09, 0, (part) =>
+      Uint8Array.from([part, moduleAddr(0)[1]]),
+    );
+    return read.blob;
   }
 
   async getTimeouts(): Promise<Uint8Array> {
