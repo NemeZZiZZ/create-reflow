@@ -20,6 +20,7 @@ import type { KeyRec, LedRec } from '@create-reflow/sdk';
 import { parseSnapshotFile, diffSnapshotToDraft, hexToBytes } from '@create-reflow/sdk';
 import type { SnapMaps } from '@create-reflow/sdk';
 import { timeoutsMs, timeoutsPayload } from '@create-reflow/sdk';
+import { parseKeyScanEvent, hostOsOp } from '@create-reflow/sdk';
 import Keyboard from '../src/components/Keyboard';
 import {
   saveAutoBackup,
@@ -4567,5 +4568,41 @@ void (async () => {
   eq(err64?.hex, '', '64 err: no payload arrived — hex empty');
   await ses64b.close();
 })();
+
+// §65 keyscan test mode, part 1 (SDK layer): fe/1009 event parse +
+// fe/1005 host-OS op + wire-guard verdicts. fe/1009 payload is
+// [row, col, state, ...]: state 0 = PRESS (INVERTED vs intuition — the
+// device reports the raw switch state, 0 = closed). fe/1005 host-OS rides
+// a 1-byte payload with 0 = Windows, 1 = macOS — NOT the 200/201 values
+// the module system uses for host OS. All three verbs are benign
+// (test-mode toggle, event stream, plain setting write): the wire guard
+// must let them through.
+{
+  const throws65 = (fn: () => unknown) => {
+    try { fn(); return false; } catch { return true; }
+  };
+  const ev650 = parseKeyScanEvent(Uint8Array.from([3, 5, 0]));
+  eq(JSON.stringify(ev650), JSON.stringify({ row: 3, col: 5, pressed: true }),
+    '65 keyscan: [3,5,0] → {row:3,col:5,pressed:true} (state 0 = PRESS, inverted)');
+  eq(parseKeyScanEvent(Uint8Array.from([3, 5, 1]))!.pressed, false,
+    '65 keyscan: [3,5,1] → pressed:false (non-zero state = release)');
+  eq(parseKeyScanEvent(Uint8Array.from([3, 5, 2]))!.pressed, false,
+    '65 keyscan: [3,5,2] → pressed:false (any non-zero state = release)');
+  eq(parseKeyScanEvent(Uint8Array.of()), null, '65 keyscan: 0 bytes → null (no row/col/state)');
+  eq(parseKeyScanEvent(Uint8Array.from([3])), null, '65 keyscan: 1 byte → null');
+  eq(parseKeyScanEvent(Uint8Array.from([3, 5])), null, '65 keyscan: 2 bytes → null (state byte required)');
+
+  eq(toHex(hostOsOp('windows').payload), '00',
+    '65 hostOsOp: windows → payload 00 (1 byte, NOT the module 200 value)');
+  eq(toHex(hostOsOp('mac').payload), '01',
+    '65 hostOsOp: mac → payload 01 (1 byte, NOT the module 201 value)');
+
+  eq(throws65(() => assertWireAllowed(0xfe, 0x10, 0x08)), false,
+    '65 guard allows fe/1008 (keyscan test-mode toggle — benign SET)');
+  eq(throws65(() => assertWireAllowed(0xfe, 0x10, 0x09)), false,
+    '65 guard allows fe/1009 (keyscan event stream — read-side, no destructive effect)');
+  eq(throws65(() => assertWireAllowed(0xfe, 0x10, 0x05)), false,
+    '65 guard allows fe/1005 (host-OS setting — plain SET write)');
+}
 
 void main();

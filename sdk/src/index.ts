@@ -8,6 +8,7 @@ export * from './io-log';
 export * from './draft';
 export * from './t10';
 export * from './settings';
+export * from './keyscan';
 export * from './modules';
 export * from './flavors';
 export * from './queue';

@@ -2,7 +2,18 @@
  * Mirrors the AGENTS.md danger list: fa/* (format/erase), ee/10be + ee/10ae
  * (DFU/MCUBoot resets), 30/10ca (factory format — wipes the layer-list
  * store; stays a text-only recipe, never a button), be/1004 (UNPAIR ALL —
- * drops every Bluetooth bond including computers; text-only repair). */
+ * drops every Bluetooth bond including computers; text-only repair).
+ *
+ * Verdicts (checked, allowed — NOT banned):
+ * - fe/1008 keyscan test-mode toggle: benign one-byte SET ([0x01] on /
+ *   [0x00] off). Reversible by sending the opposite byte; no erase, no
+ *   reset, no store wipe. While ON it streams fe/1009 events, but that is
+ *   its documented purpose, not a side effect.
+ * - fe/1009 keyscan event stream: read-side event frames (row/col/state).
+ *   Carries no destructive effect — the device simply reports switches.
+ * - fe/1005 host-OS setting: plain one-byte SET (0 = Windows, 1 = macOS;
+ *   never the t19 module 200/201 values). An ordinary settings write, no
+ *   more destructive than ed/1012-1014. */
 
 const hex = (n: number) => n.toString(16).padStart(2, "0");
 

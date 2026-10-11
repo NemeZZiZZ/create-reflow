@@ -9,7 +9,8 @@
  * resets, be/1004 UNPAIR ALL (drops every bond, computers included).
  * assertWireAllowed is the runtime guard. fe/100a is NOT banned: it is a
  * plain SET ACTIVITY TIMEOUTS write (the Behavior tab uses it) — recipes
- * simply never need it. */
+ * simply never need it. fe/1008 keyscan, fe/1009 events, fe/1005 host-OS
+ * are NOT banned (benign test-mode toggle / event stream / setting write). */
 import allKeysDead from "./all-keys-dead";
 import batteryOdd from "./battery-odd";
 import bootloaderParked from "./bootloader-parked";
