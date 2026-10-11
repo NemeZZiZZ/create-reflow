@@ -48,6 +48,7 @@ import {
   bleSelectProfile, bleClearProfile, readAux,
 } from '@create-reflow/sdk';
 import type { BleProfileStatus, SplitLinkReport } from '@create-reflow/sdk';
+import { createIoLog, hexHead } from '@create-reflow/sdk';
 import {
   MODULE_ADDR, moduleAddr, MODULE_TYPE_CODE,
   encodeListAdd, encodeListDelete, encodeBlankConfig, encodeModuleConfig,
@@ -4420,6 +4421,151 @@ void (async () => {
     '63 seam: cached-negative rows surface in devRows');
   eq(snap63b.bleName, 'Naya', '63 seam: positive re-probe still parses (name from sweep 2)');
   await capSes63.close();
+})();
+
+// §64 device I/O log — roundtrip tap (TX before write, RX per frame, error
+// record on the sync-lost throw), bounded 500 ring, subscribe/clear, hex
+// truncation. The tap lives INSIDE roundtrip, so traffic is captured even
+// when the client onFrame handler is suppressed (null) — forensics for
+// aux-polling suppression is the whole point.
+void (async () => {
+  /* ---- (a) pure ring: subscribe/unsubscribe, bound 500, clear, hex -------- */
+  const log64 = createIoLog();
+  let fires64 = 0;
+  const un64 = log64.subscribe(() => { fires64++; });
+  log64.push({ dir: '>', type: 0xfa, c0: 0x10, c1: 0x01, len: 1, hex: '00' });
+  eq(fires64, 1, '64 ring: subscribe fires on push');
+  un64();
+  log64.push({ dir: '<', type: 0xfa, c0: 0x10, c1: 0x01, len: 1, hex: '65' });
+  eq(fires64, 1, '64 ring: unsubscribe stops the callbacks');
+
+  const ring64 = createIoLog();
+  for (let i = 0; i < 520; i++)
+    ring64.push({ dir: '>', type: i & 0xff, c0: 0, c1: 0, len: 0, hex: '' });
+  eq(ring64.snapshot().length, 500, '64 ring: 520 pushes → snapshot holds the bound 500');
+  eq(ring64.snapshot()[0]!.seq, 20, '64 ring: oldest evicted (first kept is push #20)');
+  eq(ring64.snapshot()[499]!.seq, 519, '64 ring: newest kept is push #519');
+  eq(ring64.snapshot().every((e, i, a) => i === 0 || e.seq === a[i - 1]!.seq + 1), true,
+    '64 ring: seq strictly monotonic across eviction');
+  ring64.clear();
+  eq(ring64.snapshot().length, 0, '64 ring: clear() empties the ring');
+
+  eq(hexHead(Uint8Array.from([0xde, 0xad, 0xbe, 0xef])), 'DE AD BE EF',
+    '64 hex: uppercase space-separated bytes');
+  eq(hexHead(new Uint8Array(50).fill(0xab)).split(' ').length, 49,
+    '64 hex: 50B payload → 48 hex bytes + one length-note token');
+  eq(hexHead(new Uint8Array(50).fill(0xab)).startsWith('AB AB AB '), true,
+    '64 hex: truncation keeps the FIRST bytes');
+  eq(hexHead(new Uint8Array(50).fill(0xab)).endsWith('…+2'), true,
+    '64 hex: length note names the dropped tail (…+2)');
+  eq(hexHead(new Uint8Array(48).fill(9)).split(' ').length, 48,
+    '64 hex: exactly 48B payload → no note');
+  eq(hexHead(Uint8Array.from([1, 2, 3]), 2), '01 02 …+1',
+    '64 hex: cap parameter honored');
+
+  /* ---- (b) scripted exchange: TX+RX byte-pinned shape, seq order, ms ------ */
+  const scripted64 = (reply: (rq: Frame) => Uint8Array | null) => {
+    const reqs: Frame[] = [];
+    const queue: Uint8Array[] = [];
+    let waiter: (() => void) | null = null;
+    const reader = {
+      async read(): Promise<{ value?: Uint8Array; done?: boolean }> {
+        for (;;) {
+          const c = queue.shift();
+          if (c) return { value: c, done: false };
+          await new Promise<void>((res) => { waiter = res; });
+        }
+      },
+      cancel() { const w = waiter; waiter = null; w?.(); },
+      releaseLock() {},
+    };
+    const writer = {
+      async write(b: Uint8Array) {
+        const rq = verifyFrame(Uint8Array.from(b));
+        reqs.push(rq);
+        const resp = reply(rq);
+        if (resp === null) return; // device stays silent → sync-lost path
+        const frame = buildFrame(0x50, rq.type, rq.c0, rq.c1, resp);
+        verifyFrame(frame);
+        setTimeout(() => { queue.push(frame); const w = waiter; waiter = null; w?.(); }, 5);
+      },
+      releaseLock() {},
+    };
+    const port = {
+      readable: { locked: false, getReader: () => reader },
+      writable: { getWriter: () => writer },
+      async open() {}, async setSignals() {}, async close() {},
+    };
+    return {
+      reqs,
+      session(fr?: FrameReader) {
+        const r = port.readable.getReader() as unknown as ReadableStreamDefaultReader<Uint8Array>;
+        const w = port.writable.getWriter() as unknown as WritableStreamDefaultWriter<Uint8Array>;
+        return new NayaSession(
+          port as unknown as SerialPort, 0x50,
+          fr ?? new FrameReader(r), w, r,
+          async (b) => { await w.write(b); }, null,
+        );
+      },
+    };
+  };
+  const dev64 = scripted64(() => Uint8Array.from([0x00, 0x2a]));
+  const ses64 = dev64.session();
+  eq(ses64.ioLog !== undefined && typeof ses64.ioLog.snapshot === 'function', true,
+    '64 tap: every session carries an ioLog from the constructor');
+  eq(ses64.onFrame, null, '64 tap: client onFrame handler suppressed (null) in this harness');
+
+  await ses64.cmd(0xfa, 0x10, 0x01, Uint8Array.from([0]));
+  const snap64 = ses64.ioLog.snapshot();
+  eq(snap64.length, 2, '64 tap: one cmd → exactly one TX + one RX record');
+  const tx64 = snap64[0]!;
+  const rx64 = snap64[1]!;
+  eq(tx64.dir, '>', '64 TX: dir ">"');
+  eq(tx64.type, 0xfa, '64 TX: type = request t byte');
+  eq(tx64.c0, 0x10, '64 TX: c0');
+  eq(tx64.c1, 0x01, '64 TX: c1');
+  eq(tx64.len, 1, '64 TX: len = payload byte count');
+  eq(tx64.hex, '00', '64 TX: hex = payload bytes, uppercase');
+  eq(rx64.dir, '<', '64 RX: dir "<"');
+  eq(rx64.type, 0xfa, '64 RX: type echoed');
+  eq(rx64.c0, 0x10, '64 RX: c0 echoed');
+  eq(rx64.c1, 0x01, '64 RX: c1 echoed');
+  eq(rx64.len, 2, '64 RX: len = reply payload byte count');
+  eq(rx64.hex, '00 2A', '64 RX: hex byte-pinned (uppercase, space-separated)');
+  eq(rx64.seq, tx64.seq + 1, '64 tap: RX seq immediately follows its TX');
+  eq(typeof tx64.t === 'number' && tx64.t <= Date.now(), true,
+    '64 TX: t = wall clock ms (Date.now)');
+  eq(tx64.ms !== undefined && tx64.ms >= 0, true,
+    '64 ms: completed exchange carries elapsed ms on the TX record');
+  eq(toHex(dev64.reqs[0]!.raw), 'aa 00 50 00 fa 03 10 01 00 11 04',
+    '64 tap: strictly observational — wire frame byte-identical to the untapped vector');
+  await ses64.close();
+
+  /* ---- (c) sync-lost timeout → error record -------------------------------- */
+  // A FrameReader whose readFrame fails fast (ms, not the 5s deadline): the
+  // device never answers, roundtrip burns its tries and throws sync-lost.
+  class SilentReader64 extends FrameReader {
+    constructor() {
+      super({ read: () => new Promise(() => {}) } as unknown as ReadableStreamDefaultReader<Uint8Array>);
+    }
+    async readFrame(): Promise<Frame> { throw new Error('read timeout'); }
+  }
+  const dev64b = scripted64(() => Uint8Array.from([0x00]));
+  const ses64b = dev64b.session(new SilentReader64());
+  let threw64 = '';
+  try { await ses64b.cmd(0x30, 0x10, 0x63, Uint8Array.from([0])); }
+  catch (e) { threw64 = (e as Error).message; }
+  eq(threw64.startsWith('sync lost waiting cmd 30/1063'), true,
+    '64 err: silent device → cmd throws sync-lost naming the verb');
+  const err64 = ses64b.ioLog.snapshot().find((e) => e.err !== undefined);
+  eq(err64?.dir, '<', '64 err: record dir "<" (wire-side outcome, nothing came back)');
+  eq(err64?.err, 'sync lost waiting cmd 30/1063', '64 err: text byte-pinned');
+  eq(err64?.type, 0x30, '64 err: expected verb t byte recorded');
+  eq(err64?.c0, 0x10, '64 err: expected c0 recorded');
+  eq(err64?.c1, 0x63, '64 err: expected c1 recorded');
+  eq(err64?.len, 0, '64 err: no payload arrived — len 0');
+  eq(err64?.hex, '', '64 err: no payload arrived — hex empty');
+  await ses64b.close();
 })();
 
 void main();

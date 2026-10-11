@@ -28,6 +28,7 @@ import { initialUrlState, useUrlSync } from "./hooks/useUrlSync";
 import { useLayers, readInventory } from "./hooks/useLayers";
 import { useSessions } from "./hooks/useSessions";
 import { useAuxPolling } from "./hooks/useAuxPolling";
+import { useBleSlots } from "./hooks/useBleSlots";
 import { useSelection } from "./hooks/useSelection";
 import { useDraft } from "./hooks/useDraft";
 import { useFlash } from "./hooks/useFlash";
@@ -46,10 +47,13 @@ import type { BehaviorSet } from '@create-reflow/sdk';
 import type { ModuleProfile } from '@create-reflow/sdk';
 import {
   assertWireAllowed,
+  bleGetAddress,
+  bleGetAllPairs,
+  bleGetPairAddress,
   type TroubleAction,
   type TroubleCtx,
 } from '@create-reflow/sdk';
-import type { KeyRec, LedRec, Side } from '@create-reflow/sdk';
+import type { BleIdentityRead, KeyRec, LedRec, Side } from '@create-reflow/sdk';
 import { timeoutsMs } from '@create-reflow/sdk';
 import type { EditorView } from "./components/ViewLayerTabs";
 
@@ -167,6 +171,9 @@ export default function App() {
   });
   const draft = useDraft({ keysByLayer, ledsByLayer, layer });
   const { draftRef, bumpDraft, keymap, ledmap, dirtyKks, draftSize } = draft;
+  // BLE slot panel state (Devices tab): explicit reads only — this hook
+  // never touches the wire on its own.
+  const ble = useBleSlots({ sesRef, busyRef, halves, log });
 
   // Keep the viewed layer inside the board's real inventory: after a dump
   // (or a delete + post-flash refresh) a stale ?layer= or now-removed layer
@@ -450,6 +457,51 @@ export default function App() {
           "inf",
           `trouble: layer list rewritten (${inv.length} entr${inv.length === 1 ? "y" : "ies"} echoed back unchanged)`,
         );
+      },
+      // Read-only BLE identity probe for scripted checks (split-link-dead):
+      // be/1008 + be/1002 + be/1005 on BOTH halves, busy-gated like every
+      // user op, sequential like the aux sweep. No writes, ever.
+      bleSplitReads: async () => {
+        if (busyRef.current)
+          throw new Error(
+            "Device busy (flash or dump in flight) — try again after",
+          );
+        const readHalf = async (side: Side): Promise<BleIdentityRead> => {
+          const ses = sesRef.current.get(side);
+          if (!ses)
+            return {
+              connected: false,
+              address: null,
+              pairAddress: null,
+              pairedPeers: null,
+            };
+          const address = await bleGetAddress(ses);
+          const pairAddress = await bleGetPairAddress(ses);
+          const pairs = await bleGetAllPairs(ses);
+          return {
+            connected: true,
+            address,
+            pairAddress,
+            pairedPeers: pairs ? pairs.macs : null,
+          };
+        };
+        busyRef.current = true;
+        try {
+          const left = await readHalf("left");
+          const right = await readHalf("right");
+          const fwText = (side: Side) => {
+            const f = halves[side].fw;
+            return f !== "—" && f !== "" ? f : null;
+          };
+          return {
+            left,
+            right,
+            leftFw: fwText("left"),
+            rightFw: fwText("right"),
+          };
+        } finally {
+          busyRef.current = false;
+        }
       },
     };
     try {
@@ -846,6 +898,8 @@ export default function App() {
             <DevicesTab
               halves={halves}
               draftRef={draftRef}
+              sesRef={sesRef}
+              ble={ble}
               onDeviceInfo={() => setSheetOpen(true)}
             />
           )}

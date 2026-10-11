@@ -38,6 +38,8 @@ export type {
   TroubleCtx,
   TroubleEntry,
   WireStep,
+  BleIdentityRead,
+  SplitLinkReads,
 } from "./types";
 export { assertWireAllowed } from "./wire-guard";
 export { UNDARK_LADDER, undarkSteps } from "./undark";

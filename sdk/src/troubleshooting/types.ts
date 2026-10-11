@@ -36,6 +36,37 @@ export interface TroubleCtx {
    * the reply shape and refuses odd replies instead of writing garbage.
    */
   rewriteLayerList(): Promise<void>;
+  /**
+   * Read-only BLE identity reads on BOTH halves' live sessions for scripted
+   * checks: per half be/1008 (own address), be/1002 (pair address — the PEER
+   * this half points at) and be/1005 (bond-table MACs). No writes, ever —
+   * checks grade, they never repair. Runs under the app's busy gate and
+   * refuses while a dump/flash holds it.
+   */
+  bleSplitReads(): Promise<SplitLinkReads>;
+}
+
+/** One half's BLE identity snapshot for scripted checks (see
+ * TroubleCtx.bleSplitReads). Null reads = offline half or a verb the
+ * firmware left unanswered — absence of evidence, never a verdict. */
+export interface BleIdentityRead {
+  /** the half's session is live (reads were actually attempted). */
+  connected: boolean;
+  /** be/1008 — this half's own BLE address. */
+  address: Uint8Array | null;
+  /** be/1002 — the PEER this half points at. */
+  pairAddress: Uint8Array | null;
+  /** be/1005 bond-table MACs; null = unanswered / not attempted. */
+  pairedPeers: Uint8Array[] | null;
+}
+
+/** Both halves' identity reads + the transport facts a split-link verdict
+ * needs (connected flags + base FW per half, null = unknown). */
+export interface SplitLinkReads {
+  left: BleIdentityRead;
+  right: BleIdentityRead;
+  leftFw: string | null;
+  rightFw: string | null;
 }
 
 export interface TroubleAction {

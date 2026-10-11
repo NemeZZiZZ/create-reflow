@@ -8,6 +8,8 @@
 //   XOR = xor of body bytes (C0..end of payload), LEN = len(C0 C1 PARAMS)
 
 import { moduleAddr } from './module-wire';
+import type { IoLog, IoLogEntry } from './io-log';
+import { createIoLog, hexHead } from './io-log';
 
 export const DST_LEFT = 0x50;
 export const DST_RIGHT = 0x51;
@@ -232,10 +234,37 @@ export async function roundtrip(
   // match the triple and splice a wrong segment into the blob ("truncated"
   // parse). The matcher rejects stale candidates; roundtrip keeps reading.
   match?: (f: Frame) => boolean,
+  // I/O forensic log (per session). Strictly observational — see the tap
+  // comments below; a logging bug must never break an exchange.
+  ioLog?: IoLog | null,
 ): Promise<Frame> {
   const wantT = req[4];
   const wantC0 = req[6];
   const wantC1 = req[7];
+  // ---- I/O TAP (forensics) ------------------------------------------------
+  // The tap lives INSIDE roundtrip, not on the session's onFrame hook:
+  // aux polling suppresses the client handler (ses.onFrame = null), and the
+  // suppressed traffic is exactly what the log exists to capture. Strictly
+  // observational: every log touch is wrapped in try/catch so a logging bug
+  // can never break a flash. TX is recorded BEFORE the port write.
+  let txRec: IoLogEntry | null = null;
+  let sentAt = 0;
+  if (ioLog) {
+    try {
+      const body = req.length > 10 ? req.subarray(8, req.length - 2) : req.subarray(0, 0);
+      sentAt = performance.now();
+      txRec = ioLog.push({
+        dir: '>',
+        type: wantT,
+        c0: wantC0,
+        c1: wantC1,
+        len: body.length,
+        hex: hexHead(body),
+      });
+    } catch {
+      /* logging must never break an exchange */
+    }
+  }
   await writeFn(req);
   if (onFrame) onFrame('>', req);
   for (let i = 0; i < tries; i++) {
@@ -244,6 +273,26 @@ export async function roundtrip(
       f = await fr.readFrame();
     } catch {
       continue;
+    }
+    // RX tap: every received frame, matching or not (stale/foreign frames
+    // are forensically interesting too). ms scheme: see io-log.ts — this
+    // call's TX record is THE matching one (cmd mutex serializes), and the
+    // frame that satisfies the matcher below is the last ms write before
+    // return, so a completed exchange stamps ITS elapsed on the TX record.
+    if (ioLog) {
+      try {
+        ioLog.push({
+          dir: '<',
+          type: f.type,
+          c0: f.c0,
+          c1: f.c1,
+          len: f.payload.length,
+          hex: hexHead(f.payload),
+        });
+        if (txRec) txRec.ms = Math.round(performance.now() - sentAt);
+      } catch {
+        /* logging must never break an exchange */
+      }
     }
     if (onFrame) onFrame('<', f.raw);
     if (
@@ -254,13 +303,31 @@ export async function roundtrip(
     )
       return f;
   }
-  throw new Error(
+  const lost =
     'sync lost waiting cmd ' +
-      wantT.toString(16) +
-      '/' +
-      wantC0.toString(16) +
-      wantC1.toString(16),
-  );
+    wantT.toString(16) +
+    '/' +
+    wantC0.toString(16) +
+    wantC1.toString(16);
+  // Error tap: the timeout/throw path. No device frame arrived that closed
+  // the exchange — record the expected verb with an err note (dir '<' =
+  // wire-side outcome: nothing came back). ms stays unset on the TX record.
+  if (ioLog) {
+    try {
+      ioLog.push({
+        dir: '<',
+        type: wantT,
+        c0: wantC0,
+        c1: wantC1,
+        len: 0,
+        hex: '',
+        err: lost,
+      });
+    } catch {
+      /* logging must never break an exchange */
+    }
+  }
+  throw new Error(lost);
 }
 
 // Thrown by cmd() when a poller's busyGuard trips after the mutex is won:
@@ -308,6 +375,11 @@ export class NayaSession {
   reader: ReadableStreamDefaultReader<Uint8Array>;
   writeFn: WriteFn;
   onFrame: FrameHandler | null;
+  // Per-session device I/O forensic log, filled by the roundtrip() tap.
+  // Captures every exchange INCLUDING traffic whose client onFrame handler
+  // is suppressed (aux polling) — the tap is inside roundtrip, not on the
+  // client hook. Export lives client-side via blob download.
+  ioLog: IoLog;
   // c1 of a multipart family (0x03 keymap / 0x0d ledmap / 0x0b modules)
   // whose stream the device may still hold open; see partMatcher comment.
   streamDirtyC1: number | null = null;
@@ -414,6 +486,7 @@ export class NayaSession {
     this.reader = reader;
     this.writeFn = writeFn;
     this.onFrame = onFrame ?? null;
+    this.ioLog = createIoLog();
   }
 
   static async connect(
@@ -517,6 +590,8 @@ export class NayaSession {
           buildFrame(this.dst, 0xfa, 0x10, 0x01, new Uint8Array([0])),
           6,
           this.onFrame,
+          undefined,
+          this.ioLog,
         );
         if (r.type === 0xfa) break;
       } catch {
@@ -563,6 +638,7 @@ export class NayaSession {
         6,
         this.onFrame,
         match,
+        this.ioLog,
       );
     } finally {
       release();
