@@ -6,11 +6,10 @@
  * app/mcuboot/third, 0x0C8/0x0D3/0x0DE = right. Generation B is bit 0x1000.
  * Unknown PIDs → null — reported as unknown, never guessed (OF pid_info).
  *
- * RECOVERY_PIDS is the phase-9 brief's raw re-enumeration match list,
- * verbatim. Note: it carries bit 0x100 (0x16f/0x1d3), whereas OF derives the
- * gen-B recovery values as base | 0x1000 (0x106f/0x10d3) — those DO decode
- * through this table. Consumers matching recovery ports should be aware
- * (flagged in the task-3 report). */
+ * RECOVERY_PIDS is derived structurally like OF recovery.py:53-55: the
+ * mcuboot family bases (left 0x06F, right 0x0D3) × {0, 0x1000 gen-B bit}.
+ * (An earlier brief draft carried 0x16f/0x1d3 — bit 0x100, which is inside
+ * the family field and decodes to nothing; ruled a transcription slip.) */
 
 export interface PidInfo {
   side: 'left' | 'right';
@@ -20,7 +19,10 @@ export interface PidInfo {
 
 export const NAYA_VID = 0x37d1;
 
-export const RECOVERY_PIDS = [0x06f, 0x16f, 0x0d3, 0x1d3] as const;
+export const RECOVERY_PIDS = [
+  0x06f, 0x06f | 0x1000,
+  0x0d3, 0x0d3 | 0x1000,
+] as const;
 
 export function pidInfo(pid: number): PidInfo | null {
   const generation: 'A' | 'B' = (pid & 0x1000) !== 0 ? 'B' : 'A';

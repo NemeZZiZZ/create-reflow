@@ -5727,8 +5727,15 @@ void (async () => {
   // (c) PID/side/gen table (family 0x064/06F/07A left, 0x0C8/0D3/0DE right;
   //     gen B = pid & 0x1000; unknown → null)
   eq(NAYA_VID, 0x37d1, '69 plat: NAYA_VID 0x37d1');
-  eq(JSON.stringify([...RECOVERY_PIDS]), JSON.stringify([0x06f, 0x16f, 0x0d3, 0x1d3]),
-    '69 plat: RECOVERY_PIDS [0x06f,0x16f,0x0d3,0x1d3]');
+  eq(JSON.stringify([...RECOVERY_PIDS]), JSON.stringify([0x06f, 0x106f, 0x0d3, 0x10d3]),
+    '69 plat: RECOVERY_PIDS [0x06f,0x106f,0x0d3,0x10d3] — mcuboot bases × {0, 0x1000}');
+  {
+    const rp69 = new Set<number>(RECOVERY_PIDS);
+    eq(rp69.has(0x106f) && rp69.has(0x10d3), true,
+      '69 plat: RECOVERY_PIDS covers gen-B MCUboot 0x106f/0x10d3');
+    eq(rp69.has(0x16f) || rp69.has(0x1d3), false,
+      '69 plat: RECOVERY_PIDS excludes the bit-0x100 slips 0x16f/0x1d3');
+  }
   const pi69 = (pid: number): string => {
     const r = pidInfo(pid);
     return r === null ? 'null' : `${r.side}/${r.mode}/${r.generation}`;
@@ -5742,11 +5749,10 @@ void (async () => {
   eq(pi69(0x1064), 'left/app/B', '69 plat: 0x1064 left app B');
   eq(pi69(0x106f), 'left/mcuboot/B', '69 plat: 0x106F left mcuboot B');
   eq(pi69(0x10d3), 'right/mcuboot/B', '69 plat: 0x10D3 right mcuboot B');
-  // The brief's RECOVERY_PIDS list (0x16f/0x1d3) carries bit 0x100 — outside
-  // NayaCore's family table (OF recovery.py masks ONLY bit 0x1000; the gen-B
-  // recovery values there are 0x106f/0x10d3). pidInfo never guesses: unknown
-  // family → null, matching OF pid_info. The raw list is for re-enumeration
-  // matching (see task report note).
+  // 0x16f/0x1d3 (an earlier brief draft) carry bit 0x100 — inside the family
+  // field, not a NayaCore family; the recovery set uses base | 0x1000 (ruled
+  // a transcription slip, matching OF recovery.py). pidInfo never guesses:
+  // unknown family → null, matching OF pid_info.
   eq(pi69(0x16f), 'null', '69 plat: 0x16F is outside the NayaCore family table → null');
   eq(pi69(0x1d3), 'null', '69 plat: 0x1D3 is outside the NayaCore family table → null');
   eq(pi69(0x0009), 'null', '69 plat: 0x0009 unknown family → null');
