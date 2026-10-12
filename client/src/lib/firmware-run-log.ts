@@ -62,6 +62,7 @@ export const STEP_LABELS: Record<string, string> = {
   'lighting.restore': 'Restore lighting',
   'verify.compare': 'Compare against preflight',
   'slot.map': 'Read slot map',
+  'bundle.check': 'Check bundle preconditions',
   'bundle.stored': 'Read stored bundle version',
   'bundle.verify': 'Verify bundle version',
   'bundle.restart': 'Restart keyboard (bundle)',

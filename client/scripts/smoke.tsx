@@ -22,14 +22,14 @@ import {
   FIRMWARE_SOURCE_BASE, newVault, fetchImage, fetchVersion,
 } from '../src/lib/firmware-fetch';
 import { NAYA_VID, RECOVERY_PIDS, pidInfo } from '../src/lib/firmware-plat';
-import { resolveKeyboardPlan } from '../src/lib/firmware-plan';
+import { resolveKeyboardPlan, moduleBundles } from '../src/lib/firmware-plan';
 import { checkFlashGate } from '../src/lib/firmware-interlocks';
 import type { KeyboardGateInput, ModuleGateInput } from '../src/lib/firmware-interlocks';
 import { FirmwareRunLog, STEP_LABELS, stableStringify } from '../src/lib/firmware-run-log';
 import type { RunEvent } from '../src/lib/firmware-run-log';
 import {
   beginFirmwareRun, capturePreflight, endFirmwareRun, firmwareRunActive, startKeyboardRun,
-  verifyPreflight,
+  startModuleRun, verifyPreflight, moduleFwSnapshot, MODULE_REPLUG_TEXT, FWUP_TYPES,
 } from '../src/hooks/useFirmwareFlash';
 import { rescanSweep } from '../src/hooks/useSessions';
 import { defaultSerialWorld } from '../src/lib/serial-world';
@@ -8359,6 +8359,601 @@ void (async () => {
     }
   }
   signal74done?.();
+})();
+
+// §75 module firmware procedure (startModuleRun) + the vendor helpers it
+// needs: preconditions on the live left half only (right unplugged, module
+// docked LEFT, type known unless forceType, bundle range vs the keyboard
+// fw, pairing guard) → already-runs shortcut (no bootloader entry) → ONE
+// SMP link conversation (identify = slot-0 arm token, slot map 3×, image
+// id 4 via the exact-1 MiB rule) → upload → NO post-upload reset (the half
+// self-restarts ~1 s) → bundle.restart (replug action prompt ONCE after
+// replugMs unseen, cleared by the return; boot reset re-sent while a
+// bootloader port shows) → bundle.verify (de/100A == target) →
+// module.program (MOD_FWUP de/1005 = exactly ONE FWUP_TYPES byte, no
+// reply) → module.restart (await keyboard drop, await left back) →
+// module.verify (fw == target AND type == want; a clean wrong-type decode
+// refuses pointing at Force Update) → verify.compare (left identity +
+// keymap) → verdict. Fixtures: the §74 mkApp/mkBoot shapes grown module
+// verbs (de/1 presence+type, de/8 dock fw, de/a stored bundle version,
+// de/5 MOD_FWUP recorded-and-never-answered) as a THREE-stage app fake —
+// before / bundled / programmed instances share one stage closure so the
+// re-enumeration chain is observable; the 1 MiB bundle upload runs for
+// real (the gate refuses any other size); millisecond timeouts injected
+// everywhere.
+let signal75done: (() => void) | null = null;
+// T11's chain point if the docs task needs one (kept available, §74 pattern).
+// eslint-disable-next-line @typescript-eslint/no-unused-vars
+const after75: Promise<void> = new Promise<void>((r) => { signal75done = r; });
+void (async () => {
+  await after74; // §74 owns the one-run lock while its cases run — never interleave
+  const portInfo75 = (pid: number): { usbVendorId: number; usbProductId: number } =>
+    ({ usbVendorId: NAYA_VID, usbProductId: pid });
+  const stubPort75 = (pid: number): PortWithInfo =>
+    ({ getInfo: () => portInfo75(pid) }) as unknown as PortWithInfo;
+  const drop75 = (list: PortWithInfo[], p: PortWithInfo): void => {
+    const i = list.indexOf(p);
+    if (i >= 0) list.splice(i, 1);
+  };
+  const lastEv75 = (log: FirmwareRunLog): RunEvent => log.events[log.events.length - 1]!;
+
+  // ---- catalog picks: the flashable module bundles (newest first) ---------
+  const cat75 = await loadFirmwareCatalog();
+  const bundles75 = moduleBundles(cat75);
+  const entry233_75 = bundles75.find((b) => b.label === '2.3.3')?.entry ?? null;
+  eq(entry233_75 !== null && bundles75[0]?.label === '2.3.3', true,
+    '75 fixture: bundle 2.3.3 exists and is the newest flashable bundle');
+  eq(entry233_75?.keyboardRange?.from, '3.40.0', '75 fixture: bundle 2.3.3 needs keyboard 3.40.0+');
+  const sha233_75 = hexToBytes((entry233_75!.plaintextSha256 ?? entry233_75!.blobSha256).toLowerCase())!;
+  const oneMiB75 = (seed: number): Uint8Array =>
+    Uint8Array.from({ length: 1_048_576 }, (_, i) => (i * 13 + seed) & 0xff);
+  const mkVault75 = (): Vault => {
+    const v = newVault();
+    v.set(entry233_75!, oneMiB75(3));
+    return v;
+  };
+
+  // Three-stage app-mode session fake. The STAGE closure decides the
+  // module verb answers for every instance: 'before' (old bundle stored,
+  // old fw running), 'bundled' (the uploaded bundle sits on the module's
+  // flash — de/100a flips), 'programmed' (MOD_FWUP ran — de/1008 dock fw +
+  // de/1001 type flip). Each INSTANCE has its own dead flag: it stops
+  // answering when IT sees a reboot trigger (ee/ae enter or de/5 fwup —
+  // whichever reaches it), and the world hooks move the port list on.
+  // MOD_FWUP writes are RECORDED (shared sink) and never answered — no
+  // reply is expected.
+  type Stage75 = 'before' | 'bundled' | 'programmed';
+  const mkApp75 = (o: {
+    pid: number;
+    kbFw: Uint8Array; // fe/1002 keyboard fw
+    stage: () => Stage75;
+    storedOld: [number, number, number, number];
+    dockOld: [number, number, number, number];
+    typeByte: number; // de/1001 type byte while docked in the left bay
+    afterFwupTypeByte: number;
+    dockNew: [number, number, number, number];
+    storedNew: [number, number, number, number];
+    sink: { reqs: Frame[]; writes: { key: string; params: Uint8Array }[] };
+    onEnter?: () => void; // ee/10ae landed — the half drops to its bootloader
+    onFwup?: () => void; // MOD_FWUP landed — the world re-enumerates
+  }) => {
+    const queue: Uint8Array[] = [];
+    let waiter: (() => void) | null = null;
+    let dead = false;
+    const storedBytes = (): Uint8Array => {
+      const v = o.stage() === 'before' ? o.storedOld : o.storedNew;
+      return Uint8Array.from([0x00, ...v]); // [00, VER...] — moduleFileFwVersion reads p[1..4]
+    };
+    const dockFwBytes = (): Uint8Array => {
+      if (o.stage() === 'before') return Uint8Array.from([0x00, o.typeByte, 0x00, ...o.dockOld]);
+      return Uint8Array.from([0x00, o.afterFwupTypeByte, 0x00, ...o.dockNew]);
+    };
+    const presenceBytes = (): Uint8Array => {
+      const t = o.stage() === 'before' ? o.typeByte : o.afterFwupTypeByte;
+      return Uint8Array.from([0x00, 0x01, t, 0x00]); // present, LEFT bay (bit0 = 0)
+    };
+    const reader = {
+      async read(): Promise<{ value?: Uint8Array; done?: boolean }> {
+        for (;;) {
+          const c = queue.shift();
+          if (c) return { value: c, done: false };
+          await new Promise<void>((res) => { waiter = res; });
+        }
+      },
+      cancel() { const w = waiter; waiter = null; w?.(); },
+      releaseLock() {},
+    };
+    const writer = {
+      async write(b: Uint8Array) {
+        if (dead) return;
+        const rq = verifyFrame(Uint8Array.from(b));
+        const k = `${rq.type.toString(16)}/${rq.c1.toString(16)}`;
+        o.sink.reqs.push(rq);
+        o.sink.writes.push({ key: k, params: rq.payload });
+        if (k === 'ee/ae') {
+          dead = true; // the enter ack, then the half goes dark
+          const ack = buildFrame(0x50, rq.type, rq.c0, rq.c1, Uint8Array.from([0x00]));
+          verifyFrame(ack);
+          setTimeout(() => { queue.push(ack); const w = waiter; waiter = null; w?.(); }, 5);
+          setTimeout(() => o.onEnter?.(), 30);
+          return;
+        }
+        if (k === 'de/5') {
+          dead = true; // the keyboard restarts under the module program
+          setTimeout(() => o.onFwup?.(), 10);
+          return; // NO reply expected — write-and-forget
+        }
+        const reply = (() => {
+          if (k === 'fa/1') return Uint8Array.from({ length: 33 }, (_, i) => i);
+          if (k === 'fe/2') return o.kbFw;
+          if (k === 'de/a') return storedBytes();
+          if (k === 'de/8') return dockFwBytes();
+          if (k === 'de/1') return presenceBytes();
+          if (k === 'be/8') return Uint8Array.from([0x11, 0x22, 0x33, 0x44, 0x55, 0x66]);
+          if (k === 'be/2') return Uint8Array.from([0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0x0f]);
+          if (k === 'be/5') return Uint8Array.from([1, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0x0f]);
+          if (k === '30/1') return Uint8Array.from([0x00]);
+          if (k === '30/2') return Uint8Array.from([0x00, 0x00]);
+          if (k === '30/3') {
+            const layer = rq.payload[1] ?? 0;
+            const part = rq.payload[0] ?? 0;
+            if (layer === 1) return Uint8Array.from([0x16]);
+            return part === 0
+              ? Uint8Array.from([0x01, layer, 0x10, 0x20, 0x30, 0x40])
+              : Uint8Array.from([0x00, layer, 0x50, 0x60, 0x70, 0x80]);
+          }
+          if (k === '30/d') {
+            const layer = rq.payload[1] ?? 0;
+            return Uint8Array.from([0x00, layer, 0xb4, 0x00, 0x64, 0x11]);
+          }
+          return Uint8Array.from([0x00]);
+        })();
+        const resp = buildFrame(0x50, rq.type, rq.c0, rq.c1, reply);
+        verifyFrame(resp);
+        setTimeout(() => { queue.push(resp); const w = waiter; waiter = null; w?.(); }, 5);
+      },
+      releaseLock() {},
+    };
+    const port = {
+      readable: { locked: false, getReader: () => reader },
+      writable: { getWriter: () => writer },
+      async open() {}, async setSignals() {}, async close() {},
+      getInfo: () => portInfo75(o.pid),
+    };
+    return {
+      port: port as unknown as PortWithInfo,
+      session(): NayaSession {
+        const r = port.readable.getReader() as unknown as ReadableStreamDefaultReader<Uint8Array>;
+        const w = port.writable.getWriter() as unknown as WritableStreamDefaultWriter<Uint8Array>;
+        return new NayaSession(
+          port as unknown as SerialPort, 0x50,
+          new FrameReader(r), w, r,
+          async (b) => { await w.write(b); }, null,
+        );
+      },
+    };
+  };
+
+  // Bootloader line-port — the §74 mkBoot74 shape (module flavor): uploads
+  // target image id 4; the LAST chunk ack flips the module flash (stage
+  // hook) and, after restartMs, the half self-restarts (the boot port
+  // drops unless keepBoot, the next app stage re-enumerates). NO os reset
+  // is ever part of the happy flow — onReset only counts (§75(b) asserts
+  // zero post-upload resets).
+  const mkBoot75 = (o: {
+    pid: number;
+    pre0: Uint8Array;
+    sha: Uint8Array;
+    onUploaded: () => void;
+    onSelfRestart: () => void;
+    restartMs: number | null; // null = the half never comes back on its own
+    keepBootPort?: boolean; // the boot port lingers through bundle.restart
+    onReset?: () => void;
+  }) => {
+    const linesWritten: string[] = [];
+    let stage: 'fresh' | 'uploaded' = 'fresh';
+    let total = -1;
+    let controller: ReadableStreamDefaultController<Uint8Array> | null = null;
+    let pending = '';
+    let streams: { readable: ReadableStream<Uint8Array>; writable: WritableStream<Uint8Array> } | null = null;
+    const build = (): void => {
+      pending = '';
+      const enc = new TextEncoder();
+      const dec = new TextDecoder();
+      const readable = new ReadableStream<Uint8Array>({
+        start(c) { controller = c; },
+      });
+      const push = (t: string): void => {
+        setTimeout(() => { controller?.enqueue(enc.encode(t)); }, 0);
+      };
+      const writable = new WritableStream<Uint8Array>({
+        write(b) {
+          pending += dec.decode(b);
+          for (;;) {
+            const i = pending.indexOf('\n');
+            if (i < 0) break;
+            const line = pending.slice(0, i + 1);
+            pending = pending.slice(i + 1);
+            linesWritten.push(line);
+            const rq = parseSmpChunks(line).frames[0];
+            if (!rq) continue;
+            if (rq.op === SMP.OP_READ && rq.group === SMP.GROUP_IMAGE && rq.cmdId === SMP.ID_IMAGE_STATE) {
+              const slots = stage === 'uploaded'
+                ? [
+                    { slot: 0, hash: o.pre0, flags: ['active', 'confirmed'] },
+                    { slot: 1, hash: o.sha, flags: ['pending'] },
+                  ]
+                : [
+                    { slot: 0, hash: o.pre0, flags: ['active', 'confirmed'] },
+                    { slot: 1, hash: o.pre0, flags: [] },
+                  ];
+              push(encodeSmpLine(SMP.OP_READ_RSP, rq.group, rq.seq, rq.cmdId, cborEncode({ rc: 0, images: slots })));
+              continue;
+            }
+            if (rq.op === SMP.OP_READ && rq.group === SMP.GROUP_IMAGE && rq.cmdId === SMP.ID_SLOT_INFO) {
+              push(encodeSmpLine(SMP.OP_READ_RSP, rq.group, rq.seq, rq.cmdId, cborEncode({ rc: 8 })));
+              continue;
+            }
+            if (rq.op === SMP.OP_WRITE && rq.group === SMP.GROUP_IMAGE && rq.cmdId === SMP.ID_IMAGE_UPLOAD) {
+              const v = cborDecode(rq.payload).value as { off: number; len?: number; data: Uint8Array };
+              if (v.off === 0) total = typeof v.len === 'number' ? v.len : -1;
+              const end = v.off + v.data.length;
+              if (total >= 0 && end >= total) {
+                stage = 'uploaded';
+                o.onUploaded();
+                if (o.restartMs !== null) setTimeout(() => o.onSelfRestart(), o.restartMs);
+              }
+              push(encodeSmpLine(SMP.OP_READ_RSP, rq.group, rq.seq, rq.cmdId, cborEncode({ off: end, rc: 0 })));
+              continue;
+            }
+            if (rq.op === SMP.OP_WRITE && rq.group === SMP.GROUP_OS && rq.cmdId === SMP.ID_OS_RESET) {
+              push(encodeSmpLine(SMP.OP_READ_RSP, rq.group, rq.seq, rq.cmdId, cborEncode({ rc: 0 })));
+              o.onReset?.();
+              continue;
+            }
+          }
+        },
+      });
+      streams = { readable, writable };
+    };
+    build();
+    const port = {
+      get readable() { return streams?.readable ?? null; },
+      get writable() { return streams?.writable ?? null; },
+      async open() { build(); },
+      async setSignals() {},
+      async close() { streams = null; },
+      getInfo: () => portInfo75(o.pid),
+    };
+    const isWrite = (l: string, group: number, cmdId: number): boolean => {
+      const f = parseSmpChunks(l).frames[0];
+      return !!f && f.op === SMP.OP_WRITE && f.group === group && f.cmdId === cmdId;
+    };
+    return {
+      port: port as unknown as PortWithInfo,
+      osResetCount: (): number => linesWritten.filter((l) => isWrite(l, SMP.GROUP_OS, SMP.ID_OS_RESET)).length,
+    };
+  };
+
+  const KB_FW75 = Uint8Array.from([0, 3, 41, 0, 0]); // v3.41.0.0 — takes every flashable bundle
+  const T75 = {
+    pollMs: 15, enterMs: 1200, swapMs: 400, rePollMs: 10, probeMs: 150,
+    resetMs: 60, confirmMs: 9000, reResetMs: 300, settleMs: 1500, rescueMs: 2500,
+    replugMs: 120, reappearMs: 5000, dropMs: 1500, modFindMs: 1200,
+    reBootResetMs: 200, fwupMs: 80,
+  };
+  const OLD_BUNDLE: [number, number, number, number] = [2, 2, 0, 0]; // 2.2.0 — the dock's old fw/stored
+  const NEW_BUNDLE: [number, number, number, number] = [2, 3, 3, 0]; // 2.3.3 — the catalog's newest
+
+  // Left-only module case builder. World re-enumeration chain:
+  //   enter → appBefore dies, boot port in;
+  //   last chunk → stage 'bundled'; after restartMs the boot port drops
+  //   (unless keepBootPort) and appBundled appears;
+  //   MOD_FWUP → stage 'programmed', the live app port dies, appProgrammed
+  //   appears after fwupMs.
+  const mkCase75 = (o: {
+    kbFw?: Uint8Array;
+    typeByte?: number; // de/1001 while docked (0x10 Touch, 0x11 right bay, 0x00 unknown)
+    afterFwupTypeByte?: number;
+    stored?: [number, number, number, number];
+    dockRunning?: [number, number, number, number] | null; // null = de/1008 unreadable
+    rightHalf?: boolean;
+    restartMs?: number | null; // self-restart delay after the last chunk (default 40)
+    keepBootPort?: boolean;
+    appHideMs?: number; // extra delay between the boot port dropping and the app port returning
+    fwupReenumerateMs?: number; // app return after MOD_FWUP (default 40)
+  }) => {
+    const list: PortWithInfo[] = [];
+    const world: SerialWorld = {
+      getPorts: async () => [...list],
+      requestPort: async () => { throw new Error('no user gesture in the smoke world'); },
+    };
+    const sink = { reqs: [] as Frame[], writes: [] as { key: string; params: Uint8Array }[] };
+    const stage = { s: 'before' as Stage75 };
+    let liveApp: PortWithInfo | null = null;
+    let fwupCount = 0;
+    const bootL = mkBoot75({
+      pid: 0x06f,
+      pre0: Uint8Array.from({ length: 32 }, (_, i) => 0x40 + i),
+      sha: sha233_75,
+      onUploaded: (): void => { stage.s = 'bundled'; },
+      restartMs: o.restartMs === undefined ? 40 : o.restartMs,
+      keepBootPort: o.keepBootPort === true,
+      onSelfRestart: (): void => {
+        if (o.keepBootPort !== true) drop75(list, bootL.port);
+        const delay = o.appHideMs ?? 0;
+        if (delay === 0) {
+          if (liveApp === null) {
+            liveApp = spawnApp();
+            list.push(liveApp);
+          }
+          return;
+        }
+        // The port stays hidden for the window (the §6 replug shape).
+        setTimeout(() => {
+          if (liveApp === null) {
+            liveApp = spawnApp();
+            list.push(liveApp);
+          }
+        }, delay);
+      },
+    });
+    function onEnter(): void {
+      if (liveApp !== null) drop75(list, liveApp);
+      liveApp = null;
+      list.push(bootL.port);
+    }
+    function onFwup(): void {
+      fwupCount += 1;
+      stage.s = 'programmed';
+      if (liveApp !== null) drop75(list, liveApp);
+      setTimeout(() => {
+        liveApp = spawnApp();
+        list.push(liveApp);
+      }, o.fwupReenumerateMs ?? 40);
+    }
+    const appCommon = {
+      kbFw: o.kbFw ?? KB_FW75, stage: (): Stage75 => stage.s,
+      storedOld: o.stored ?? OLD_BUNDLE, storedNew: NEW_BUNDLE,
+      dockOld: o.dockRunning ?? OLD_BUNDLE, dockNew: NEW_BUNDLE,
+      typeByte: o.typeByte ?? 0x10,
+      afterFwupTypeByte: o.afterFwupTypeByte ?? (o.typeByte ?? 0x10),
+      sink, onEnter, onFwup,
+    };
+    // A fresh app fake in the current era — the re-enumerated port the
+    // procedure's openOwnedSession adopts.
+    function spawnApp(): PortWithInfo {
+      return mkApp75({ ...appCommon, pid: 0x064 }).port;
+    }
+    // The initial app fake: the world's only left port, and the sesRef
+    // session's host. It dies on whichever reboot trigger reaches it
+    // (ee/ae enter, or de/5 fwup in the no-upload flow).
+    const appBefore = mkApp75({ ...appCommon, pid: 0x064 });
+    liveApp = appBefore.port;
+    list.push(appBefore.port);
+    if (o.rightHalf === true) list.push(stubPort75(0x0c8));
+    const sesRef = { current: new Map<'left' | 'right', NayaSession>() };
+    if (o.rightHalf === true) {
+      sesRef.current.set('right', mkApp75({ ...appCommon, pid: 0x0c8 }).session());
+    }
+    sesRef.current.set('left', appBefore.session());
+    let rescans = 0;
+    let rescanFlag: boolean | null = null;
+    let cacheInvalidations = 0;
+    const deps = {
+      sesRef,
+      busyRef: { current: false },
+      world,
+      vault: mkVault75(),
+      timeouts: T75,
+      rescan: async (): Promise<void> => {
+        rescans += 1;
+        rescanFlag = firmwareRunActive();
+      },
+      onModuleCacheStale: (): void => { cacheInvalidations += 1; },
+    };
+    return {
+      deps, bootL, list, sesRef,
+      fwupCount: (): number => fwupCount,
+      rescans: (): number => rescans,
+      rescanFlag: (): boolean | null => rescanFlag,
+      cacheInvalidations: (): number => cacheInvalidations,
+      writesOf: (key: string): Uint8Array[] =>
+        sink.writes.filter((w) => w.key === key).map((w) => w.params),
+      sawEnter: (): boolean => sink.reqs.some((f) => f.type === 0xee),
+    };
+  };
+  const begin75 = async (
+    name: string,
+    c: ReturnType<typeof mkCase75>,
+    opts: Parameters<typeof startModuleRun>[1],
+  ): Promise<FirmwareRunLog | null> => {
+    const log = await startModuleRun(c.deps, opts);
+    if (log === null) eq(false, true, `${name}: run began (null = refused — the one-run lock was held)`);
+    return log;
+  };
+
+  // ---- (a) precondition refusals — no bootloader entry, ever ---------------
+  {
+    const c = mkCase75({ rightHalf: true });
+    const log = await begin75('75(a1)', c, { allowOlder: false });
+    if (log !== null) {
+      const le = lastEv75(log);
+      eq(le.step === 'run.end' && le.ok === false && /right half is connected/.test(le.summary ?? ''), true,
+        '75(a1) right half connected → refusal before anything moves');
+      eq(c.sawEnter(), false, '75(a1) no ee/10ae on the refusal');
+      eq(log.events.some((e) => e.step === 'mcuboot.enter' && e.phase === 'start'), false,
+        '75(a1) the refusal lands in preconditions — no enter step started');
+    }
+  }
+  {
+    const c = mkCase75({ typeByte: 0x11 }); // present, RIGHT bay
+    const log = await begin75('75(a2)', c, { allowOlder: false });
+    if (log !== null) {
+      const le = lastEv75(log);
+      eq(le.step === 'run.end' && le.ok === false && /right bay/.test(le.summary ?? ''), true,
+        '75(a2) module docked in the right bay → refusal');
+      eq(c.sawEnter(), false, '75(a2) no ee/10ae on the refusal');
+    }
+  }
+  {
+    // keyboard 3.29.1 + explicit label 2.3.3 (needs 3.40.0+) → pairing refusal
+    const c = mkCase75({ kbFw: Uint8Array.from([0, 3, 29, 1, 0]) });
+    const log = await begin75('75(a3)', c, { allowOlder: false, label: '2.3.3' });
+    if (log !== null) {
+      const le = lastEv75(log);
+      eq(le.step === 'run.end' && le.ok === false && /newer than the keyboard/.test(le.summary ?? ''), true,
+        '75(a3) bundle newer than the keyboard firmware → refusal');
+      eq(c.sawEnter(), false, '75(a3) no ee/10ae on the refusal');
+    }
+  }
+
+  // ---- (b) happy path: upload → NO post-upload reset → program byte 0x01 ---
+  {
+    const c = mkCase75({});
+    const log = await begin75('75(b)', c, { allowOlder: false });
+    if (log !== null) {
+      const le = lastEv75(log);
+      eq(le.step === 'run.end' && le.ok === true && /module flash finished/.test(le.summary ?? ''), true,
+        '75(b) run.end ok');
+      // Step order: enter → identify → upload → bundle.restart →
+      // bundle.verify → module.program → module.restart → module.verify →
+      // verify.compare.
+      const idxOf = (step: string, phase: string): number =>
+        log.events.findIndex((e) => e.step === step && e.phase === phase);
+      const iEnter = idxOf('mcuboot.enter', 'ok');
+      const iIdent = idxOf('identify', 'ok');
+      const iUpload = idxOf('upload', 'ok');
+      const iRestart = idxOf('bundle.restart', 'ok');
+      const iBVer = idxOf('bundle.verify', 'ok');
+      const iProg = idxOf('module.program', 'ok');
+      const iMRestart = idxOf('module.restart', 'ok');
+      const iMVer = idxOf('module.verify', 'ok');
+      const iCmp = idxOf('verify.compare', 'ok');
+      eq(iEnter >= 0 && iEnter < iIdent && iIdent < iUpload && iUpload < iRestart &&
+        iRestart < iBVer && iBVer < iProg && iProg < iMRestart && iMRestart < iMVer && iMVer < iCmp, true,
+        '75(b) order: enter → identify → upload → bundle.restart → bundle.verify → module.program → module.restart → module.verify → verify.compare');
+      // The MOD_FWUP frame is EXACTLY 0xDE/0x1005 + ONE byte (code 1 = Touch).
+      const fwups = c.writesOf('de/5');
+      eq(fwups.length, 1, '75(b) exactly one MOD_FWUP write');
+      eq(fwups[0]?.length, 1, '75(b) MOD_FWUP carries exactly ONE payload byte');
+      eq(fwups[0]?.[0], FWUP_TYPES.Touch, '75(b) MOD_FWUP byte is FWUP_TYPES.Touch (1)');
+      // NO reset after the last chunk — the half self-restarts (§6 ruling).
+      eq(c.bootL.osResetCount(), 0, '75(b) ZERO os resets on the boot port — nothing is sent after the last chunk');
+      // bundle.verify named the target; the 1 MiB upload really ran.
+      const bv = log.events.find((e) => e.step === 'bundle.verify' && e.phase === 'ok');
+      eq(bv !== undefined && /2\.3\.3/.test(bv.detail ?? ''), true, '75(b) bundle.verify names the stored target');
+      const tot = log.events.find((e) => e.step === 'upload' && e.phase === 'progress' && e.total === 1048576);
+      eq(tot !== undefined, true, '75(b) the 1 MiB bundle upload made progress events');
+      const cmp = log.events.find((e) => e.step === 'verify.compare' && e.phase === 'ok');
+      eq(cmp !== undefined && /match the preflight/.test(cmp.detail ?? ''), true,
+        '75(b) verify.compare ok: left identity + keymap unchanged');
+      // Run teardown: handover fired after the flag cleared, the dead
+      // pre-flash session was dropped, the module-fw cache invalidated.
+      eq(c.rescans() === 1 && c.rescanFlag() === false, true,
+        '75(b) rescan fired after the freeze flag cleared');
+      eq(c.sesRef.current.size, 0, '75(b) the dead pre-flash session was dropped at handover');
+      eq(moduleFwSnapshot(), null, '75(b) the module-fw snapshot cache is invalidated in finally');
+      eq(c.cacheInvalidations(), 1, '75(b) onModuleCacheStale fired exactly once');
+      eq(c.fwupCount(), 1, '75(b) exactly one MOD_FWUP world transition');
+    }
+  }
+
+  // ---- (c) stored == target && running == target → already runs it ---------
+  {
+    const c = mkCase75({ stored: NEW_BUNDLE, dockRunning: NEW_BUNDLE });
+    const log = await begin75('75(c)', c, { allowOlder: false });
+    if (log !== null) {
+      const le = lastEv75(log);
+      eq(le.step === 'run.end' && le.ok === true && /already runs/.test(le.summary ?? ''), true,
+        '75(c) already-runs shortcut: ok verdict without touching anything');
+      eq(c.sawEnter(), false, '75(c) no bootloader entry');
+      eq(c.writesOf('de/5').length, 0, '75(c) no MOD_FWUP write');
+      eq(c.bootL.osResetCount(), 0, '75(c) no resets');
+      eq(moduleFwSnapshot(), null, '75(c) the snapshot cache is still invalidated (finally)');
+    }
+  }
+
+  // ---- (d) replug: the app port stays hidden past replugMs → exactly ONE
+  //      action event with the replug text, cleared by the return -----------
+  {
+    // restartMs 40 + appHideMs 400 > replugMs 120: after the last chunk the
+    // boot port drops within one poll and NO port answers for the window —
+    // the prompt fires once at ~120 ms and is cleared by the return.
+    const c = mkCase75({ restartMs: 40, appHideMs: 400 });
+    const log = await begin75('75(d)', c, { allowOlder: false });
+    if (log !== null) {
+      const le = lastEv75(log);
+      eq(le.step === 'run.end' && le.ok === true, true, '75(d) the run recovers after the replug');
+      const actions = log.events.filter((e) => e.phase === 'action');
+      eq(actions.length, 1, '75(d) exactly ONE action event during the unseen window');
+      eq(actions[0]?.step === 'bundle.restart' && actions[0]?.detail === MODULE_REPLUG_TEXT, true,
+        '75(d) the action carries the replug text verbatim, on bundle.restart');
+      const ai = log.events.findIndex((e) => e.phase === 'action');
+      eq(ai >= 0 && ai < log.events.length - 1, true,
+        '75(d) the prompt was cleared by the return (later events exist)');
+      eq(c.bootL.osResetCount(), 0, '75(d) no boot port visible → no boot resets');
+    }
+  }
+
+  // ---- (d2) boot reset re-send: a lingering bootloader port gets the
+  //      reset re-sent on the cadence while the app port is missing ---------
+  {
+    // keepBootPort + a LATE self-restart (600 ms > one reBootResetMs of
+    // 200 ms): the reset lands while the boot port is the only thing on
+    // USB; the run still completes when the app port finally returns.
+    const c = mkCase75({ restartMs: 600, keepBootPort: true });
+    const log = await begin75('75(d2)', c, { allowOlder: false });
+    if (log !== null) {
+      const le = lastEv75(log);
+      eq(le.step === 'run.end' && le.ok === true, true, '75(d2) the run still completes');
+      eq(c.bootL.osResetCount() >= 1, true,
+        '75(d2) the visible bootloader port had the boot reset re-sent');
+    }
+  }
+
+  // ---- (e) force-type flow --------------------------------------------------
+  {
+    // (e1) type unknown + forceType 'Tune' → program byte 0x02; the module
+    // comes back with the target fw and an undecodable (Tune) dock byte.
+    const c = mkCase75({
+      typeByte: 0x00, afterFwupTypeByte: 0x30, // 0x30 decodes 'unknown' — Tune's byte is unproven
+      stored: NEW_BUNDLE, dockRunning: NEW_BUNDLE,
+    });
+    const log = await begin75('75(e1)', c, { allowOlder: false, forceType: 'Tune' });
+    if (log !== null) {
+      const le = lastEv75(log);
+      eq(le.step === 'run.end' && le.ok === true, true, '75(e1) force-type run completes ok');
+      const fwups = c.writesOf('de/5');
+      eq(fwups.length === 1 && fwups[0]?.length === 1 && fwups[0]?.[0] === FWUP_TYPES.Tune, true,
+        '75(e1) MOD_FWUP byte is FWUP_TYPES.Tune (2) — NOT nayactl order');
+      eq(c.sawEnter(), false,
+        '75(e1) bundle already stored → no bootloader entry even when forced');
+      eq(c.sesRef.current.size, 0, '75(e1) the rebooted keyboard drops its pre-flash session');
+    }
+  }
+  {
+    // (e2) wrong-type verify: forceType 'Tune' but the module comes back
+    // reporting Touch → refusal pointing at Force Update.
+    const c = mkCase75({
+      typeByte: 0x00, afterFwupTypeByte: 0x10, // decodes 'Touch' — the WRONG app
+      stored: NEW_BUNDLE, dockRunning: NEW_BUNDLE,
+    });
+    const log = await begin75('75(e2)', c, { allowOlder: false, forceType: 'Tune' });
+    if (log !== null) {
+      const le = lastEv75(log);
+      eq(le.step === 'run.end' && le.ok === false && /Force Update/.test(le.summary ?? ''), true,
+        '75(e2) wrong-type verify refuses, pointing at Force Update');
+      const mv = log.events.find((e) => e.step === 'module.verify' && e.phase === 'fail');
+      eq(mv !== undefined && /Touch/.test(mv.detail ?? ''), true,
+        '75(e2) the refusal names the type the module reports');
+      const fwups = c.writesOf('de/5');
+      eq(fwups.length === 1 && fwups[0]?.[0] === FWUP_TYPES.Tune, true,
+        '75(e2) the program write itself was still exactly Tune/0x02');
+    }
+  }
+
+  signal75done?.();
 })();
 
 void main();

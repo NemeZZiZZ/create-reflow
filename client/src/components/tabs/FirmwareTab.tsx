@@ -5,11 +5,12 @@
 import { useCallback, useEffect, useState } from 'react';
 import { Button } from '../ui/button';
 import { Card, CardContent } from '../ui/card';
-import { Cpu } from 'lucide-react';
+import { Cpu, Package } from 'lucide-react';
 import FirmwareLibraryView from '../firmware/FirmwareLibraryView';
 import type { LibraryNotice } from '../firmware/FirmwareLibraryView';
 import KeyboardFlashDialog from '../firmware/KeyboardFlashDialog';
 import type { KeyboardFlash } from '../firmware/KeyboardFlashDialog';
+import ModuleFlashDialog from '../firmware/ModuleFlashDialog';
 import { loadFirmwareCatalog } from '../../lib/firmware-catalog';
 import type { FwCatalog } from '../../lib/firmware-catalog';
 import { fetchVersion } from '../../lib/firmware-fetch';
@@ -32,6 +33,7 @@ export default function FirmwareTab({
 }) {
   const [catalog, setCatalog] = useState<FwCatalog | null>(null);
   const [dlgOpen, setDlgOpen] = useState(false);
+  const [modDlgOpen, setModDlgOpen] = useState(false);
   const [downloading, setDownloading] = useState<string | null>(null);
   const [notices, setNotices] = useState<Record<string, LibraryNotice>>({});
 
@@ -100,6 +102,21 @@ export default function FirmwareTab({
         </CardContent>
       </Card>
 
+      <Card>
+        <CardContent className="flex flex-wrap items-center gap-3">
+          <div className="min-w-0 flex-1">
+            <div className="text-sm font-medium">Module firmware</div>
+            <div className="text-[13px] text-muted-foreground">
+              Dock the module in the LEFT bay, unplug the right half — the module programs itself
+              from a stored bundle.
+            </div>
+          </div>
+          <Button disabled={catalog === null} onClick={() => setModDlgOpen(true)}>
+            <Package /> Update module firmware…
+          </Button>
+        </CardContent>
+      </Card>
+
       <FirmwareLibraryView
         catalog={catalog}
         vault={vault}
@@ -117,6 +134,16 @@ export default function FirmwareTab({
         vault={vault}
         flash={flash}
         grant={grant}
+      />
+
+      <ModuleFlashDialog
+        open={modDlgOpen}
+        onOpenChange={setModDlgOpen}
+        catalog={catalog}
+        left={halves.left}
+        right={halves.right}
+        vault={vault}
+        flash={flash}
       />
     </div>
   );

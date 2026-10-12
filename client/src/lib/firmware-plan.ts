@@ -167,3 +167,150 @@ export function resolveKeyboardPlan(
     }),
   };
 }
+
+/* ---- module bundle plan (spec §6 preconditions) --------------------------- */
+
+/* The label a module bundle entry groups under: the catalog's declared
+ * module firmware version when the row carries one, else versionLabel
+ * (the no-number era rows — all withheld anyway). */
+function moduleLabel(e: FwEntry): string | undefined {
+  return e.moduleFirmware ?? e.versionLabel;
+}
+
+/* Newest flashable module bundle row for a label. */
+function newestModuleBundle(cat: FwCatalog, label: string): FwEntry | null {
+  let best: FwEntry | null = null;
+  for (const e of cat.images) {
+    if (e.target !== 'module' || e.type !== 'littlefs' || e.flashable !== true) continue;
+    if (moduleLabel(e) !== label) continue;
+    if (best === null || (e.releaseOrder ?? -1) > (best.releaseOrder ?? -1)) best = e;
+  }
+  return best;
+}
+
+export interface ModulePlan {
+  side: 'module';
+  /** The picked bundle entry (null = nothing usable — see reason). */
+  entry: FwEntry | null;
+  /** moduleFirmware ?? versionLabel of the entry. */
+  target: string | null;
+  /** Pairing guard (OF firmware_upload.py:953-994): the bundle's
+   * keyboardRange.from is NEWER than the running keyboard firmware. */
+  bundleNewerThanKeyboard: boolean;
+  downgrade: boolean;
+  /** The docked module already reports the target version. */
+  unchanged: boolean;
+  /** True when a specific label was requested but no flashable bundle
+   * carries it (the dialog disables those options; the procedure refuses). */
+  noSuchBundle: boolean;
+  reason?: string;
+}
+
+/* Module bundle selection (spec §6): the newest flashable littlefs
+ * target=module entry whose `keyboardRange.from` ≤ the running keyboard
+ * firmware — pairing guard by construction. A specific `label` picks that
+ * version instead (the dialog offers older bundles; newer-than-keyboard
+ * ones come back flagged, and the gate refuses them). keyboardFw null (the
+ * half's version was unreadable) cannot prove any range: refused honestly,
+ * never guessed. Downgrade/unchanged compare the dock-reported module fw
+ * (de/1008) against the target with trailing-zero-insensitive tuples —
+ * the wire carries '2.3.3.0', the catalog labels '2.3.3'. */
+export function resolveModulePlan(
+  cat: FwCatalog,
+  keyboardFw: string | null,
+  currentModuleFw: string | null,
+  label?: string,
+): ModulePlan {
+  const kbTuple = keyboardFw !== null ? parseDotVersion(keyboardFw) : null;
+  if (keyboardFw !== null && kbTuple === null) {
+    return {
+      side: 'module', entry: null, target: null, bundleNewerThanKeyboard: false,
+      downgrade: false, unchanged: false, noSuchBundle: false,
+      reason: `the keyboard reports "${keyboardFw}" — not a comparable version`,
+    };
+  }
+
+  // The keyboard must at least MEET the bundle's range floor: from ≤ kbFw.
+  const rangeOk = (e: FwEntry): boolean => {
+    const from = e.keyboardRange?.from;
+    if (typeof from !== 'string') return true; // no declared range — not bundle-gated
+    const t = parseDotVersion(from);
+    return t === null || (kbTuple !== null && tupleCompare(kbTuple, t) >= 0);
+  };
+
+  if (label !== undefined) {
+    const entry = newestModuleBundle(cat, label);
+    if (entry === null) {
+      return {
+        side: 'module', entry: null, target: null, bundleNewerThanKeyboard: false,
+        downgrade: false, unchanged: false, noSuchBundle: true,
+        reason: `no flashable module bundle labeled ${label}`,
+      };
+    }
+    const newer = !rangeOk(entry);
+    const target = moduleLabel(entry) ?? null;
+    const curTuple = currentModuleFw !== null ? parseDotVersion(currentModuleFw) : null;
+    const tgtTuple = target !== null ? parseDotVersion(target) : null;
+    const downgrade = curTuple !== null && tgtTuple !== null && tupleCompare(curTuple, tgtTuple) > 0;
+    const unchanged = curTuple !== null && tgtTuple !== null && tupleCompare(curTuple, tgtTuple) === 0;
+    const plan: ModulePlan = {
+      side: 'module', entry, target, bundleNewerThanKeyboard: newer,
+      downgrade, unchanged, noSuchBundle: false,
+    };
+    if (newer && entry.keyboardRange?.from !== undefined) {
+      plan.reason = `the ${label} bundle needs keyboard ${entry.keyboardRange.from} or newer`;
+    }
+    return plan;
+  }
+
+  // Auto-pick: newest releaseOrder among the flashable bundles the running
+  // keyboard firmware can take.
+  let best: FwEntry | null = null;
+  for (const e of cat.images) {
+    if (e.target !== 'module' || e.type !== 'littlefs' || e.flashable !== true) continue;
+    if (!rangeOk(e)) continue;
+    if (best === null || (e.releaseOrder ?? -1) > (best.releaseOrder ?? -1)) best = e;
+  }
+  if (best === null) {
+    return {
+      side: 'module', entry: null, target: null, bundleNewerThanKeyboard: false,
+      downgrade: false, unchanged: false, noSuchBundle: false,
+      reason: keyboardFw === null
+        ? 'the keyboard firmware version is unreadable — cannot check bundle compatibility'
+        : 'no flashable module bundle is compatible with this keyboard firmware',
+    };
+  }
+  const target = moduleLabel(best) ?? null;
+  const curTuple = currentModuleFw !== null ? parseDotVersion(currentModuleFw) : null;
+  const tgtTuple = target !== null ? parseDotVersion(target) : null;
+  return {
+    side: 'module',
+    entry: best,
+    target,
+    bundleNewerThanKeyboard: false,
+    downgrade: curTuple !== null && tgtTuple !== null && tupleCompare(curTuple, tgtTuple) > 0,
+    unchanged: curTuple !== null && tgtTuple !== null && tupleCompare(curTuple, tgtTuple) === 0,
+    noSuchBundle: false,
+  };
+}
+
+/* Distinct installable module bundle versions, newest releaseOrder first —
+ * the module dialog's version picker. Only flashable littlefs rows group
+ * (withheld bundles are not offered), same discipline as keyboardVersions. */
+export function moduleBundles(cat: FwCatalog): Array<{ label: string; entry: FwEntry; keyboardFrom: string | null }> {
+  const groups = new Map<string, FwEntry>();
+  for (const e of cat.images) {
+    if (e.target !== 'module' || e.type !== 'littlefs' || e.flashable !== true) continue;
+    const label = moduleLabel(e);
+    if (typeof label !== 'string' || label === '') continue;
+    const cur = groups.get(label);
+    if (cur === undefined || (e.releaseOrder ?? -1) > (cur.releaseOrder ?? -1)) groups.set(label, e);
+  }
+  return [...groups.entries()]
+    .map(([label, entry]) => ({
+      label,
+      entry,
+      keyboardFrom: typeof entry.keyboardRange?.from === 'string' ? entry.keyboardRange.from : null,
+    }))
+    .sort((a, b) => (b.entry.releaseOrder ?? -1) - (a.entry.releaseOrder ?? -1));
+}

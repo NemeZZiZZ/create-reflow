@@ -277,6 +277,10 @@ export default function App() {
     world: fwWorld,
     rescan: sessions.rescan,
     grantPort: fwGrant,
+    // Module-fw client cache invalidation: a module reprogram wipes the
+    // module's config slots — the per-slot match verdicts cached from
+    // before the run must not survive it (startModuleRun teardown).
+    onModuleCacheStale: moduleProfiles.clearLive,
   });
   // 'off' when the Bindings tab is hidden: the keyboard card unmounts on tab
   // switch, and useKbFit must re-attach its observer when it comes back.

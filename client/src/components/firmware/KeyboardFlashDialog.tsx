@@ -37,17 +37,18 @@ import type { HalfPlan } from '../../lib/firmware-plan';
 import type { SerialWorld } from '../../lib/serial-world';
 import { NAYA_VID, pidInfo } from '../../lib/firmware-plat';
 import type { HalfSnapshot, Side } from '@create-reflow/sdk';
-import type { FlashRunStatus, StartKeyboardOpts } from '../../hooks/useFirmwareFlash';
+import type { FlashRunStatus, StartKeyboardOpts, StartModuleOpts } from '../../hooks/useFirmwareFlash';
 import type { FirmwareRunLog, RunEvent } from '../../lib/firmware-run-log';
 import { cn } from '../../lib/utils';
 
-/* The hook subset the dialog drives (App holds the useFirmwareFlash return;
+/* The hook subset the dialogs drive (App holds the useFirmwareFlash return;
  * the FirmwareTab passes it through). */
 export interface KeyboardFlash {
   status: FlashRunStatus;
   events: readonly RunEvent[];
   log: FirmwareRunLog | null;
   startKeyboard: (opts: StartKeyboardOpts) => Promise<void>;
+  startModule: (opts: StartModuleOpts) => Promise<void>;
   exportLog: () => void;
 }
 

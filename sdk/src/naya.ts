@@ -647,6 +647,66 @@ export class NayaSession {
     }
   }
 
+  // MODULE_FILE_FW_VERSION — de/100A read (left half, app mode): the module
+  // bundle version STORED on the docked module's flash (OF service.py:1155,
+  // spec decision 8). Payload shape mirrors the de-family convention
+  // ([00, VER…]): status byte first, then the dotted components; a short or
+  // zeroed reply reads as null (nothing stored / unreadable), never a
+  // guess. Errors also read as null — a dead read is "unreadable", and the
+  // procedure decides what that refusal means.
+  async moduleFileFwVersion(): Promise<string | null> {
+    try {
+      const f = await this.cmd(0xde, 0x10, 0x0a, new Uint8Array([0]));
+      const p = f.payload;
+      if (p.length < 5 || p[1] === 0) return null;
+      return `${p[1]}.${p[2]}.${p[3]}.${p[4]}`;
+    } catch {
+      return null;
+    }
+  }
+
+  // MOD_FWUP — de/1005 write (left half, app mode, dest 0x50): tell the
+  // docked module to program itself from the stored bundle (OF
+  // module_procedure.py:479). ONE payload byte — the FWUP_TYPES code
+  // (Touch 1, Tune 2, Track 3; deliberately NOT nayactl's MODULE_TYPES
+  // order — the historical mismatch gave a Tune the Track app). NO reply
+  // is expected: the module's lights go out and the keyboard restarts
+  // ~32 s later, so this follows enterMcuboot's write-and-forget shape,
+  // NOT cmd()'s 6-try ladder — one write, then a bounded wait (waitMs,
+  // default 2 s) for ANY frame; reply and timeout both resolve.
+  async modFwup(typeCode: number, waitMs?: number): Promise<void> {
+    const req = buildFrame(this.dst, 0xde, 0x10, 0x05, Uint8Array.from([typeCode & 0xff]));
+    try {
+      this.ioLog.push({ dir: '>', type: 0xde, c0: 0x10, c1: 0x05, len: 1, hex: hexHead(req.subarray(9, 10)) });
+    } catch {
+      /* logging must never break an exchange */
+    }
+    try {
+      await this.writeFn(req);
+    } catch {
+      /* port died mid-write — the module may still take the byte */
+    }
+    if (this.onFrame) this.onFrame('>', req);
+    try {
+      const f = await this.fr.readFrame(waitMs ?? 2000);
+      try {
+        this.ioLog.push({
+          dir: '<',
+          type: f.type,
+          c0: f.c0,
+          c1: f.c1,
+          len: f.payload.length,
+          hex: hexHead(f.payload),
+        });
+      } catch {
+        /* observational */
+      }
+      if (this.onFrame) this.onFrame('<', f.raw);
+    } catch {
+      /* no reply within the window — expected: there is no reply */
+    }
+  }
+
   // Per-session promise mutex: concurrent callers (1s presence tick, 30s
   // sweep, dumpAll, manual ops) share one port. Without serialization their
   // request/response pairs interleave and both roundtrips eat each other's

@@ -64,7 +64,7 @@ import { useCallback, useState } from 'react';
 import type { RefObject } from 'react';
 import {
   bleGetAddress, bleGetAllPairs, bleGetPairAddress, buildFrame, DST_LEFT, DST_RIGHT,
-  encodeRestorePayload, fwVersionText, hexToBytes, maxBrtOp, modPresence, NayaSession,
+  encodeRestorePayload, fwVersionText, hexToBytes, maxBrtOp, modFwText, modPresence, NayaSession,
   parseCmdPath, parseInventory, parseLayer, resolveUploadImageId, sleep, SmpDevice,
   SmpLink, SMP_DEFAULT_TIMEOUTS, toHex,
 } from '@create-reflow/sdk';
@@ -74,10 +74,10 @@ import { FirmwareRunLog, sha256Hex, stableStringify } from '../lib/firmware-run-
 import type { RunEvent } from '../lib/firmware-run-log';
 import { loadFirmwareCatalog } from '../lib/firmware-catalog';
 import type { FwEntry } from '../lib/firmware-catalog';
-import { resolveKeyboardPlan } from '../lib/firmware-plan';
-import type { HalfPlan } from '../lib/firmware-plan';
+import { resolveKeyboardPlan, resolveModulePlan } from '../lib/firmware-plan';
+import type { HalfPlan, ModulePlan } from '../lib/firmware-plan';
 import { checkFlashGate } from '../lib/firmware-interlocks';
-import type { KeyboardGateInput } from '../lib/firmware-interlocks';
+import type { KeyboardGateInput, ModuleGateInput } from '../lib/firmware-interlocks';
 import { newVault } from '../lib/firmware-fetch';
 import type { Vault } from '../lib/firmware-fetch';
 import { NAYA_VID, pidInfo } from '../lib/firmware-plat';
@@ -112,6 +112,12 @@ export interface FlashDeps {
    * event stream while the run is in flight. The core never needs it; the
    * smoke drives the core directly and leaves it unset. */
   onBegin?: (log: FirmwareRunLog) => void;
+  /* The module-fw client cache invalidation (App wires useModuleProfiles'
+   * clearLive): a module reprogram wipes the module's config slots, so the
+   * per-slot match verdicts cached from before the run are stale. Called
+   * from startModuleRun's teardown — success AND failure (finally
+   * semantics: every exit path funnels through finishRun). */
+  onModuleCacheStale?: () => void;
 }
 
 /* ---- React-free lifecycle core ------------------------------------------ */
@@ -515,6 +521,13 @@ export interface FlashTimeouts {
   reResetMs?: number; // version.confirm re-reset cadence while the app port is missing
   settleMs?: number; // halves.settle window for BOTH halves to answer again
   rescueMs?: number; // stranded-half rescue window (spec §5 failure path)
+  /* ---- module procedure (spec §6 constants) ---- */
+  replugMs?: number; // bundle.restart: half unseen before the replug prompt (30 s)
+  reappearMs?: number; // bundle.restart / module.restart await-left total window (600 s)
+  dropMs?: number; // module.restart: window for the keyboard to drop after MOD_FWUP (120 s)
+  modFindMs?: number; // module.verify: module fw+type confirm window (90 s)
+  reBootResetMs?: number; // boot reset re-send cadence while a bootloader port shows (60 s)
+  fwupMs?: number; // MOD_FWUP write-and-forget bounded wait (2 s)
 }
 
 /* Spec defaults — the ONLY sleeps the procedure does; smoke injects
@@ -530,6 +543,12 @@ export const FLASH_TIMEOUT_DEFAULTS = {
   reResetMs: 30_000,
   settleMs: 90_000,
   rescueMs: 300_000,
+  replugMs: 30_000,
+  reappearMs: 600_000,
+  dropMs: 120_000,
+  modFindMs: 90_000,
+  reBootResetMs: 60_000,
+  fwupMs: 2_000,
 } as const;
 
 export interface StartKeyboardTarget {
@@ -542,6 +561,52 @@ export interface StartKeyboardOpts {
   allowOlder: boolean;
   acceptUnknown: boolean;
   consentedUnknown: boolean;
+}
+
+/* ---- module procedure (spec §6) ------------------------------------------- */
+
+/* MOD_FWUP type codes (OF module_procedure.py FWUP_TYPES). These EXACT
+ * codes — NOT nayactl's MODULE_TYPES order: the historical mismatch gave a
+ * Tune the Track app. forceType values are exactly these keys, never ''
+ * (T4 gate contract). */
+export const FWUP_TYPES = { Touch: 1, Tune: 2, Track: 3 } as const;
+export type ModuleForceType = keyof typeof FWUP_TYPES;
+
+/* The bundle.restart replug prompt (spec §6) — emitted ONCE, 30 s after
+ * the half went unseen, cleared by the return. */
+export const MODULE_REPLUG_TEXT =
+  "Unplug the left half's USB cable, count to ten, and plug it back in — " +
+  'not a power cycle, nothing being written is interrupted';
+
+export interface StartModuleOpts {
+  /** Target bundle version (moduleFirmware ?? versionLabel). Absent = the
+   * newest flashable bundle this keyboard firmware can take. */
+  label?: string;
+  /** Re-upload the bundle even when the stored version already matches. */
+  forceUpload?: boolean;
+  /** Program the module even when the dock decodes its type fine — the
+   * ONLY lift of the unknown-type precondition (never bay/right/flashable). */
+  forceType?: ModuleForceType;
+  allowOlder: boolean;
+}
+
+/* Module-fw client cache: the pre-run reads (stored bundle version,
+ * dock-reported fw, dock type) the precondition step produced — the module
+ * dialog shows them as "last read" without re-asking a possibly-busy half.
+ * startModuleRun's teardown clears it (finally semantics): firmware changed
+ * under the run, so anything cached from before it is a lie. */
+export interface ModuleFwSnapshot {
+  stored: string | null;
+  running: string | null;
+  type: string | null;
+  at: number;
+}
+let moduleFwCache: ModuleFwSnapshot | null = null;
+
+/** The last module-fw precondition read, or null (never read / invalidated
+ * by a finished run). */
+export function moduleFwSnapshot(): ModuleFwSnapshot | null {
+  return moduleFwCache;
 }
 
 /* Module-shared blob vault: fetchVersion primes it, the flash consumes it.
@@ -1620,6 +1685,624 @@ export async function startKeyboardRun(
   }
 }
 
+/* ---- Module flash procedure (spec §6) ------------------------------------- */
+
+/* The dock's decoded type vs the programmed want. Touch/Track dock bytes
+ * are live-proven (the de-family decoder); Tune's byte is not, so an
+ * 'unknown' decode is accepted when programming a Tune — there the
+ * firmware match is the authority. A WRONG type that decodes cleanly
+ * (Touch reported, Track wanted) still refuses. */
+function typeMatches(decoded: string | null, want: ModuleForceType): boolean {
+  return decoded === want || (decoded === 'unknown' && want === 'Tune');
+}
+
+/* 'v3.41.0.0  [hex]' → '3.41.0.0' when it is a clean dot-version, else
+ * null ('—', 'NayaFlow 1.14.3', unreadable — never compared). */
+function labelOfFwText(t: string | null): string | null {
+  if (t === null) return null;
+  const s = (t.split('  [')[0] ?? '').trim();
+  if (s === '' || s === '—') return null;
+  const raw = s.startsWith('v') ? s.slice(1) : s;
+  return dotTupleOf(raw) !== null ? raw : null;
+}
+
+/* de/1008 — the dock-reported module firmware ('v2.3.3.0'), null when the
+ * read dies or the dock is empty. de/1001 — the dock type decode. */
+async function readModuleFw(ses: NayaSession): Promise<string | null> {
+  try {
+    const d = await ses.cmd(0xde, 0x10, 0x08, new Uint8Array([0]));
+    return modFwText(d.payload);
+  } catch {
+    return null;
+  }
+}
+
+async function readDockType(ses: NayaSession): Promise<string | null> {
+  try {
+    const d = await ses.cmd(0xde, 0x10, 0x01, new Uint8Array([0]));
+    return modPresence(d.payload)?.type ?? null;
+  } catch {
+    return null;
+  }
+}
+
+/** The module flash procedure (spec §6): preconditions on the live left
+ * half only (right unplugged; module docked LEFT; type known unless
+ * forceType; newest flashable bundle the keyboard firmware can take;
+ * stored/running read from the dock) → the already-runs shortcut (no
+ * bootloader entry) → ONE SMP link conversation (identify = slot-0 arm
+ * token, slot map retried 3×, image id 4 — unmapped allowed only for an
+ * exactly-1 MiB bundle) → upload → deliberately NO post-upload reset (the
+ * half self-restarts ~1 s) → bundle.restart (replug `action` prompt once
+ * after replugMs unseen; boot reset re-sent on the cadence while a
+ * bootloader port shows; ≤ reappearMs) → bundle.verify (stored == target)
+ * → module.program (MOD_FWUP de/1005, one FWUP_TYPES byte, no reply) →
+ * module.restart (await the keyboard drop, then await the half back) →
+ * module.verify (module fw == target AND type == want ≤ modFindMs; a clean
+ * wrong-type decode refuses, pointing at Force Update) → verify.compare
+ * (left identity + keymap vs preflight) → verdict. The failure tail
+ * recovers a parked left half; run teardown invalidates the module-fw
+ * client cache and hands the ports back (both verdicts — finally
+ * semantics). Every wait is an injected `timeouts` value. */
+export async function startModuleRun(
+  deps: FlashDeps,
+  opts: StartModuleOpts,
+): Promise<FirmwareRunLog | null> {
+  const world = deps.world ?? defaultSerialWorld();
+  const vault = deps.vault ?? sharedVault;
+  const T = { ...FLASH_TIMEOUT_DEFAULTS, ...deps.timeouts };
+  const log = beginFirmwareRun(deps, 'module');
+  if (log === null) return null;
+  deps.onBegin?.(log);
+
+  const failures: string[] = [];
+  const advisories: string[] = [];
+  /* Procedure-owned app sessions on the re-enumerated left port (bundle
+   * restart / module restart) — never stored in sesRef. */
+  const owned = new Map<Side, NayaSession>();
+  /* Set when the enter frame landed: the pre-flash left session is dead
+   * from that moment (the half reboots), so the handover must drop it. */
+  let leftRebooted = false;
+  let cacheDone = false;
+  const invalidateModuleCache = (): void => {
+    if (cacheDone) return;
+    cacheDone = true;
+    moduleFwCache = null; // the module-fw snapshot cache — finally semantics
+    try {
+      deps.onModuleCacheStale?.();
+    } catch {
+      /* best-effort — the sweep rebuilds the verdicts anyway */
+    }
+  };
+
+  const finishRun = async (ok: boolean, summary: string): Promise<FirmwareRunLog> => {
+    for (const s of owned.values()) {
+      try {
+        await s.close();
+      } catch {
+        /* ignore */
+      }
+    }
+    owned.clear();
+    if (leftRebooted) {
+      const ses = deps.sesRef.current.get('left');
+      if (ses !== undefined) {
+        try {
+          await ses.close();
+        } catch {
+          /* ignore */
+        }
+        deps.sesRef.current.delete('left');
+      }
+    }
+    endFirmwareRun(ok, summary, failures, advisories);
+    invalidateModuleCache();
+    if (deps.rescan !== undefined) {
+      try {
+        await deps.rescan();
+      } catch {
+        /* best-effort handover — the user can always reconnect manually */
+      }
+    }
+    return log;
+  };
+
+  /* Failure tail: a parked left half is put back into the application
+   * before the run reports failure (os reset to the answering bootloader
+   * port, then the app PID awaited within rescueMs, re-resets on the
+   * cadence). */
+  const failTail = async (detail: string): Promise<FirmwareRunLog> => {
+    if (leftRebooted) {
+      try {
+        const ports0 = await world.getPorts();
+        if (!ports0.some((p) => portMatches(p, 'left', 'app'))) {
+          try {
+            await exitBootloader(world, 'left', null, T.probeMs, T.resetMs);
+          } catch {
+            /* the reset may still land — the window below keeps polling */
+          }
+          const deadline = Date.now() + T.rescueMs;
+          let lastReset = Date.now();
+          for (;;) {
+            if ((await world.getPorts()).some((p) => portMatches(p, 'left', 'app'))) break;
+            const now = Date.now();
+            if (now >= deadline) {
+              const d = 'the left half never returned to app mode — unplug and replug it';
+              log.fail('rescue', 'left', d);
+              failures.push(`rescue: ${d}`);
+              break;
+            }
+            if (now - lastReset >= T.reBootResetMs) {
+              try {
+                await exitBootloader(world, 'left', null, T.probeMs, T.resetMs);
+              } catch {
+                /* best-effort — keep polling */
+              }
+              lastReset = now;
+            }
+            await sleep(Math.min(T.pollMs, Math.max(0, deadline - Date.now())));
+          }
+          if ((await world.getPorts()).some((p) => portMatches(p, 'left', 'app'))) {
+            log.ok('rescue', 'left', { detail: 'the left half is back in app mode' });
+          }
+        }
+      } catch (e) {
+        failures.push(`rescue: ${msgOf(e)}`);
+      }
+    }
+    return finishRun(false, `module flash failed — ${detail}`);
+  };
+  const abort = (step: string, detail: string): Promise<FirmwareRunLog> => {
+    failures.push(`${step}: ${detail}`);
+    log.fail(step, 'left', detail);
+    return failTail(detail);
+  };
+
+  /* Await the left half's app port and open a procedure-owned session on
+   * it (the openOwnedSession connect+identify discipline). The replug
+   * prompt (bundle.restart only) fires ONCE after replugMs unseen; a
+   * visible bootloader port gets the boot reset re-sent on the cadence. */
+  const awaitLeftApp = async (o: {
+    windowMs: number;
+    replugAfterMs: number | null;
+    step: string;
+  }): Promise<NayaSession> => {
+    const t0 = Date.now();
+    const deadline = t0 + o.windowMs;
+    let actionSent = false;
+    let lastBootReset = Date.now();
+    for (;;) {
+      const ports = await world.getPorts();
+      const appPort = ports.find((p) => portMatches(p, 'left', 'app')) ?? null;
+      if (appPort !== null) {
+        const s = await openOwnedSession(appPort, 'left');
+        if (s !== null) return s;
+      }
+      const now = Date.now();
+      if (now >= deadline) {
+        throw new Error(`the left half never came back within ${Math.round(o.windowMs / 1000)} s`);
+      }
+      if (o.replugAfterMs !== null && !actionSent && now - t0 >= o.replugAfterMs) {
+        actionSent = true;
+        log.action(o.step, 'left', MODULE_REPLUG_TEXT);
+      }
+      if (
+        now - lastBootReset >= T.reBootResetMs &&
+        ports.some((p) => portMatches(p, 'left', 'mcuboot'))
+      ) {
+        try {
+          await exitBootloader(world, 'left', null, T.probeMs, T.resetMs);
+        } catch {
+          /* best-effort — keep polling */
+        }
+        lastBootReset = now;
+      }
+      await sleep(Math.min(T.pollMs, Math.max(0, deadline - Date.now())));
+    }
+  };
+
+  /* fr-based identity probe with an INJECTED deadline — never cmd(), whose
+   * 6-try ladder would stall on a dead port (halves.settle precedent). */
+  const probeIdentityOwned = async (ses: NayaSession): Promise<boolean> => {
+    try {
+      ses.fr.clear();
+      await ses.writeFn(buildFrame(ses.dst, 0xfa, 0x10, 0x01, new Uint8Array([0])));
+      const f = await ses.fr.readFrame(T.probeMs);
+      return f.type === 0xfa;
+    } catch {
+      return false;
+    }
+  };
+
+  try {
+    /* ---- preflight: capture (left only — the right half must be gone) ---- */
+    if (!deps.sesRef.current.get('left')) {
+      return abort('bundle.check', 'no app session for the left half — connect it first');
+    }
+    log.start('preflight.capture');
+    const cap = await capturePreflight(deps.sesRef.current, ['left'], log);
+    log.ok('preflight.capture');
+    log.start('preflight.verify');
+    const pv = await verifyPreflight(cap);
+    if (!pv.ok) return abort('preflight.verify', pv.reason ?? 'preflight verify failed');
+    log.ok('preflight.verify');
+
+    /* ---- bundle.check: the §6 preconditions, left-half values only ------ */
+    log.start('bundle.check');
+    const left = deps.sesRef.current.get('left')!;
+    const ports0 = await world.getPorts();
+    const rightConnected =
+      deps.sesRef.current.has('right') ||
+      ports0.some((p) => portMatches(p, 'right', 'app') || portMatches(p, 'right', 'mcuboot'));
+    if (rightConnected) {
+      return abort('bundle.check', 'the right half is connected — unplug it before flashing modules');
+    }
+    const preLeft = cap.data.halves.left;
+    const dockedSide: 'left' | 'right' | null =
+      preLeft?.modulePresent === true ? ((preLeft.moduleHalfBit ?? 0) & 1) === 0 ? 'left' : 'right' : null;
+    if (dockedSide === 'right') {
+      return abort('bundle.check', 'the module is docked in the right bay — move it to the left bay');
+    }
+    if (dockedSide === null) {
+      return abort('bundle.check', 'no module is docked — dock it in the left bay first');
+    }
+    /* The bundle's keyboardRange is checked against the RUNNING keyboard
+     * firmware (fe/1002 via the preflight capture) — the pairing guard. */
+    const kbFw = labelOfFwText(preLeft?.fwText ?? null);
+    const cat = await loadFirmwareCatalog();
+    const want: ModuleForceType | null =
+      opts.forceType ??
+      (preLeft?.moduleType === 'Touch' || preLeft?.moduleType === 'Track' || preLeft?.moduleType === 'Tune'
+        ? preLeft.moduleType
+        : null);
+    if (want === null) {
+      return abort(
+        'bundle.check',
+        'the module type is unknown — use Force Update to pick the type (the wrong type gives it the wrong app)',
+      );
+    }
+    /* The stored bundle version + the dock-reported running fw (the
+     * upload/program decisions), then the client-cache snapshot. */
+    const stored = await left.moduleFileFwVersion();
+    const runningRaw = await readModuleFw(left);
+    const running = runningRaw !== null ? (runningRaw.startsWith('v') ? runningRaw.slice(1) : runningRaw) : null;
+    moduleFwCache = { stored, running, type: preLeft?.moduleType ?? null, at: Date.now() };
+
+    const plan: ModulePlan = resolveModulePlan(cat, kbFw, running, opts.label);
+    if (plan.entry === null || plan.target === null) {
+      return abort('bundle.check', plan.reason ?? 'no module bundle resolved for this keyboard');
+    }
+    const entry: FwEntry = plan.entry;
+    const target = plan.target;
+    if (plan.bundleNewerThanKeyboard) {
+      return abort(
+        'bundle.check',
+        `the ${target} bundle is newer than the keyboard firmware (${kbFw ?? 'unreadable'}) — update the keyboard first`,
+      );
+    }
+    const bytes = vault.get(entry.blobSha256);
+    if (bytes === undefined) {
+      return abort('bundle.check', `the ${target} bundle is not in the vault — download the version first`);
+    }
+    log.note(
+      'bundle.check',
+      'left',
+      `keyboard ${kbFw ?? 'unreadable'} · module type ${preLeft?.moduleType ?? 'unknown'}` +
+        ` · stored ${stored ?? 'unreadable'} · running ${running ?? 'unreadable'} → ${target}`,
+      { sha256: entry.blobSha256 },
+    );
+
+    /* upload = forceUpload || stored !== target; program = forceType != null
+     * || running !== target. Neither → the module is already on target:
+     * finish ok WITHOUT touching its bootloader. */
+    const uploadNeeded = opts.forceUpload === true || !versionsMatch(stored ?? '', target);
+    const programNeeded = opts.forceType !== undefined || !versionsMatch(running ?? '', target);
+    if (!uploadNeeded && !programNeeded) {
+      log.ok('bundle.check', 'left');
+      return finishRun(true, `the module already runs ${target} — nothing to do`);
+    }
+    if (!uploadNeeded) {
+      log.note('bundle.check', 'left', `the ${target} bundle is already stored — skipping the upload`);
+    }
+    log.ok('bundle.check', 'left');
+
+    /* ---- enter the left half's bootloader -------------------------------- */
+    if (uploadNeeded) {
+      log.start('mcuboot.enter', 'left');
+      try {
+        await left.enterMcuboot();
+      } catch (e) {
+        return abort('mcuboot.enter', `the enter write failed (${msgOf(e)})`);
+      }
+      leftRebooted = true; // the half is rebooting — its app session is dead now
+      let bootPort: PortWithInfo | null = null;
+      const enterDeadline = Date.now() + T.enterMs;
+      while (bootPort === null && Date.now() < enterDeadline) {
+        bootPort = (await world.getPorts()).find((p) => portMatches(p, 'left', 'mcuboot')) ?? null;
+        if (bootPort !== null) break;
+        const remain = enterDeadline - Date.now();
+        if (remain <= 0) break;
+        await sleep(Math.min(T.pollMs, remain));
+      }
+      if (bootPort === null) {
+        return abort('mcuboot.enter', 'no bootloader port appeared — replug the left half and retry');
+      }
+      log.ok('mcuboot.enter', 'left');
+
+      /* ---- ONE link conversation: identify → slot map → chunks ------------ */
+      log.start('identify', 'left');
+      const candidates = [...new Set((await world.getPorts()).filter((p) => portMatches(p, 'left', 'mcuboot')))];
+      let winner: Awaited<ReturnType<typeof probeOnce>>['winner'] = null;
+      let probeConsole = '';
+      for (const c of candidates) {
+        const r = await probeOnce(c, T.probeMs, T.resetMs);
+        probeConsole += r.consoleText;
+        if (r.winner !== null) {
+          winner = r.winner;
+          break;
+        }
+      }
+      if (winner === null) {
+        const text = probeConsole.trim();
+        if (text !== '') log.note('bootloader.console', 'left', text.length > 2000 ? `${text.slice(0, 2000)}…` : text);
+        return abort('identify', 'no bootloader port answered SMP image-state — replug the left half and retry');
+      }
+      const { link, device, slots, console: liveConsole } = winner;
+      const slot0 = slots.find((s) => s.slot === 0) ?? null;
+      if (slot0 === null || slot0.hash.length === 0) {
+        await link.close();
+        return abort('identify', 'the bootloader reported no slot-0 hash');
+      }
+      const slot0Hex = hexCompact(slot0.hash);
+      log.note('identify', 'left', `bundle slot-0 ${slot0Hex.slice(0, 16)}… (arm token)`, { sha256: slot0Hex });
+      log.ok('identify', 'left');
+
+      /* Slot map: 3 tries, else the unmapped rule (an exactly-1 MiB bundle
+       * may ride image id 4 unconfirmed; a disagreeing map throws). */
+      log.start('slot.map', 'left');
+      let map: Map<string, number> | null = null;
+      let mapped = false;
+      for (let i = 0; i < 3; i++) {
+        try {
+          map = await device.slotInfoMap();
+          mapped = true;
+          break;
+        } catch {
+          /* retry */
+        }
+      }
+      if (!mapped) {
+        log.note('slot.map', 'left', 'slot-info read failed 3× — continuing unmapped (the exact-1 MiB rule decides)');
+      }
+      let imageId: number;
+      try {
+        imageId = resolveUploadImageId(map, 'modules', bytes.length);
+      } catch (e) {
+        await link.close();
+        return abort('slot.map', msgOf(e));
+      }
+      log.ok('slot.map', 'left', {
+        detail: mapped ? `map confirmed → image id ${imageId}` : `no map — exact-1 MiB bundle → image id ${imageId}`,
+      });
+
+      /* The interlock gate on live values (forceType lifts ONLY the type
+       * rule — inside the gate; bay/right/arm/flashable always hold). */
+      log.start('gate.check', 'left');
+      const ports1 = await world.getPorts();
+      const gateInput: ModuleGateInput = {
+        kind: 'module',
+        entry,
+        heldSha256: entry.blobSha256,
+        arm: slot0Hex,
+        slot0Hash: slot0Hex,
+        fileSize: bytes.length,
+        bundleNewerThanKeyboard: plan.bundleNewerThanKeyboard,
+        downgrade: plan.downgrade,
+        allowOlder: opts.allowOlder,
+        rightConnected:
+          deps.sesRef.current.has('right') ||
+          ports1.some((p) => portMatches(p, 'right', 'app') || portMatches(p, 'right', 'mcuboot')),
+        moduleDockedSide: dockedSide,
+        uploadImageId: imageId,
+        forceType: opts.forceType ?? null,
+      };
+      const refusals = checkFlashGate(gateInput);
+      if (refusals.length > 0) {
+        await link.close();
+        return abort('gate.check', refusals.join('; ')); // NO upload bytes written
+      }
+      log.ok('gate.check', 'left');
+      if (plan.downgrade) {
+        log.note('gate.check', 'left', `target ${target} is older than the running module firmware — re-flashing anyway`);
+        advisories.push(`module: target version ${target} is a downgrade`);
+      }
+
+      /* Upload. The erase IS the first chunk's stall (slot.erase turns ok
+       * on its ack); progress lands at 5% steps. NO reset after the last
+       * chunk — the half self-restarts ~1 s later, and a reset here would
+       * go into a closing port (§75(b) asserts zero post-upload resets). */
+      const shaBytes = hexToBytes((entry.plaintextSha256 ?? entry.blobSha256).toLowerCase());
+      if (shaBytes === null) {
+        await link.close();
+        return abort('upload', 'catalog hash is not valid hex');
+      }
+      log.start('slot.erase', 'left');
+      log.start('upload', 'left');
+      let eraseOk = false;
+      let lastPct = -1;
+      try {
+        await device.uploadImage(
+          { bytes, sha256: shaBytes, imageId },
+          {
+            onProgress: (p) => {
+              const pct = Math.floor((p.sent / p.total) * 100);
+              if (pct >= lastPct + 5 || p.sent >= p.total) {
+                lastPct = pct;
+                log.progress('upload', 'left', pct, p.sent, p.total);
+              }
+            },
+            onFirstChunkAck: () => {
+              if (!eraseOk) {
+                eraseOk = true;
+                log.ok('slot.erase', 'left');
+              }
+            },
+          },
+        );
+      } catch (e) {
+        const m = msgOf(e);
+        if (!eraseOk) log.fail('slot.erase', 'left', m);
+        log.fail('upload', 'left', m);
+        await link.close();
+        failures.push(`upload: ${m}`);
+        return failTail(m); // the half may sit parked — rescue before the verdict
+      }
+      log.ok('upload', 'left');
+      const conText = (probeConsole + liveConsole.text).trim();
+      if (conText !== '') {
+        log.note('bootloader.console', 'left', conText.length > 2000 ? `${conText.slice(0, 2000)}…` : conText);
+      }
+      await link.close(); // the conversation is over — the port may vanish any second
+    } else {
+      /* Bundle already stored: the conversation rides the LIVE app session
+       * — but the half still reboots during module.restart below, so the
+       * reboot bookkeeping applies from the program step on. */
+      log.note('mcuboot.enter', 'left', 'skipped — the bundle is already stored, nothing enters the bootloader');
+    }
+
+    /* ---- bundle.restart: await the half back (upload path only) ---------- */
+    let ses = owned.get('left') ?? left;
+    if (uploadNeeded) {
+      log.start('bundle.restart', 'left');
+      try {
+        ses = await awaitLeftApp({ windowMs: T.reappearMs, replugAfterMs: T.replugMs, step: 'bundle.restart' });
+      } catch (e) {
+        return abort('bundle.restart', msgOf(e));
+      }
+      owned.set('left', ses);
+      log.ok('bundle.restart', 'left', { detail: 'the left half is back in app mode' });
+    }
+
+    /* ---- bundle.verify: stored == target ---------------------------------- */
+    log.start('bundle.verify', 'left');
+    const storedNow = await ses.moduleFileFwVersion();
+    if (!versionsMatch(storedNow ?? '', target)) {
+      return abort('bundle.verify', `the stored bundle version is ${storedNow ?? 'unreadable'} but ${target} was uploaded`);
+    }
+    log.ok('bundle.verify', 'left', { detail: `the stored bundle is ${target}` });
+
+    /* ---- module.program: MOD_FWUP, one FWUP_TYPES byte, no reply ---------- */
+    log.start('module.program', 'left');
+    const typeCode = FWUP_TYPES[want];
+    await ses.modFwup(typeCode, T.fwupMs);
+    log.ok('module.program', 'left', { detail: `MOD_FWUP ${want} (code ${typeCode}) — the module programs itself next` });
+
+    /* ---- module.restart: await the keyboard drop, then await it back ------ */
+    log.start('module.restart', 'left');
+    leftRebooted = true; // the keyboard restarts under us from here on
+    const dropDeadline = Date.now() + T.dropMs;
+    let dropped = false;
+    while (Date.now() < dropDeadline) {
+      if (!(await probeIdentityOwned(ses))) {
+        dropped = true;
+        break;
+      }
+      const remain = dropDeadline - Date.now();
+      if (remain <= 0) break;
+      await sleep(Math.min(T.pollMs, remain));
+    }
+    if (!dropped) {
+      return abort('module.restart', 'the keyboard never restarted after module programming — the module may still be programming');
+    }
+    try {
+      ses = await awaitLeftApp({ windowMs: T.reappearMs, replugAfterMs: null, step: 'module.restart' });
+    } catch (e) {
+      return abort('module.restart', msgOf(e));
+    }
+    owned.set('left', ses);
+    log.ok('module.restart', 'left', { detail: 'the keyboard is back in app mode after the module restart' });
+
+    /* ---- module.verify: fw == target AND type == want ≤ modFindMs -------- */
+    log.start('module.verify', 'left');
+    const vDeadline = Date.now() + T.modFindMs;
+    let verified = false;
+    for (;;) {
+      const runningNow = await readModuleFw(ses);
+      const dockType = await readDockType(ses);
+      const fwOk = runningNow !== null && versionsMatch(runningNow.startsWith('v') ? runningNow.slice(1) : runningNow, target);
+      if (fwOk && typeMatches(dockType, want)) {
+        verified = true;
+        log.ok('module.verify', 'left', { detail: `the module runs ${target} as ${want}` });
+        break;
+      }
+      /* A CLEAN wrong-type decode refuses immediately — the wrong app is
+       * on the module and Force Update is the way back. */
+      if (dockType !== null && dockType !== 'unknown' && dockType !== 'none' && dockType !== want) {
+        return abort(
+          'module.verify',
+          `the module reports type ${dockType} but ${want} was programmed — re-run with Force Update (the wrong type gives it the wrong app)`,
+        );
+      }
+      const now = Date.now();
+      if (now >= vDeadline) break;
+      await sleep(Math.min(T.pollMs, Math.max(0, vDeadline - Date.now())));
+    }
+    if (!verified) {
+      const got = await readModuleFw(ses);
+      return abort(
+        'module.verify',
+        `the module never confirmed ${target} as ${want} within ${Math.round(T.modFindMs / 1000)} s (last read: ${got ?? 'unreadable'})`,
+      );
+    }
+
+    /* ---- verify.compare: left identity + keymap vs preflight -------------- */
+    log.start('verify.compare');
+    try {
+      const postSessions = new Map<Side, NayaSession>();
+      postSessions.set('left', ses);
+      const postDoc = await captureDoc(postSessions, ['left']);
+      const postSerialized = stableStringify(postDoc);
+      const postSha = await sha256Hex(postSerialized);
+      log.note(
+        'verify.compare',
+        undefined,
+        `postflight artifact ${postSha.slice(0, 16)}… (${postSerialized.length} chars)`,
+        { artifact: 'postflight', sha256: postSha, bytes: postSerialized.length },
+      );
+      const { strict, advisories: cmpAdvisories } = comparePreflightDocs(cap.data, postDoc);
+      for (const a of cmpAdvisories) {
+        advisories.push(`verify.compare: ${a}`);
+        log.note('verify.compare', undefined, a);
+      }
+      if (strict.length > 0) {
+        for (const s of strict) failures.push(`verify.compare: ${s}`);
+        log.fail('verify.compare', undefined, strict.join('; '));
+      } else {
+        log.ok('verify.compare', undefined, {
+          detail: 'left identity + primary keymap match the preflight snapshot',
+        });
+      }
+    } catch (e) {
+      log.note('verify.compare', undefined, `compare skipped (${msgOf(e)}) — cosmetic`);
+    }
+
+    /* ---- run end ----------------------------------------------------------- */
+    const ok = failures.length === 0;
+    return finishRun(
+      ok,
+      ok ? `module flash finished — the module runs ${target}` : 'module flash finished with failures',
+    );
+  } catch (e) {
+    /* Belt+braces: an unexpected throw fails the run honestly instead of
+     * leaking the lock — and still recovers the left half first. */
+    const m = msgOf(e);
+    failures.push(`unexpected: ${m}`);
+    return failTail(m);
+  } finally {
+    invalidateModuleCache();
+  }
+}
+
 /* ---- React mirror --------------------------------------------------------- */
 
 /** Thin reactive shell over the core: status/log/events state for the UI
@@ -1635,6 +2318,7 @@ export function useFirmwareFlash(deps: FlashDeps): {
   beginRun: (kind: 'keyboard' | 'module') => FirmwareRunLog | null;
   endRun: (ok: boolean, summary?: string, failures?: string[], advisories?: string[]) => void;
   startKeyboard: (opts: StartKeyboardOpts) => Promise<void>;
+  startModule: (opts: StartModuleOpts) => Promise<void>;
 } {
   const { sesRef, busyRef, win } = deps;
   const [status, setStatus] = useState<FlashRunStatus>('idle');
@@ -1701,5 +2385,33 @@ export function useFirmwareFlash(deps: FlashDeps): {
     if (log !== null) saveText(`${log.id}.log.jsonl`, log.lines());
   }, [log]);
 
-  return { status, log, events, exportLog, beginRun, endRun, startKeyboard };
+  const startModule = useCallback(
+    async (opts: StartModuleOpts): Promise<void> => {
+      setStatus('running');
+      const l = await startModuleRun(
+        {
+          ...deps,
+          onBegin: (run) => {
+            setLog(run);
+            setEvents([...run.events]);
+            run.subscribe(() => {
+              setEvents([...run.events]);
+            });
+          },
+        },
+        opts,
+      );
+      if (l === null) {
+        setStatus('idle'); // refused — a run is already active
+        return;
+      }
+      setLog(l);
+      setEvents([...l.events]);
+      const last = l.events[l.events.length - 1];
+      setStatus(last !== undefined && last.step === 'run.end' && last.ok === false ? 'failed' : 'done');
+    },
+    [deps],
+  );
+
+  return { status, log, events, exportLog, beginRun, endRun, startKeyboard, startModule };
 }
