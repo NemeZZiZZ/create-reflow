@@ -6774,7 +6774,8 @@ void (async () => {
   // raw constants (swapMs 400 < settle+poll of a SECOND re-poll, so any
   // early-success path is proven by finishing at all).
   const T72 = { pollMs: 15, enterMs: 1200, swapMs: 400, rePollMs: 10, probeMs: 150,
-    resetMs: 60, confirmMs: 9000, reResetMs: 300, settleMs: 1500 };
+    resetMs: 60, confirmMs: 9000, reResetMs: 300, settleMs: 1500,
+    rescueMs: 900 }; // T8: the stranded-half rescue window (failure tail)
 
   const mkCase72 = (o: {
     foreign?: boolean; // slot-0 hash matches no catalog entry
@@ -6792,19 +6793,22 @@ void (async () => {
     const w = mkWorld72([appL, appR]);
     // Post-flash app-mode fakes (T7 return-to-app): the re-enumerated app
     // port answers the connectPort discipline — fa/1001 identify (33B left /
-    // 21B right) and fe/1002 with the flashed version's bytes.
+    // 21B right) and fe/1002 with the flashed version's bytes. T8: the tail's
+    // verify.compare re-reads the full preflight verb set through these
+    // sessions, so they delegate to the same replyApp72 shapes the
+    // pre-flight capture saw — identical values, clean compare.
     const fwAfter72 = fwBytes72(label72!);
     const appAfterL = scripted72((rq: Frame): Uint8Array => {
       const k = `${rq.type.toString(16)}/${rq.c1.toString(16)}`;
       if (k === 'fa/1') return Uint8Array.from({ length: 33 }, (_, i) => i);
       if (k === 'fe/2') return fwAfter72;
-      return Uint8Array.from([0x00]);
+      return replyApp72({})(rq);
     });
     const appAfterR = scripted72((rq: Frame): Uint8Array => {
       const k = `${rq.type.toString(16)}/${rq.c1.toString(16)}`;
       if (k === 'fa/1') return Uint8Array.from({ length: 21 }, (_, i) => i);
       if (k === 'fe/2') return fwAfter72;
-      return Uint8Array.from([0x00]);
+      return replyApp72({})(rq);
     });
     // The re-enumerated app ports must carry the USB identity — portMatches
     // decodes the PID, and a port without getInfo matches nothing.
@@ -6936,14 +6940,14 @@ void (async () => {
       '72(b) gate refusal: unknown current firmware needs consent');
     const anyWrite72b = c.bootL.linesWritten.some((l) => {
       const f = parseSmpChunks(l).frames[0];
-      return !!f && f.op === SMP.OP_WRITE;
+      return !!f && f.op === SMP.OP_WRITE && f.group === SMP.GROUP_IMAGE;
     });
     eq(anyWrite72b, false,
-      '72(b) ZERO OP_WRITE frames on the bootloader port — no upload, no set-pending, nothing');
+      '72(b) ZERO image-family writes on the bootloader port — no upload, no set-pending, nothing (the T8 rescue tail may only os-reset: OS family)');
     eq(log.events.some((e) => e.step === 'upload'), false, '72(b) upload never started');
   };
 
-  // ---- (c) upload rc≠0 abort: run fails, no rescue (T8), no swap.verify -----
+  // ---- (c) upload rc≠0 abort: run fails, T8 rescue resets the parked half --
   const caseC72 = async (): Promise<void> => {
     const c = mkCase72({ failRc: 5, boots: { left: ['smp'] } });
     const log = await begin72('72(c)', c, { targets: leftOnly72, ...kbOpts72 });
@@ -6952,8 +6956,11 @@ void (async () => {
     const uf = log.events.find((e) => e.step === 'upload' && e.phase === 'fail');
     eq(uf !== undefined && /rc 5/.test(uf.detail ?? ''), true, '72(c) upload rc≠0 surfaces as the upload failure');
     eq(c.bootL.uploadCount(), 1, '72(c) exactly one chunk write attempted (abort on the first rc≠0)');
-    eq(c.bootL.osResetCount(), 0, '72(c) rescue path not yet (T8): no os reset sent');
-    eq(log.events.some((e) => e.step === 'rescue'), false, '72(c) no rescue step events');
+    eq(c.bootL.osResetCount() >= 1, true,
+      '72(c) T8 rescue: the parked half is os-reset (initial + reResetMs-cadence re-resets through the window)');
+    const rf72c = log.events.find((e) => e.step === 'rescue' && e.phase === 'fail');
+    eq(rf72c !== undefined && /power cycle/.test(rf72c.detail ?? ''), true,
+      '72(c) rescue outcome: half never came back within the window → power-cycle note, run still fails on the upload');
     eq(log.events.some((e) => e.step === 'swap.verify'), false, '72(c) swap.verify never started');
     eq(log.events.some((e) => e.step === 'gate.check' && e.phase === 'ok'), true,
       '72(c) the gate had passed before the abort');
@@ -7269,7 +7276,10 @@ void (async () => {
           const k = `${rq.type.toString(16)}/${rq.c1.toString(16)}`;
           if (k === 'fa/1') return Uint8Array.from({ length: o.idLen }, (_, i) => i);
           if (k === 'fe/2') return o.fw;
-          return Uint8Array.from([0x00]);
+          // T8: the tail (brightness/lighting restores, verify.compare)
+          // re-reads the preflight verb set through this owned session —
+          // delegate to the same shapes the pre-flight capture saw.
+          return replyApp73(rq);
         })());
         verifyFrame(resp);
         setTimeout(() => { queue.push(resp); const w = waiter; waiter = null; w?.(); }, 5);
@@ -7417,7 +7427,8 @@ void (async () => {
   };
 
   const T73 = { pollMs: 15, enterMs: 1200, swapMs: 400, rePollMs: 10, probeMs: 150,
-    resetMs: 60, confirmMs: 9000, reResetMs: 300, settleMs: 1500 };
+    resetMs: 60, confirmMs: 9000, reResetMs: 300, settleMs: 1500,
+    rescueMs: 900 }; // T8: the stranded-half rescue window (failure tail)
   const leftOnly73 = [{ side: 'left' as const, label: label73! }];
   const kbOpts73 = { allowOlder: false, acceptUnknown: false, consentedUnknown: false };
 
@@ -7687,6 +7698,667 @@ void (async () => {
       '73(d) sweep: connects the unclaimed app-PID port; SKIPS mcuboot/third PIDs, foreign VID, no-info, claimed sides');
   }
   signal73done?.();
+})();
+
+// §74 flash tail (startKeyboardRun steps 12-15 + the failure path): the
+// restores are cosmetic and never fatal — brightness.restore writes LED max
+// brightness 100 (never 0) per flashed side through the owned session
+// (ed/1013 settings write), lighting.restore reads the LEFT half's layer
+// list (30/1001 handshake payload) and echoes it straight back (30/1002 —
+// one frame to the left clears runtime effects on both halves); a throwing
+// restore lands as a note and the run still ends ok. verify.compare
+// re-captures the world on the settled sessions and compares against the
+// preflight artifact — strict failures: BLE address, pair address, bond
+// table, primary (bank 0) keymap, where an absent position equals a `07 00`
+// NONE record (the device compacts fillers away); LED map and bank-1
+// differences are advisories only (a version change across the flash is the
+// expected reason for them). The failure path rescues any entered half
+// still parked in its bootloader: probe for the answering port, os reset,
+// await the app PID within rescueMs with re-resets on the reResetMs cadence
+// — three logged outcomes: back running X / still parked after the window →
+// power-cycle note / left the bootloader but not on USB → unplug-replug
+// note. run.end carries failures[] + advisories[] either way.
+let signal74done: (() => void) | null = null;
+// T9/T10's §75+ chain on this signal the way §74 chains on after73.
+// eslint-disable-next-line @typescript-eslint/no-unused-vars
+const after74: Promise<void> = new Promise<void>((r) => { signal74done = r; });
+void (async () => {
+  await after73; // §73 owns the one-run lock while its cases run — never interleave
+  const portInfo74 = (pid: number): { usbVendorId: number; usbProductId: number } =>
+    ({ usbVendorId: NAYA_VID, usbProductId: pid });
+  const stubPort74 = (pid: number): PortWithInfo =>
+    ({ getInfo: () => portInfo74(pid) }) as unknown as PortWithInfo;
+  const mkWorld74 = (initial: PortWithInfo[]): { world: SerialWorld; list: PortWithInfo[] } => {
+    const list = [...initial];
+    return {
+      list,
+      world: {
+        getPorts: async () => [...list],
+        requestPort: async () => { throw new Error('no user gesture in the smoke world'); },
+      },
+    };
+  };
+  const drop74 = (list: PortWithInfo[], p: PortWithInfo): void => {
+    const i = list.indexOf(p);
+    if (i >= 0) list.splice(i, 1);
+  };
+  const lastEv74 = (log: FirmwareRunLog): RunEvent => log.events[log.events.length - 1]!;
+  // The silent twin: swallows SMP frames, babbles console text (§73 mkLog73).
+  const mkLogPort74 = (pid: number, banner: string) => {
+    let streams: { readable: ReadableStream<Uint8Array>; writable: WritableStream<Uint8Array> } | null = null;
+    const build = (): void => {
+      const readable = new ReadableStream<Uint8Array>({
+        start(c) { setTimeout(() => { c.enqueue(new TextEncoder().encode(banner)); }, 5); },
+      });
+      const writable = new WritableStream<Uint8Array>({
+        write() { /* swallowed */ },
+      });
+      streams = { readable, writable };
+    };
+    build();
+    const port = {
+      get readable() { return streams?.readable ?? null; },
+      get writable() { return streams?.writable ?? null; },
+      async open() { build(); },
+      async setSignals() {},
+      async close() { streams = null; },
+      getInfo: () => portInfo74(pid),
+    };
+    return { port: port as unknown as PortWithInfo };
+  };
+  const fwBytes74 = (label: string): Uint8Array => {
+    const parts = label.split('.').map((p) => Number.parseInt(p, 10));
+    while (parts.length < 4) parts.push(0);
+    return Uint8Array.from([0, ...parts.slice(0, 4)]);
+  };
+
+  // Recording app-mode port fake — the §73 mkApp73 shape plus:
+  // - every request recorded as {key, params} so the smoke can observe the
+  //   ed/1013 brightness value and the 30/1002 layer-list echo bytes;
+  // - 30/1001 inventory + 30/1003/30/100d bank overrides (the compare
+  //   fixtures feed DIFFERENT bank bytes pre vs post);
+  // - throwKeys: the writer THROWS for the listed verb keys (restore
+  //   failure → note, never fatal).
+  const mkApp74 = (o: {
+    pid: number;
+    fw: Uint8Array;
+    idLen: number;
+    inventory?: Uint8Array; // 30/1001 handshake reply payload
+    keyBank?: (layer: number, part: number) => Uint8Array; // 30/1003 parts
+    ledBank?: (layer: number, part: number) => Uint8Array; // 30/100d parts
+    be8?: Uint8Array;
+    throwKeys?: string[];
+  }) => {
+    const replyDefault = replyApp74(); // canonical pre-shape for non-overridden verbs
+    let closes = 0;
+    let dead = false;
+    const writes: { key: string; params: Uint8Array }[] = [];
+    const queue: Uint8Array[] = [];
+    let waiter: (() => void) | null = null;
+    const throwSet = new Set(o.throwKeys ?? []);
+    const reader = {
+      async read(): Promise<{ value?: Uint8Array; done?: boolean }> {
+        for (;;) {
+          const c = queue.shift();
+          if (c) return { value: c, done: false };
+          await new Promise<void>((res) => { waiter = res; });
+        }
+      },
+      cancel() { const w = waiter; waiter = null; w?.(); },
+      releaseLock() {},
+    };
+    const writer = {
+      async write(b: Uint8Array) {
+        if (dead) return;
+        const rq = verifyFrame(Uint8Array.from(b));
+        const k = `${rq.type.toString(16)}/${rq.c1.toString(16)}`;
+        writes.push({ key: k, params: rq.payload });
+        if (throwSet.has(k)) throw new Error(`fake ${k} write failure`);
+        const resp = buildFrame(0x50, rq.type, rq.c0, rq.c1, (() => {
+          if (k === 'fa/1') return Uint8Array.from({ length: o.idLen }, (_, i) => i);
+          if (k === 'fe/2') return o.fw;
+          if (k === '30/1') return o.inventory ?? Uint8Array.from([0x00]);
+          if (k === '30/2') return Uint8Array.from([0x00, 0x00]);
+          if (k === 'ed/13') return Uint8Array.from([0x00]);
+          if (k === 'be/8') return o.be8 ?? Uint8Array.from([0x11, 0x22, 0x33, 0x44, 0x55, 0x66]);
+          if (k === 'be/2') return Uint8Array.from([0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0x0f]);
+          if (k === 'be/5') return Uint8Array.from([1, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0x0f]);
+          if (k === 'de/1') return Uint8Array.from([0x00, 0x00, 0x10, 0x00]); // module absent
+          if (k === '30/3') return o.keyBank ? o.keyBank(rq.payload[1] ?? 0, rq.payload[0] ?? 0) : replyDefault(rq);
+          if (k === '30/d') return o.ledBank ? o.ledBank(rq.payload[1] ?? 0, rq.payload[0] ?? 0) : replyDefault(rq);
+          return Uint8Array.from([0x00]);
+        })());
+        verifyFrame(resp);
+        setTimeout(() => { queue.push(resp); const w = waiter; waiter = null; w?.(); }, 5);
+      },
+      releaseLock() {},
+    };
+    const port = {
+      readable: { locked: false, getReader: () => reader },
+      writable: { getWriter: () => writer },
+      async open() {}, async setSignals() {}, async close() { closes += 1; },
+      getInfo: () => portInfo74(o.pid),
+    };
+    return {
+      port: port as unknown as PortWithInfo,
+      closes: (): number => closes,
+      writesOf: (key: string): Uint8Array[] => writes.filter((w) => w.key === key).map((w) => w.params),
+    };
+  };
+
+  // Bootloader line-port — the §73 mkBoot73 shape plus failRc (the upload
+  // aborts on the first rc≠0 chunk ack, leaving the half parked).
+  const mkBoot74 = (o: {
+    pid: number;
+    pre0: Uint8Array;
+    sha: Uint8Array;
+    swapAfterMs?: number | null;
+    failRc?: number | null;
+    onReset?: () => void;
+  }) => {
+    const linesWritten: string[] = [];
+    let stage: 'fresh' | 'uploaded' | 'swapped' = 'fresh';
+    let total = -1;
+    let controller: ReadableStreamDefaultController<Uint8Array> | null = null;
+    let pending = '';
+    let streams: { readable: ReadableStream<Uint8Array>; writable: WritableStream<Uint8Array> } | null = null;
+    const build = (): void => {
+      pending = '';
+      const enc = new TextEncoder();
+      const dec = new TextDecoder();
+      const readable = new ReadableStream<Uint8Array>({
+        start(c) { controller = c; },
+      });
+      const push = (t: string, delayMs = 5): void => {
+        setTimeout(() => { controller?.enqueue(enc.encode(t)); }, delayMs);
+      };
+      const writable = new WritableStream<Uint8Array>({
+        write(b) {
+          pending += dec.decode(b);
+          for (;;) {
+            const i = pending.indexOf('\n');
+            if (i < 0) break;
+            const line = pending.slice(0, i + 1);
+            pending = pending.slice(i + 1);
+            linesWritten.push(line);
+            const rq = parseSmpChunks(line).frames[0];
+            if (!rq) continue;
+            if (rq.op === SMP.OP_READ && rq.group === SMP.GROUP_IMAGE && rq.cmdId === SMP.ID_IMAGE_STATE) {
+              const slots = stage === 'swapped'
+                ? [
+                    { slot: 0, hash: o.sha, flags: ['active', 'confirmed'] },
+                    { slot: 1, hash: o.pre0, flags: [] },
+                  ]
+                : stage === 'uploaded'
+                  ? [
+                      { slot: 0, hash: o.pre0, flags: ['active', 'confirmed'] },
+                      { slot: 1, hash: o.sha, flags: ['pending'] },
+                    ]
+                  : [
+                      { slot: 0, hash: o.pre0, flags: ['active', 'confirmed'] },
+                      { slot: 1, hash: o.pre0, flags: [] },
+                    ];
+              push(encodeSmpLine(SMP.OP_READ_RSP, rq.group, rq.seq, rq.cmdId, cborEncode({ rc: 0, images: slots })));
+              continue;
+            }
+            if (rq.op === SMP.OP_READ && rq.group === SMP.GROUP_IMAGE && rq.cmdId === SMP.ID_SLOT_INFO) {
+              push(encodeSmpLine(SMP.OP_READ_RSP, rq.group, rq.seq, rq.cmdId, cborEncode({ rc: 8 })));
+              continue;
+            }
+            if (rq.op === SMP.OP_WRITE && rq.group === SMP.GROUP_IMAGE && rq.cmdId === SMP.ID_IMAGE_UPLOAD) {
+              const v = cborDecode(rq.payload).value as { off: number; len?: number; data: Uint8Array };
+              if (o.failRc !== null && o.failRc !== undefined) {
+                push(encodeSmpLine(SMP.OP_READ_RSP, rq.group, rq.seq, rq.cmdId, cborEncode({ rc: o.failRc })));
+                continue;
+              }
+              if (v.off === 0) total = typeof v.len === 'number' ? v.len : -1;
+              const end = v.off + v.data.length;
+              if (total >= 0 && end >= total) {
+                stage = 'uploaded';
+                const delay = o.swapAfterMs;
+                if (typeof delay === 'number') setTimeout(() => { stage = 'swapped'; }, delay);
+              }
+              push(encodeSmpLine(SMP.OP_READ_RSP, rq.group, rq.seq, rq.cmdId, cborEncode({ off: end, rc: 0 })));
+              continue;
+            }
+            if (rq.op === SMP.OP_WRITE && rq.group === SMP.GROUP_OS && rq.cmdId === SMP.ID_OS_RESET) {
+              push(encodeSmpLine(SMP.OP_READ_RSP, rq.group, rq.seq, rq.cmdId, cborEncode({ rc: 0 })));
+              o.onReset?.();
+              continue;
+            }
+          }
+        },
+      });
+      streams = { readable, writable };
+    };
+    build();
+    const port = {
+      get readable() { return streams?.readable ?? null; },
+      get writable() { return streams?.writable ?? null; },
+      async open() { build(); },
+      async setSignals() {},
+      async close() { streams = null; },
+      getInfo: () => portInfo74(o.pid),
+    };
+    const isWrite = (l: string, group: number, cmdId: number): boolean => {
+      const f = parseSmpChunks(l).frames[0];
+      return !!f && f.op === SMP.OP_WRITE && f.group === group && f.cmdId === cmdId;
+    };
+    return {
+      port: port as unknown as PortWithInfo,
+      linesWritten,
+      osResetCount: (): number => linesWritten.filter((l) => isWrite(l, SMP.GROUP_OS, SMP.ID_OS_RESET)).length,
+    };
+  };
+
+  // Pre-flash app-session fake — the §73 scripted73 shape verbatim (the
+  // half goes dark once the ee/10ae enter frame lands).
+  const scripted74 = (reply: (rq: Frame) => Uint8Array, onEnter?: () => void) => {
+    const queue: Uint8Array[] = [];
+    let waiter: (() => void) | null = null;
+    let dead = false;
+    const reader = {
+      async read(): Promise<{ value?: Uint8Array; done?: boolean }> {
+        for (;;) {
+          const c = queue.shift();
+          if (c) return { value: c, done: false };
+          await new Promise<void>((res) => { waiter = res; });
+        }
+      },
+      cancel() { const w = waiter; waiter = null; w?.(); },
+      releaseLock() {},
+    };
+    const writer = {
+      async write(b: Uint8Array) {
+        if (dead) return;
+        const rq = verifyFrame(Uint8Array.from(b));
+        if (rq.type === 0xee && rq.c0 === 0x10 && rq.c1 === 0xae) {
+          const ack = buildFrame(0x50, rq.type, rq.c0, rq.c1, Uint8Array.from([0x00]));
+          verifyFrame(ack);
+          setTimeout(() => { queue.push(ack); const w = waiter; waiter = null; w?.(); }, 5);
+          dead = true;
+          setTimeout(() => onEnter?.(), 30);
+          return;
+        }
+        const resp = buildFrame(0x50, rq.type, rq.c0, rq.c1, reply(rq));
+        verifyFrame(resp);
+        setTimeout(() => { queue.push(resp); const w = waiter; waiter = null; w?.(); }, 5);
+      },
+      releaseLock() {},
+    };
+    const port = {
+      readable: { locked: false, getReader: () => reader },
+      writable: { getWriter: () => writer },
+      async open() {}, async setSignals() {}, async close() {},
+    };
+    return {
+      session() {
+        const r = port.readable.getReader() as unknown as ReadableStreamDefaultReader<Uint8Array>;
+        const w = port.writable.getWriter() as unknown as WritableStreamDefaultWriter<Uint8Array>;
+        return new NayaSession(
+          port as unknown as SerialPort, 0x50,
+          new FrameReader(r), w, r,
+          async (b) => { await w.write(b); }, null,
+        );
+      },
+    };
+  };
+
+  // Preflight reply shape — the replyApp73 verb set, with the keymap/LED
+  // banks overridable per case (the compare fixtures feed DIFFERENT bytes
+  // pre vs post and expect the classified verdict). Also the DEFAULT the
+  // post-side fake delegates to when a bank override is absent — the
+  // identical-world compare must see identical bytes, never a [0x00]
+  // no-answer (that would read as an 'unknown' bank status).
+  const replyApp74 = (banks?: {
+    keymap?: Record<number, Uint8Array>; // layer → assembled blob
+    ledmap?: Record<number, Uint8Array>;
+  }) => (rq: Frame): Uint8Array => {
+    const k = `${rq.type.toString(16)}/${rq.c1.toString(16)}`;
+    if (k === 'fe/2') return Uint8Array.from([0, 1, 2, 3, 4]);
+    if (k === 'be/8') return Uint8Array.from([0x11, 0x22, 0x33, 0x44, 0x55, 0x66]);
+    if (k === 'be/2') return Uint8Array.from([0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0x0f]);
+    if (k === 'be/5') return Uint8Array.from([1, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0x0f]);
+    if (k === 'de/1') return Uint8Array.from([0x00, 0x00, 0x10, 0x00]); // module absent
+    if (k === '30/3') {
+      const layer = rq.payload[1] ?? 0;
+      const part = rq.payload[0] ?? 0;
+      const blob = banks?.keymap?.[layer];
+      if (blob === undefined) {
+        if (layer === 1) return Uint8Array.from([0x16]);
+        return part === 0
+          ? Uint8Array.from([0x01, layer, 0x10, 0x20, 0x30, 0x40])
+          : Uint8Array.from([0x00, layer, 0x50, 0x60, 0x70, 0x80]);
+      }
+      const chunk = 6;
+      const body = blob.subarray(part * chunk, (part + 1) * chunk);
+      const more = (part + 1) * chunk < blob.length ? 0x01 : 0x00;
+      return Uint8Array.from([more, layer, ...body]);
+    }
+    if (k === '30/d') {
+      const layer = rq.payload[1] ?? 0;
+      const part = rq.payload[0] ?? 0;
+      const blob = banks?.ledmap?.[layer];
+      if (blob === undefined) {
+        if (layer === 1) return Uint8Array.from([0x16]);
+        return Uint8Array.from([0x00, layer, 0xb4, 0x00, 0x64, 0x11]);
+      }
+      const chunk = 6;
+      const body = blob.subarray(part * chunk, (part + 1) * chunk);
+      const more = (part + 1) * chunk < blob.length ? 0x01 : 0x00;
+      return Uint8Array.from([more, layer, ...body]);
+    }
+    return Uint8Array.from([0x00]);
+  };
+
+  // ---- catalog picks (§73 pattern): newest dual-side gen-A label + older
+  // running entry.
+  const cat74 = await loadFirmwareCatalog();
+  let label74: string | undefined;
+  let entryL74: FwEntry | null = null;
+  let entryR74: FwEntry | null = null;
+  for (const v of keyboardVersions(cat74)) {
+    const l = findKeyboardImage(cat74, 'left', 'A', v.label);
+    const r = findKeyboardImage(cat74, 'right', 'A', v.label);
+    if (l === null || r === null) continue;
+    if (typeof l.plaintextSha256 !== 'string' || typeof r.plaintextSha256 !== 'string') continue;
+    label74 = v.label;
+    entryL74 = l;
+    entryR74 = r;
+    break;
+  }
+  let runEntry74: FwEntry | null = null;
+  for (const v of keyboardVersions(cat74)) {
+    if (v.label === label74) continue;
+    const l = findKeyboardImage(cat74, 'left', 'A', v.label);
+    if (l === null || typeof l.plaintextSha256 !== 'string') continue;
+    if (typeof l.releaseOrder === 'number' && entryL74 !== null &&
+        typeof entryL74.releaseOrder === 'number' && l.releaseOrder < entryL74.releaseOrder) {
+      runEntry74 = l;
+      break;
+    }
+  }
+  eq(label74 !== undefined && entryL74 !== null && entryR74 !== null && runEntry74 !== null, true,
+    '74 fixture: dual-side gen-A label with plaintext hashes + an older running entry exist');
+  const pre074 = hexToBytes(runEntry74!.plaintextSha256!)!;
+  const shaL74 = hexToBytes(entryL74!.plaintextSha256 ?? entryL74!.blobSha256)!;
+  const bytes74 = (seed: number): Uint8Array => Uint8Array.from({ length: 700 }, (_, i) => (i * 13 + seed) & 0xff);
+  const mkVault74 = (): Vault => {
+    const v = newVault();
+    v.set(entryL74!, bytes74(3));
+    v.set(entryR74!, bytes74(5));
+    return v;
+  };
+  const T74 = { pollMs: 15, enterMs: 1200, swapMs: 400, rePollMs: 10, probeMs: 150,
+    resetMs: 60, confirmMs: 9000, reResetMs: 300, settleMs: 1500, rescueMs: 600 };
+  const leftOnly74 = [{ side: 'left' as const, label: label74! }];
+  const kbOpts74 = { allowOlder: false, acceptUnknown: false, consentedUnknown: false };
+
+  // Left-only case builder: silent twin + answering bootloader port, both
+  // replaced by the post-flash app port when an os reset lands on the
+  // answerer (reenumerate: false keeps the half parked — still-parked
+  // outcome). postApp shapes the owned session's answers (compare fixtures).
+  const mkCase74 = (o: {
+    failUpload?: boolean;
+    reenumerate?: boolean; // default true — the os reset re-enumerates the app port
+    noBootPort?: boolean; // the bootloader port never appears (enter-window abort)
+    preBanks?: { keymap?: Record<number, Uint8Array>; ledmap?: Record<number, Uint8Array> };
+    postApp?: {
+      be8?: Uint8Array;
+      keyBank?: (layer: number, part: number) => Uint8Array;
+      ledBank?: (layer: number, part: number) => Uint8Array;
+      inventory?: Uint8Array;
+      throwKeys?: string[];
+    };
+    enterMs?: number;
+  }) => {
+    const appLstub = stubPort74(0x064);
+    const appRstub = stubPort74(0x0c8);
+    const w = mkWorld74([appLstub, appRstub]);
+    const appAfterL = mkApp74({
+      pid: 0x064, fw: fwBytes74(label74!), idLen: 33,
+      be8: o.postApp?.be8,
+      keyBank: o.postApp?.keyBank,
+      ledBank: o.postApp?.ledBank,
+      inventory: o.postApp?.inventory,
+      throwKeys: o.postApp?.throwKeys,
+    });
+    const logL = mkLogPort74(0x06f, 'Naya bootloader log port — verbosity high\n');
+    const bootL = mkBoot74({
+      pid: 0x06f, pre0: pre074, sha: shaL74, swapAfterMs: 30,
+      failRc: o.failUpload === true ? 5 : null,
+      onReset: () => {
+        if (o.reenumerate === false) return;
+        drop74(w.list, bootL.port);
+        drop74(w.list, logL.port);
+        w.list.push(appAfterL.port);
+      },
+    });
+    const leftDev = scripted74(replyApp74(o.preBanks), () => {
+      drop74(w.list, appLstub);
+      if (o.noBootPort !== true) {
+        w.list.push(bootL.port);
+        w.list.push(logL.port);
+      }
+    });
+    const sesRef = { current: new Map<'left' | 'right', NayaSession>() };
+    sesRef.current.set('left', leftDev.session());
+    let rescans = 0;
+    let rescanFlag: boolean | null = null;
+    const deps = {
+      sesRef,
+      busyRef: { current: false },
+      world: w.world,
+      vault: mkVault74(),
+      timeouts: { ...T74, ...(o.enterMs !== undefined ? { enterMs: o.enterMs } : {}) },
+      rescan: async (): Promise<void> => {
+        rescans += 1;
+        rescanFlag = firmwareRunActive();
+      },
+    };
+    return {
+      deps, bootL, appAfterL, sesRef,
+      rescans: (): number => rescans,
+      rescanFlag: (): boolean | null => rescanFlag,
+    };
+  };
+
+  // ---- (a) upload throws mid-run → rescue resets the parked fake, the
+  // outcome lands ("back running …"), the verdict still fails on the upload.
+  {
+    const c = mkCase74({ failUpload: true });
+    const log = await startKeyboardRun(c.deps, { targets: leftOnly74, ...kbOpts74 });
+    if (log === null) {
+      eq(false, true, '74(a): run began');
+    } else {
+      const le = lastEv74(log);
+      eq(le.step === 'run.end' && le.ok === false, true, '74(a) run.end fails on the upload throw');
+      eq((le.failures as string[]).some((f) => f.startsWith('upload:')), true,
+        '74(a) the verdict failures list carries the upload failure');
+      eq(c.bootL.osResetCount(), 1, '74(a) the rescue os-reset the parked half exactly once');
+      const rok = log.events.find((e) => e.step === 'rescue' && e.phase === 'ok' && e.side === 'left');
+      eq(rok !== undefined && /back running/.test(rok.detail ?? ''), true,
+        '74(a) rescue outcome logged: the half is back running (with its version)');
+      eq(c.rescans() === 1 && c.rescanFlag() === false, true,
+        '74(a) the failure tail still hands the ports back (rescan after the flag cleared)');
+      eq(c.sesRef.current.size === 0, true, '74(a) the dead pre-flash session was dropped at handover');
+    }
+  }
+
+  // ---- (a2) the half never comes back → still-parked power-cycle outcome ---
+  {
+    const c = mkCase74({ failUpload: true, reenumerate: false });
+    const log = await startKeyboardRun(c.deps, { targets: leftOnly74, ...kbOpts74 });
+    if (log === null) {
+      eq(false, true, '74(a2): run began');
+    } else {
+      const le = lastEv74(log);
+      eq(le.step === 'run.end' && le.ok === false, true, '74(a2) run.end fails');
+      const rf = log.events.find((e) => e.step === 'rescue' && e.phase === 'fail' && e.side === 'left');
+      eq(rf !== undefined && /power cycle/.test(rf.detail ?? ''), true,
+        '74(a2) still parked after the window → the power-cycle note');
+      eq((le.failures as string[]).some((f) => f.startsWith('rescue:')), true,
+        '74(a2) the verdict failures list carries the unresolved rescue');
+      eq(c.bootL.osResetCount() >= 1, true, '74(a2) at least the initial rescue os-reset was sent');
+    }
+  }
+
+  // ---- (a3) the half left the bootloader but never re-appeared on USB →
+  // unplug-replug outcome, instantly (no window wait on a vanished port) ----
+  {
+    const c = mkCase74({ noBootPort: true, enterMs: 90 });
+    const t0 = Date.now();
+    const log = await startKeyboardRun(c.deps, { targets: leftOnly74, ...kbOpts74 });
+    const dt = Date.now() - t0;
+    if (log === null) {
+      eq(false, true, '74(a3): run began');
+    } else {
+      const le = lastEv74(log);
+      eq(le.step === 'run.end' && le.ok === false, true, '74(a3) run.end fails');
+      const rf = log.events.find((e) => e.step === 'rescue' && e.phase === 'fail' && e.side === 'left');
+      eq(rf !== undefined && /unplug and replug/.test(rf.detail ?? ''), true,
+        '74(a3) not on USB → the unplug-replug note');
+      eq(dt < 10000, true, '74(a3) the vanish classification is instant — never a window wait');
+    }
+  }
+
+  // ---- (b1) compare: post-run BLE address differs → strict failure ---------
+  {
+    const c = mkCase74({
+      postApp: { be8: Uint8Array.from([0x99, 0x88, 0x77, 0x66, 0x55, 0x44]) },
+    });
+    const log = await startKeyboardRun(c.deps, { targets: leftOnly74, ...kbOpts74 });
+    if (log === null) {
+      eq(false, true, '74(b1): run began');
+    } else {
+      const le = lastEv74(log);
+      eq(le.step === 'run.end' && le.ok === false, true, '74(b1) a BLE address change fails the run');
+      const cf = log.events.find((e) => e.step === 'verify.compare' && e.phase === 'fail');
+      eq(cf !== undefined && /BLE address/.test(cf.detail ?? ''), true,
+        '74(b1) verify.compare fail: the BLE address change is named');
+      eq((le.failures as string[]).some((f) => f.startsWith('verify.compare:')), true,
+        '74(b1) the verdict failures list carries the compare refusal');
+    }
+  }
+
+  // ---- (b2) compare: LED map differs with a version change → advisory only -
+  {
+    const c = mkCase74({
+      postApp: {
+        ledBank: (layer, part) => (layer === 1
+          ? Uint8Array.from([0x16])
+          : Uint8Array.from([part === 0 ? 0x00 : 0x00, layer, part === 0 ? 0xc8 : 0x00, 0x00, 0x64, 0x11])),
+      },
+    });
+    const log = await startKeyboardRun(c.deps, { targets: leftOnly74, ...kbOpts74 });
+    if (log === null) {
+      eq(false, true, '74(b2): run began');
+    } else {
+      const le = lastEv74(log);
+      eq(le.step === 'run.end' && le.ok === true, true, '74(b2) an LED map difference never fails the run');
+      eq((le.advisories as string[]).some((a) => /LED map/.test(a)), true,
+        '74(b2) the LED map difference lands in the verdict advisories');
+      eq(log.events.some((e) => e.step === 'verify.compare' && e.phase === 'fail'), false,
+        '74(b2) no verify.compare failure for an LED map difference');
+      const cok = log.events.find((e) => e.step === 'verify.compare' && e.phase === 'ok');
+      eq(cok !== undefined, true, '74(b2) verify.compare still closes ok (advisories only)');
+    }
+  }
+
+  // ---- (b3) compare: identical world + NONE-equivalent keymap → clean ------
+  // Pre bank 0 carries an explicit `07 00` NONE filler at KK 0x07 plus a
+  // real record at KK 0x08; post carries only KK 0x08 — the absent position
+  // equals a `07 00` NONE record (the device compacts fillers away), so the
+  // banks compare EQUAL.
+  const blob74pre = Uint8Array.from([
+    0x07, 0x07, 0x00,                         // KK 0x07: `07 00` NONE filler
+    0x08, 0x01, 0x04, 0x42, 0x00, 0x07, 0x00, // KK 0x08: T01 'B'
+  ]);
+  const blob74post = Uint8Array.from([
+    0x08, 0x01, 0x04, 0x42, 0x00, 0x07, 0x00, // KK 0x08 only — 0x07 ABSENT
+  ]);
+  const keyBankParts74 = (blob: Uint8Array) => (layer: number, part: number): Uint8Array => {
+    if (layer !== 0) return Uint8Array.from([0x16]);
+    const chunk = 6;
+    const body = blob.subarray(part * chunk, (part + 1) * chunk);
+    const more = (part + 1) * chunk < blob.length ? 0x01 : 0x00;
+    return Uint8Array.from([more, layer, ...body]);
+  };
+  {
+    const c = mkCase74({
+      preBanks: { keymap: { 0: blob74pre } },
+      postApp: { keyBank: keyBankParts74(blob74post) },
+    });
+    const log = await startKeyboardRun(c.deps, { targets: leftOnly74, ...kbOpts74 });
+    if (log === null) {
+      eq(false, true, '74(b3): run began');
+    } else {
+      const le = lastEv74(log);
+      eq(le.step === 'run.end' && le.ok === true, true, '74(b3) the NONE-equivalent keymap compares clean — run ok');
+      const cok = log.events.find((e) => e.step === 'verify.compare' && e.phase === 'ok');
+      eq(cok !== undefined && /match the preflight/.test(cok.detail ?? ''), true,
+        '74(b3) verify.compare ok: identities + primary keymap match the preflight snapshot');
+      eq((le.advisories as string[]).filter((a) => /verify\.compare|keymap|LED map/.test(a)).length, 0,
+        '74(b3) no compare advisories on an identical world');
+    }
+  }
+
+  // ---- (c) restores: the owned fake observes the ed/1013 write (value 100,
+  // never 0) and the layer-list read + write-back; then the throw variant —
+  // a failing restore lands as a note and the run still ends ok --------------
+  {
+    const inv74 = [
+      { idx: 1, uuid: 'a'.repeat(32), animStored: 0 },
+      { idx: 2, uuid: 'b'.repeat(32), animStored: 1 },
+    ];
+    const invReply = encodeLayerListAdd(inv74); // 00 00 prefix — parses as an inventory reply too
+    const echoExpected = encodeRestorePayload(inv74);
+    const c = mkCase74({ postApp: { inventory: invReply } });
+    const log = await startKeyboardRun(c.deps, { targets: leftOnly74, ...kbOpts74 });
+    if (log === null) {
+      eq(false, true, '74(c): run began');
+    } else {
+      const le = lastEv74(log);
+      eq(le.step === 'run.end' && le.ok === true, true, '74(c) the restored run ends ok');
+      const brts = c.appAfterL.writesOf('ed/13');
+      eq(brts.length >= 1, true, '74(c) the owned session observed the ed/1013 brightness write');
+      eq(brts.length >= 1 && brts[0]!.length === 2 && brts[0]![0] === 0x00 && brts[0]![1] === 100, true,
+        '74(c) brightness value is 100 (target 0) — never 0');
+      eq(brts.every((p) => p[1] !== 0), true, '74(d) every brightness write carries a non-0 value');
+      eq(c.appAfterL.writesOf('30/1').length >= 1, true,
+        '74(c) lighting.restore read the layer list (30/1001) through the owned session');
+      const echoes = c.appAfterL.writesOf('30/2');
+      eq(echoes.length >= 1 && toHex(echoes[0]!) === toHex(echoExpected), true,
+        '74(c) lighting.restore echoed the inventory straight back (30/1002 restore payload)');
+      const lrOk = log.events.find((e) => e.step === 'lighting.restore' && e.phase === 'ok');
+      eq(lrOk !== undefined && /2 entries/.test(lrOk.detail ?? ''), true,
+        '74(c) lighting.restore ok names the echoed entry count');
+      const brOk = log.events.find((e) => e.step === 'brightness.restore' && e.phase === 'ok' && e.side === 'left');
+      eq(brOk !== undefined, true, '74(c) brightness.restore ok for the flashed side');
+    }
+  }
+  {
+    // '30/1' must stay ANSWERING here — the owned-session connect
+    // (openOwnedSession) handshakes the left half with it, and a throw
+    // there would leave version.confirm polling a session that can never
+    // open. The lighting failure rides '30/2' (the echo write) instead.
+    const c = mkCase74({ postApp: { throwKeys: ['ed/13', '30/2'] } });
+    const log = await startKeyboardRun(c.deps, { targets: leftOnly74, ...kbOpts74 });
+    if (log === null) {
+      eq(false, true, '74(c2): run began');
+    } else {
+      const le = lastEv74(log);
+      eq(le.step === 'run.end' && le.ok === true, true, '74(c2) a throwing restore never fails the run');
+      const bn = log.events.find((e) => e.step === 'brightness.restore' && e.phase === 'note' && e.side === 'left');
+      eq(bn !== undefined && /not restored/.test(bn.detail ?? ''), true,
+        '74(c2) the throwing brightness restore lands as a note');
+      const ln = log.events.find((e) => e.step === 'lighting.restore' && e.phase === 'note');
+      eq(ln !== undefined, true, '74(c2) the throwing lighting restore lands as a note');
+      eq(log.events.some((e) => e.step === 'brightness.restore' && e.phase === 'fail'), false,
+        '74(c2) no fail events from the cosmetic steps');
+    }
+  }
+  signal74done?.();
 })();
 
 void main();

@@ -41,18 +41,31 @@
  * values, re-checks the interlock gate with live values, uploads through
  * SmpDevice.uploadImage (slot.erase ok = first chunk ack), observes the
  * swap, os-resets the answering port (mcuboot.exit — the silent twin never
- * sees an SMP write), confirms the flashed version on a procedure-owned
- * app session (mismatch refuses; non-versioned target is advisory-only),
- * settles BOTH halves (fail-and-continue on timeout), and hands the ports
- * back: owned sessions closed, dead pre-flash sessions disconnected, flag
- * cleared, rescan(). Every wait is an injected `timeouts` value — the core
- * never sleeps on raw constants (the smoke runs millisecond-scale). */
+ * sees an SMP write; a throwing reset on a stale answer-port is read as
+ * "already rebooted", never an abort), confirms the flashed version on a
+ * procedure-owned app session (mismatch refuses; non-versioned target is
+ * advisory-only), settles BOTH halves (fail-and-continue on timeout), then
+ * the tail: brightness.restore (ed/1013 max brightness 100 per flashed
+ * side) and lighting.restore (read the left layer list, echo it straight
+ * back — cosmetic, never fatal), verify.compare (postflight re-capture on
+ * the settled sessions; strict: BLE/pair/bond identity + primary keymap
+ * bank with the `07 00`-NONE-equals-absent rule; advisories: LED map +
+ * second bank across a version change), the stranded-half rescue (every
+ * entered half not proven back in app mode: answering port → os reset →
+ * await app ≤ rescueMs with re-resets; back-running / power-cycle /
+ * unplug-replug outcomes — on the failure tail this runs BEFORE the
+ * verdict), and the verdict `finish` with failures/advisories. Run end
+ * hands the ports back: owned sessions closed, dead pre-flash sessions
+ * disconnected (entered + settle-dead halves), flag cleared, rescan().
+ * Every wait is an injected `timeouts` value — the core never sleeps on
+ * raw constants (the smoke runs millisecond-scale). */
 
 import { useCallback, useState } from 'react';
 import type { RefObject } from 'react';
 import {
   bleGetAddress, bleGetAllPairs, bleGetPairAddress, buildFrame, DST_LEFT, DST_RIGHT,
-  fwVersionText, hexToBytes, modPresence, NayaSession, resolveUploadImageId, sleep, SmpDevice,
+  encodeRestorePayload, fwVersionText, hexToBytes, maxBrtOp, modPresence, NayaSession,
+  parseCmdPath, parseInventory, parseLayer, resolveUploadImageId, sleep, SmpDevice,
   SmpLink, SMP_DEFAULT_TIMEOUTS, toHex,
 } from '@create-reflow/sdk';
 import type { ImageSlot, Side } from '@create-reflow/sdk';
@@ -280,15 +293,14 @@ async function readBankPreflight(ses: NayaSession, layer: number): Promise<Prefl
   return bank;
 }
 
-/** Capture the preflight artifact for the requested sides (left first).
- * Reads go through the live sessions; missing sessions record null halves.
- * When `log` is omitted, the artifact note lands in the active run's log
- * (and nowhere when no run is active). */
-export async function capturePreflight(
+/* Capture the world doc for the requested sides (left first). Reads go
+ * through the live sessions; missing sessions record null halves. Shared by
+ * capturePreflight (pre-run, logs a 'preflight.capture' artifact note) and
+ * the verify.compare tail (post-run, logged under 'verify.compare'). */
+async function captureDoc(
   sessions: Map<Side, NayaSession>,
   sides: Side[],
-  log?: FirmwareRunLog | null,
-): Promise<PreflightCapture> {
+): Promise<PreflightDoc> {
   const wantLeft = sides.includes('left');
   const wantRight = sides.includes('right');
   const left = wantLeft ? sessions.get('left') : undefined;
@@ -307,6 +319,19 @@ export async function capturePreflight(
       '1': await readBankPreflight(left, 1),
     };
   }
+  return doc;
+}
+
+/** Capture the preflight artifact for the requested sides (left first).
+ * Reads go through the live sessions; missing sessions record null halves.
+ * When `log` is omitted, the artifact note lands in the active run's log
+ * (and nowhere when no run is active). */
+export async function capturePreflight(
+  sessions: Map<Side, NayaSession>,
+  sides: Side[],
+  log?: FirmwareRunLog | null,
+): Promise<PreflightCapture> {
+  const doc = await captureDoc(sessions, sides);
   const serialized = stableStringify(doc);
   const sha256 = await sha256Hex(serialized);
   const sink = log ?? activeRun?.log ?? null;
@@ -337,6 +362,141 @@ export async function verifyPreflight(
   return { ok: true };
 }
 
+/* ---- verify.compare (spec §5 step 14) ------------------------------------- */
+
+/* The restore brightness value. There is no app-saved brightness cache to
+ * read (BehaviorTab holds a UI-local default-100 state; nothing is
+ * persisted), so the OF constant it is — maxBrtOp refuses 0..100 violations,
+ * and a 0 here could black out the LEDs. */
+const BRIGHTNESS_RESTORE_VALUE = 100;
+
+/* One keymap bank's records, NONE-normalized: the stored blob hex parsed
+ * into per-position records (parseLayer's universal [KK, T, LEN, …] rule).
+ * A `07 00` NONE filler at a position EQUALS that position being absent —
+ * the device compacts fillers away, so both shapes are the same "nothing
+ * bound here". Values are the record hex minus the KK byte (the position).
+ * Null = the bank was not readable (status ≠ 'ok'). */
+function keyBankMap(status: string, hex: string | null): Map<number, string> | null {
+  if (status !== 'ok' || hex === null) return null;
+  const bytes = hexToBytes(hex);
+  if (bytes === null) return null;
+  const out = new Map<number, string>();
+  for (const r of parseLayer(bytes).recs) {
+    if (r.rec.length === 3 && r.rec[1] === 0x07 && r.rec[2] === 0x00) continue; // NONE == absent
+    out.set(r.kk, toHex(r.rec.slice(1)));
+  }
+  return out;
+}
+
+/* Compare one keymap bank; null = equal, string = the first difference. */
+function compareKeyBanks(a: PreflightBank, b: PreflightBank): string | null {
+  const ma = keyBankMap(a.keysStatus, a.keysHex);
+  const mb = keyBankMap(b.keysStatus, b.keysHex);
+  if (ma === null || mb === null) {
+    // Unreadable banks: equal only when BOTH sides failed the same way.
+    return a.keysStatus === b.keysStatus && ma === mb ? null : `read status ${a.keysStatus} → ${b.keysStatus}`;
+  }
+  for (const [kk, rec] of ma) {
+    const other = mb.get(kk);
+    if (other === undefined) return `KK 0x${kk.toString(16)} record removed (${rec})`;
+    if (other !== rec) return `KK 0x${kk.toString(16)} record changed (${rec} → ${other})`;
+  }
+  for (const [kk, rec] of mb) {
+    if (!ma.has(kk)) return `KK 0x${kk.toString(16)} record added (${rec})`;
+  }
+  return null;
+}
+
+/* Compare one LED-map bank (advisory tier — never strict); null = equal. */
+function compareLedBanks(a: PreflightBank, b: PreflightBank): string | null {
+  const ba = hexToBytes(a.ledsHex ?? '');
+  const bb = hexToBytes(b.ledsHex ?? '');
+  if (ba !== null && bb !== null && a.ledsStatus === 'ok' && b.ledsStatus === 'ok') {
+    if (toHex(ba) === toHex(bb)) return null;
+    return `blob ${ba.length} B → ${bb.length} B`;
+  }
+  return a.ledsStatus === b.ledsStatus ? null : `read status ${a.ledsStatus} → ${b.ledsStatus}`;
+}
+
+/* One lighting.restore attempt on the left half (step 13): read the left
+ * half's layer list (30/1001 handshake payload — the same read the app's
+ * readInventory uses) and echo it straight back with one 30/1002 restore
+ * frame, which clears runtime lighting effects on both halves (OF
+ * service.py:1189-1207). Returns the echoed entry count; throws on
+ * anything — the caller notes, never fatal. */
+async function echoLayerListOnce(left: NayaSession): Promise<number> {
+  const inv = parseInventory((await left.handshake()).payload);
+  if (inv.length === 0) {
+    throw new Error('layer list unreadable (0 entries) — nothing to echo back');
+  }
+  const ack = await left.writeLayerList(encodeRestorePayload(inv));
+  // ACK gate: the settings/module write convention (00 …) or a layer-idx
+  // echo 1..7; 0xEA = value rejected (useFlash isLayerListAck precedent).
+  const ackOk = ack.payload.length > 0 &&
+    (ack.payload[0] === 0x00 || (ack.payload[0] >= 0x01 && ack.payload[0] <= 0x07));
+  if (!ackOk) throw new Error(`NACK ${toHex(ack.payload)}`);
+  return inv.length;
+}
+
+/* Compare the postflight world doc against the preflight artifact. Strict
+ * failures: per-half BLE address / pair address / bond table + the primary
+ * (bank 0) keymap. LED map + second bank differences are advisories — and
+ * only when the left half's firmware version changed across the flash (the
+ * expected reason for them; an identical version must not invent findings).
+ * The doc comparison is done on PARSED records with the NONE/absent
+ * normalization (not raw hex equality): the choice that respects the
+ * device's filler compaction. */
+function comparePreflightDocs(
+  pre: PreflightDoc,
+  post: PreflightDoc,
+): { strict: string[]; advisories: string[] } {
+  const strict: string[] = [];
+  const advisories: string[] = [];
+  for (const side of ['left', 'right'] as const) {
+    const a = pre.halves[side];
+    const b = post.halves[side];
+    if (a === null || b === null) {
+      if (a !== null && b === null) {
+        advisories.push(`${side}: postflight identity unreadable (half not on a live session)`);
+      }
+      continue;
+    }
+    if (a.bleAddress !== b.bleAddress) {
+      strict.push(`${side}: BLE address changed (${a.bleAddress ?? 'unreadable'} → ${b.bleAddress ?? 'unreadable'})`);
+    }
+    if (a.pairAddress !== b.pairAddress) {
+      strict.push(`${side}: pair address changed (${a.pairAddress ?? 'unreadable'} → ${b.pairAddress ?? 'unreadable'})`);
+    }
+    const bondA = a.bondedPeers === null ? null : a.bondedPeers.join(' ');
+    const bondB = b.bondedPeers === null ? null : b.bondedPeers.join(' ');
+    if (bondA !== bondB) {
+      strict.push(`${side}: bond table changed (${bondA ?? 'unreadable'} → ${bondB ?? 'unreadable'})`);
+    }
+  }
+  const versionChanged =
+    pre.halves.left !== null && post.halves.left !== null &&
+    pre.halves.left.fwText !== post.halves.left.fwText;
+  const pb = pre.keymapBanks;
+  const qb = post.keymapBanks;
+  if (pb !== null && qb !== null) {
+    const k0 = compareKeyBanks(pb['0'], qb['0']);
+    if (k0 !== null) strict.push(`left: primary keymap bank changed across the flash (${k0})`);
+    const k1 = compareKeyBanks(pb['1'], qb['1']);
+    if (k1 !== null && versionChanged) {
+      advisories.push(`left: second keymap bank differs across the version change (${k1})`);
+    }
+    for (const bank of ['0', '1'] as const) {
+      const l = compareLedBanks(pb[bank], qb[bank]);
+      if (l !== null && versionChanged) {
+        advisories.push(`left: LED map bank ${bank} differs across the version change (${l})`);
+      }
+    }
+  } else if (pb !== null || qb !== null) {
+    advisories.push('left: postflight keymap banks unreadable (no live left session)');
+  }
+  return { strict, advisories };
+}
+
 /* ---- Keyboard flash-one-side core (spec §5 steps 1-8) --------------------- */
 
 export interface FlashTimeouts {
@@ -349,6 +509,7 @@ export interface FlashTimeouts {
   confirmMs?: number; // version.confirm window for the app PID to (re)appear
   reResetMs?: number; // version.confirm re-reset cadence while the app port is missing
   settleMs?: number; // halves.settle window for BOTH halves to answer again
+  rescueMs?: number; // stranded-half rescue window (spec §5 failure path)
 }
 
 /* Spec defaults — the ONLY sleeps the procedure does; smoke injects
@@ -363,6 +524,7 @@ export const FLASH_TIMEOUT_DEFAULTS = {
   confirmMs: 300_000,
   reResetMs: 30_000,
   settleMs: 90_000,
+  rescueMs: 300_000,
 } as const;
 
 export interface StartKeyboardTarget {
@@ -660,6 +822,13 @@ export async function startKeyboardRun(
    * re-enumerated): at handover those sesRef entries get closed + removed;
    * a pre-run session of a half we never touched stays untouched. */
   const entered = new Set<Side>();
+  /* Sides that version.confirm brought back to app mode — proof the half
+   * left its bootloader, so the rescue pass never touches them. */
+  const confirmed = new Set<Side>();
+  /* Sides whose settle probe failed (dead sessions): their sesRef entries
+   * are dropped at handover too — a stale dead session must not block the
+   * post-run rescan/connectPort from rebuilding the half (T7 review). */
+  const deadSides = new Set<Side>();
   /* The run-end handover: close owned sessions, disconnect the dead
    * pre-flash sessions, clear the freeze flag, then hand the ports back to
    * rescan() — it rebuilds the live sessions on the re-enumerated app
@@ -673,7 +842,7 @@ export async function startKeyboardRun(
       }
     }
     owned.clear();
-    for (const side of entered) {
+    for (const side of new Set([...entered, ...deadSides])) {
       const ses = deps.sesRef.current.get(side);
       if (ses !== undefined) {
         try {
@@ -694,10 +863,126 @@ export async function startKeyboardRun(
     }
     return log;
   };
+
+  /* ---- stranded-half rescue (spec §5 failure path) ------------------------
+   * For each entered half not proven back in app mode (and not visibly on
+   * an app port): find the answering bootloader port, os-reset it, then
+   * await the app PID within rescueMs — re-resetting on the reResetMs
+   * cadence. Three logged outcomes, none of which softens the original
+   * failure (rescue success logs its own recovery outcome; the verdict
+   * keeps what failed): back running X / still parked → power-cycle note /
+   * left the bootloader but not on USB → unplug-replug note. */
+  const rescueSide = async (side: Side): Promise<void> => {
+    log.start('rescue', side);
+    const ports0 = await world.getPorts();
+    if (ports0.some((p) => portMatches(p, side, 'app'))) {
+      // The half is visibly in app mode — nothing stranded (candidate-filter
+      // race); the settle/compare tail covers the session side.
+      log.ok('rescue', side, { detail: `the ${side} half is back in app mode` });
+      return;
+    }
+    const boots = [...new Set(ports0.filter((p) => portMatches(p, side, 'mcuboot')))];
+    if (boots.length === 0) {
+      const d = `the ${side} half left the bootloader but is not on USB — unplug and replug it`;
+      log.fail('rescue', side, d);
+      failures.push(`rescue: ${d}`);
+      return;
+    }
+    // Find the ANSWERING bootloader port (the silent twin never sees an SMP
+    // write), and os-reset it.
+    let answer: PortWithInfo | null = null;
+    for (const c of boots) {
+      const r = await probeOnce(c, T.probeMs, T.resetMs);
+      if (r.winner !== null) {
+        answer = r.winner.port;
+        await r.winner.link.close();
+        break;
+      }
+    }
+    if (answer !== null) {
+      try {
+        await resetPort(answer, T.resetMs);
+      } catch {
+        /* the reset may still land — the window below keeps polling */
+      }
+    } else {
+      log.note('rescue', side, `no ${side} bootloader port answers SMP — waiting out the window in case it recovers on its own`);
+    }
+    const rescueDeadline = Date.now() + T.rescueMs;
+    let lastReset = Date.now();
+    for (;;) {
+      if ((await world.getPorts()).some((p) => portMatches(p, side, 'app'))) break;
+      const now = Date.now();
+      if (now >= rescueDeadline) {
+        const stillParked = (await world.getPorts()).some((p) => portMatches(p, side, 'mcuboot'));
+        const d = stillParked
+          ? `the ${side} half is still parked in its bootloader — a power cycle brings it back (nothing written is lost)`
+          : `the ${side} half left the bootloader but is not on USB — unplug and replug it`;
+        log.fail('rescue', side, d);
+        failures.push(`rescue: ${d}`);
+        return;
+      }
+      if (now - lastReset >= T.reResetMs) {
+        // Re-reset with a FRESH probe (exitBootloader with no kept port):
+        // the original answerer may have vanished mid-swap while its twin
+        // now answers.
+        try {
+          await exitBootloader(world, side, null, T.probeMs, T.resetMs);
+        } catch {
+          /* best-effort — keep polling */
+        }
+        lastReset = Date.now();
+      }
+      await sleep(Math.min(T.pollMs, Math.max(0, rescueDeadline - Date.now())));
+    }
+    // Back in app: read the version for the outcome line (garnish — a dead
+    // read just means "back in app mode").
+    let ver = '';
+    const appPort = (await world.getPorts()).find((p) => portMatches(p, side, 'app')) ?? null;
+    if (appPort !== null) {
+      const ses = await openOwnedSession(appPort, side);
+      if (ses !== null) {
+        try {
+          const f = await ses.cmd(0xfe, 0x10, 0x02, new Uint8Array([0]));
+          ver = fwTextOf(f.payload);
+        } catch {
+          /* version is garnish */
+        }
+        try {
+          await ses.close();
+        } catch {
+          /* ignore */
+        }
+      }
+    }
+    log.ok('rescue', side, {
+      detail: ver !== '' ? `the ${side} half is back running ${ver}` : `the ${side} half is back in app mode`,
+    });
+  };
+  const rescueStranded = async (): Promise<void> => {
+    for (const side of entered) {
+      if (confirmed.has(side)) continue; // proven out of its bootloader
+      const ports = await world.getPorts();
+      if (ports.some((p) => portMatches(p, side, 'app'))) continue; // visible in app — settle handles the session
+      await rescueSide(side);
+    }
+  };
+
+  /* Failure tail: rescue any stranded half, then the failing verdict. EVERY
+   * failure exit funnels through here — a half left in its bootloader is
+   * put back into the application before the run reports failure. */
+  const failTail = async (detail: string): Promise<FirmwareRunLog> => {
+    try {
+      await rescueStranded();
+    } catch (e) {
+      failures.push(`rescue: ${msgOf(e)}`);
+    }
+    return finishRun(false, `keyboard flash failed — ${detail}`);
+  };
   const abort = (step: string, side: Side | undefined, detail: string): Promise<FirmwareRunLog> => {
     failures.push(`${step}: ${detail}`);
     log.fail(step, side, detail);
-    return finishRun(false, `keyboard flash failed — ${detail}`);
+    return failTail(detail);
   };
 
   /* Per-side console bookkeeping: probed-port text accumulates across the
@@ -999,7 +1284,7 @@ export async function startKeyboardRun(
         await link.close();
         dumpConsole(side, probeConsole, liveConsole);
         failures.push(`upload: ${m}`);
-        return finishRun(false, `keyboard flash failed — ${m}`);
+        return failTail(m); // the half may sit parked in its bootloader — rescue before the verdict
       }
       log.ok('upload', side);
       /* The winning link's job is done — the port may vanish the moment the
@@ -1060,7 +1345,12 @@ export async function startKeyboardRun(
           log.ok('mcuboot.exit', side);
         }
       } catch (e) {
-        return abort('mcuboot.exit', side, msgOf(e));
+        /* A throwing reset on a STALE answer-port (the half rebooted under
+         * us between swap.verify and this reset) is not a refusal: fall
+         * through to the probe-fallback reading — the half already
+         * rebooted; version.confirm below re-checks it comes back. */
+        log.note('mcuboot.exit', side, `the reset on the answering port failed (${msgOf(e)}) — treating it as already rebooted`);
+        log.ok('mcuboot.exit', side);
       }
 
       /* ---- step 10: version.confirm — the half must come back running the
@@ -1138,6 +1428,7 @@ export async function startKeyboardRun(
           `the ${side} half never returned to app mode within ${Math.round(T.confirmMs / 1000)} s`,
         );
       }
+      confirmed.add(side); // proof the half left its bootloader — rescue skips it
       if (versionAdvisory !== null) log.note('version.confirm', side, versionAdvisory);
       else log.note('version.confirm', side, confirmedDetail);
       log.ok('version.confirm', side);
@@ -1210,9 +1501,99 @@ export async function startKeyboardRun(
       const detail = `the ${side} half never answered identity again within ${Math.round(T.settleMs / 1000)} s — power-cycle it if it stays dark`;
       log.fail('halves.settle', side, detail);
       failures.push(`halves.settle: ${detail}`);
+      deadSides.add(side); // its session is dead — the handover must drop it
     }
     if (settled.size === settleSides.size) {
       log.ok('halves.settle', undefined, { detail: `${settled.size} half${settled.size === 1 ? '' : 'ves'} answered identity again` });
+    }
+
+    /* ---- steps 12-13: restores (cosmetic, never fatal) -------------------- */
+    /* brightness.restore: LED max brightness 100 through each flashed
+     * half's settled session (ed/1013 settings-path write). Lighting
+     * restore: read the LEFT half's layer list and echo it straight back —
+     * one frame to the left clears runtime lighting effects on both halves
+     * (the useFlash flash-tail echo / App rewriteLayerList precedent).
+     * A throwing restore lands as a note; it never enters the verdict. */
+    for (const t of targets) {
+      const side = t.side;
+      const ses = owned.get(side) ?? null;
+      log.start('brightness.restore', side);
+      if (ses === null) {
+        log.note('brightness.restore', side, `no live session for the ${side} half — skipped (cosmetic)`);
+        continue;
+      }
+      try {
+        const op = maxBrtOp(BRIGHTNESS_RESTORE_VALUE);
+        const { t: ty, c0, c1 } = parseCmdPath(op.path);
+        const f = await ses.cmd(ty, c0, c1, op.payload);
+        if (f.payload.length === 0 || f.payload[0] !== 0x00) {
+          throw new Error(`NACK ${toHex(f.payload)}`);
+        }
+        log.ok('brightness.restore', side, { detail: `max brightness ${BRIGHTNESS_RESTORE_VALUE}` });
+      } catch (e) {
+        log.note('brightness.restore', side, `not restored (${msgOf(e)}) — cosmetic, the run continues`);
+      }
+    }
+    log.start('lighting.restore', 'left');
+    {
+      const left = owned.get('left') ?? deps.sesRef.current.get('left') ?? null;
+      if (left === null) {
+        log.note('lighting.restore', 'left', 'no live session for the left half — skipped (cosmetic)');
+      } else {
+        try {
+          const n = await echoLayerListOnce(left);
+          log.ok('lighting.restore', 'left', {
+            detail: `${n} entr${n === 1 ? 'y' : 'ies'} echoed back — stored lighting restored on both halves`,
+          });
+        } catch (e) {
+          log.note('lighting.restore', 'left', `not restored (${msgOf(e)}) — cosmetic, the run continues`);
+        }
+      }
+    }
+
+    /* ---- step 14: verify.compare — re-capture on the settled sessions ----- */
+    log.start('verify.compare');
+    try {
+      const postSessions = new Map<Side, NayaSession>();
+      for (const side of settleSides) {
+        if (!settled.has(side)) continue; // a dark half's reads would only stall — settle failed it already
+        const ses = owned.get(side) ?? deps.sesRef.current.get(side);
+        if (ses !== undefined) postSessions.set(side, ses);
+      }
+      const postDoc = await captureDoc(postSessions, ['left', 'right']);
+      const postSerialized = stableStringify(postDoc);
+      const postSha = await sha256Hex(postSerialized);
+      log.note(
+        'verify.compare',
+        undefined,
+        `postflight artifact ${postSha.slice(0, 16)}… (${postSerialized.length} chars)`,
+        { artifact: 'postflight', sha256: postSha, bytes: postSerialized.length },
+      );
+      const { strict, advisories: cmpAdvisories } = comparePreflightDocs(cap.data, postDoc);
+      for (const a of cmpAdvisories) {
+        advisories.push(`verify.compare: ${a}`);
+        log.note('verify.compare', undefined, a);
+      }
+      if (strict.length > 0) {
+        for (const s of strict) failures.push(`verify.compare: ${s}`);
+        log.fail('verify.compare', undefined, strict.join('; '));
+      } else {
+        log.ok('verify.compare', undefined, {
+          detail: 'identities + primary keymap match the preflight snapshot',
+        });
+      }
+    } catch (e) {
+      /* The compare itself must never sink the run harder than a note: a
+       * dead port mid-capture is recorded as nulls by the readers, so this
+       * is a belt+braces for unexpected world throws. */
+      log.note('verify.compare', undefined, `compare skipped (${msgOf(e)}) — cosmetic`);
+    }
+
+    /* ---- belt: no half left parked before the verdict --------------------- */
+    try {
+      await rescueStranded();
+    } catch (e) {
+      failures.push(`rescue: ${msgOf(e)}`);
     }
 
     /* ---- run end: hand the ports back ------------------------------------- */
@@ -1225,10 +1606,11 @@ export async function startKeyboardRun(
     );
   } catch (e) {
     /* Belt+braces: an unexpected throw (world rejection, dead port) fails
-     * the run honestly instead of leaking the lock. */
+     * the run honestly instead of leaking the lock — and still rescues any
+     * half we left parked before reporting. */
     const m = msgOf(e);
     failures.push(`unexpected: ${m}`);
-    return finishRun(false, `keyboard flash failed — ${m}`);
+    return failTail(m);
   }
 }
 
