@@ -14,6 +14,15 @@ import {
   loadAppShortcuts, detectPlatform, bindOf, appShortcutActionDef, rankAppHits,
 } from '../src/lib/app-shortcuts';
 import type { AppEntry, ShortcutEntry } from '../src/lib/app-shortcuts';
+import {
+  loadFirmwareCatalog, parseFirmwareCatalog, keyboardVersions, findKeyboardImage,
+} from '../src/lib/firmware-catalog';
+import type { FwCatalog, FwEntry } from '../src/lib/firmware-catalog';
+import {
+  FIRMWARE_SOURCE_BASE, newVault, fetchImage, fetchVersion,
+} from '../src/lib/firmware-fetch';
+import { NAYA_VID, RECOVERY_PIDS, pidInfo } from '../src/lib/firmware-plat';
+import { resolveKeyboardPlan } from '../src/lib/firmware-plan';
 import * as fs from 'fs';
 import * as path from 'path';
 import { keyIconName, shortLabel } from '../src/lib/key-icon-map';
@@ -5666,6 +5675,288 @@ void (async () => {
   eq(SMP_DEFAULT_TIMEOUTS.chunkMs, 20000, '68 timeouts: default chunkMs 20s');
   eq(SMP_DEFAULT_TIMEOUTS.eraseMs, 90000, '68 timeouts: default eraseMs 90s');
   eq(SMP_DEFAULT_TIMEOUTS.transceiveMs, 5000, '68 timeouts: default transceiveMs 5s');
+})();
+
+// §69 firmware catalog + fetch + plan libs: vendored OF catalog integrity,
+// loader validation, PID/side/gen table, plan flags (unchanged/downgrade/
+// unknownCurrent/present/fetchable/reason), the catalog-by-name hazard
+// (14 entries share the literal name kb_fwl.bin — matching is BY ENTRY,
+// never by file name), and sha256-gated fetch over an injectable fetchFn.
+void (async () => {
+  const msg69 = (e: unknown): string => (e instanceof Error ? e.message : String(e));
+
+  // (a) vendored catalog loads through the memoized dynamic-import loader
+  const cat69 = await loadFirmwareCatalog();
+  eq(cat69.generated.startsWith('2026-09-23'), true,
+    '69 catalog: generated date 2026-09-23 (vendored byte-identical from OF)');
+  eq(cat69.images.length, 69, '69 catalog: 69 images');
+  eq(cat69.releases.length, 25, '69 catalog: 25 releases');
+  const comp69 = cat69.images.find((e) => e.file === 'Touch_UserApp.sfb');
+  eq(comp69 !== undefined && typeof comp69.sha256 === 'string' && typeof comp69.blobSha256 !== 'string',
+    true, '69 catalog: module component entries carry sha256 (no blobSha256) and still load');
+  eq(cat69.images.filter((e) => e.target === 'keyboard' && e.flashable === true).length, 24,
+    '69 catalog: 24 flashable keyboard images');
+  eq((await loadFirmwareCatalog()) === cat69, true,
+    '69 catalog: loader memoizes — second call returns the same instance');
+  eq(FIRMWARE_SOURCE_BASE,
+    'https://raw.githubusercontent.com/create-collective/create-legacy-firmware/main/firmware-history/',
+    '69 fetch: source base is the legacy firmware-history raw URL');
+
+  // (b) loader validation throws on doctored shapes
+  const throwsParse69 = (raw: unknown, name: string): void => {
+    let threw = false;
+    try { parseFirmwareCatalog(raw); } catch { threw = true; }
+    eq(threw, true, name);
+  };
+  throwsParse69(null, '69 validate: null throws');
+  throwsParse69({}, '69 validate: missing images throws');
+  throwsParse69({ generated: 'x', images: [] }, '69 validate: empty images array throws');
+  throwsParse69({ generated: 'x', images: [{ target: 'keyboard', blobSha256: 'a' }] },
+    '69 validate: entry without string file throws');
+  throwsParse69({ generated: 'x', images: [{ file: 'x.bin', blobSha256: 'a' }] },
+    '69 validate: entry without string target throws');
+  throwsParse69({ generated: 'x', images: [{ file: 'x.bin', target: 'keyboard' }] },
+    '69 validate: entry without blobSha256/sha256 throws');
+  let compOk69 = false;
+  try {
+    parseFirmwareCatalog({ generated: 'x', images: [{ file: 'Touch_UserApp.sfb', target: 'module', sha256: 'ab' }] });
+    compOk69 = true;
+  } catch { /* must not throw */ }
+  eq(compOk69, true, '69 validate: module component entry (sha256 only) accepted');
+
+  // (c) PID/side/gen table (family 0x064/06F/07A left, 0x0C8/0D3/0DE right;
+  //     gen B = pid & 0x1000; unknown → null)
+  eq(NAYA_VID, 0x37d1, '69 plat: NAYA_VID 0x37d1');
+  eq(JSON.stringify([...RECOVERY_PIDS]), JSON.stringify([0x06f, 0x16f, 0x0d3, 0x1d3]),
+    '69 plat: RECOVERY_PIDS [0x06f,0x16f,0x0d3,0x1d3]');
+  const pi69 = (pid: number): string => {
+    const r = pidInfo(pid);
+    return r === null ? 'null' : `${r.side}/${r.mode}/${r.generation}`;
+  };
+  eq(pi69(0x0064), 'left/app/A', '69 plat: 0x0064 left app A');
+  eq(pi69(0x00c8), 'right/app/A', '69 plat: 0x00C8 right app A');
+  eq(pi69(0x006f), 'left/mcuboot/A', '69 plat: 0x006F left mcuboot A');
+  eq(pi69(0x00d3), 'right/mcuboot/A', '69 plat: 0x00D3 right mcuboot A');
+  eq(pi69(0x007a), 'left/third/A', '69 plat: 0x007A left third A');
+  eq(pi69(0x00de), 'right/third/A', '69 plat: 0x00DE right third A');
+  eq(pi69(0x1064), 'left/app/B', '69 plat: 0x1064 left app B');
+  eq(pi69(0x106f), 'left/mcuboot/B', '69 plat: 0x106F left mcuboot B');
+  eq(pi69(0x10d3), 'right/mcuboot/B', '69 plat: 0x10D3 right mcuboot B');
+  // The brief's RECOVERY_PIDS list (0x16f/0x1d3) carries bit 0x100 — outside
+  // NayaCore's family table (OF recovery.py masks ONLY bit 0x1000; the gen-B
+  // recovery values there are 0x106f/0x10d3). pidInfo never guesses: unknown
+  // family → null, matching OF pid_info. The raw list is for re-enumeration
+  // matching (see task report note).
+  eq(pi69(0x16f), 'null', '69 plat: 0x16F is outside the NayaCore family table → null');
+  eq(pi69(0x1d3), 'null', '69 plat: 0x1D3 is outside the NayaCore family table → null');
+  eq(pi69(0x0009), 'null', '69 plat: 0x0009 unknown family → null');
+  eq(pi69(0x1000), 'null', '69 plat: bare gen-B bit, unknown family → null');
+
+  // keyboardVersions: flashable keyboard versions, newest releaseOrder first
+  const kv69 = keyboardVersions(cat69);
+  eq(kv69.length, 11, '69 versions: 11 flashable keyboard versions (betas + pre-history withheld)');
+  eq(kv69[0] !== undefined && kv69[0].label === '3.41.0' && kv69[0].declared
+    && kv69[0].releaseOrder === 23, true, '69 versions: first = 3.41.0 declared ro 23');
+  eq(kv69[0]?.bundle, 'NayaFlow 1.25.1', "69 versions: first bundle 'NayaFlow 1.25.1'");
+  eq(kv69.map((v) => v.label).join('|'),
+    '3.41.0|3.35.4|3.31.1|3.29.1|3.28.7|NayaFlow 1.14.3|NayaFlow 1.11.11'
+    + '|NayaFlow 1.11.8, 1.11.10|NayaFlow 1.11.0, 1.11.9|NayaFlow 1.3.8 to 1.6.10'
+    + '|NayaFlow 0.1.0 to 0.1.1',
+    '69 versions: exact newest-first order');
+  eq(kv69.filter((v) => v.declared).length, 5, '69 versions: 5 declared (createFirmware) versions');
+  eq(kv69[kv69.length - 1]?.declared, false, '69 versions: oldest (0.1.0 to 0.1.1) undeclared');
+
+  // (d) plan flags against the real catalog
+  const FWL341 = '3d3e544ece9d986a0e6cae41879cade1749272cb8fac39b6f8adc10edff111e0';
+  const FWR341 = 'a4c137eb4d8b55f3cd1282b1752b8eb45d00c1180189aee531a6e990a407acbf';
+  const FWL64_341 = 'afa7642bcf6cbc210917d275d4394f653dcb754dfd1e57f1cb4caa184992dba4';
+  const FWL335 = 'a126f4f6dd0f45bd0572e4f107a22bd4697850ef2b548d3ff76e662bbe91651c';
+  const FWL1143 = '099651b8b6950e243ced709f6edd38127413b3ea5f99f0bf483d77d6500bfe61';
+  const mkHalf69 = (side: 'left' | 'right', pid: number | null, fw: string | null) =>
+    ({ side, pid, fw });
+  const heldVault69 = newVault();
+  heldVault69.set(
+    { file: 'probe.bin', target: 'keyboard', type: 'app', side: 'left', generation: 'A',
+      flashable: true, blobSha256: FWL341 },
+    new Uint8Array([0x01]),
+  );
+  const pUpToDate69 = resolveKeyboardPlan(cat69, [mkHalf69('left', 0x0064, '3.41.0')], heldVault69, '3.41.0').halves[0]!;
+  eq(pUpToDate69.image?.blobSha256, FWL341, '69 plan: up-to-date left A 3.41.0 → fwl entry by digest');
+  eq(pUpToDate69.generation, 'A', '69 plan: pid 0x0064 → generation A');
+  eq(pUpToDate69.present, true, '69 plan: present when vault holds blobSha256');
+  eq(pUpToDate69.fetchable, true, '69 plan: fetchable when image carries historyPath');
+  eq(pUpToDate69.unchanged, true, '69 plan: unchanged when current == label');
+  eq(pUpToDate69.downgrade, false, '69 plan: same version is not a downgrade');
+  eq(pUpToDate69.unknownCurrent, false, '69 plan: 3.41.0 is a declared current');
+  eq(pUpToDate69.reason, undefined, '69 plan: no reason on the happy path');
+
+  const pRight69 = resolveKeyboardPlan(cat69, [mkHalf69('right', 0x00c8, '3.41.0')], newVault(), '3.41.0').halves[0]!;
+  eq(pRight69.image?.blobSha256, FWR341, '69 plan: right A resolves the fwr entry');
+  eq(pRight69.present, false, '69 plan: present false on empty vault');
+
+  const pDown69 = resolveKeyboardPlan(cat69, [mkHalf69('left', 0x0064, '3.41.0')], newVault(), '3.35.4').halves[0]!;
+  eq(pDown69.downgrade, true, '69 plan: 3.41.0 → 3.35.4 is a downgrade (dot-tuple)');
+  eq(pDown69.unchanged, false, '69 plan: downgrade is not unchanged');
+  eq(pDown69.image?.blobSha256, FWL335, '69 plan: target 3.35.4 image digest');
+  const pUp69 = resolveKeyboardPlan(cat69, [mkHalf69('left', 0x0064, '3.35.4')], newVault(), '3.41.0').halves[0]!;
+  eq(pUp69.downgrade, false, '69 plan: 3.35.4 → 3.41.0 is an upgrade');
+
+  const pRoDown69 = resolveKeyboardPlan(cat69, [mkHalf69('left', 0x0064, '3.41.0')], newVault(), 'NayaFlow 1.14.3').halves[0]!;
+  eq(pRoDown69.downgrade, true,
+    '69 plan: declared → undeclared downgrades by releaseOrder fallback (23 > 14)');
+  eq(pRoDown69.image?.blobSha256, FWL1143, '69 plan: undeclared target label still finds its image');
+  const pRoUp69 = resolveKeyboardPlan(cat69, [mkHalf69('left', 0x1064, 'NayaFlow 1.11.11')], newVault(), '3.41.0').halves[0]!;
+  eq(pRoUp69.unknownCurrent, true, '69 plan: NayaFlow 1.11.11 is not among createFirmware values');
+  eq(pRoUp69.downgrade, false, '69 plan: undeclared ro 13 → declared ro 23 is not a downgrade');
+  const pUnknown69 = resolveKeyboardPlan(cat69, [mkHalf69('left', 0x0064, '9.9.9')], newVault(), '3.35.4').halves[0]!;
+  eq(pUnknown69.unknownCurrent, true, "69 plan: unknown '9.9.9' flagged");
+  eq(pUnknown69.downgrade, false, "69 plan: unknown '9.9.9' has no releaseOrder → no downgrade claim");
+
+  const pNoImgB69 = resolveKeyboardPlan(cat69, [mkHalf69('left', 0x1064, '3.35.4')], newVault(), '3.35.4').halves[0]!;
+  eq(pNoImgB69.image === null && pNoImgB69.reason === 'no image for this half+generation', true,
+    '69 plan: gen B + 3.35.4 (A-era release) → no image for this half+generation');
+  const pNoPid69 = resolveKeyboardPlan(cat69, [mkHalf69('left', null, '3.41.0')], newVault(), '3.41.0').halves[0]!;
+  eq(pNoPid69.generation === null && pNoPid69.image === null
+    && pNoPid69.reason === 'no image for this half+generation' && pNoPid69.unchanged, true,
+    '69 plan: pid null → gen null, no image, unchanged still true');
+  const pBeta69 = resolveKeyboardPlan(cat69, [mkHalf69('left', 0x0064, null)], newVault(), '3.40.4').halves[0]!;
+  eq(pBeta69.image === null && pBeta69.fetchable === false
+    && (pBeta69.reason ?? '').startsWith('not flashable: beta-channel image'), true,
+    '69 plan: withheld beta target → not flashable reason, nothing fetchable');
+  eq(pBeta69.unknownCurrent, false, '69 plan: beta 3.40.4 is a declared createFirmware (recognised, withheld)');
+
+  const catSynth69: FwCatalog = {
+    generated: 'probe',
+    images: [{
+      file: 'kb_np.bin', target: 'keyboard', type: 'app', side: 'left', generation: 'A',
+      flashable: true, blobSha256: 'ab'.repeat(32), createFirmware: '1.0.0',
+    }],
+    releases: [],
+  };
+  const pNoPath69 = resolveKeyboardPlan(catSynth69, [mkHalf69('left', 0x0064, null)], newVault(), '1.0.0').halves[0]!;
+  eq(pNoPath69.image !== null && pNoPath69.fetchable === false && pNoPath69.present === false
+    && pNoPath69.reason === undefined, true,
+    '69 plan: flashable image without historyPath → image present, fetchable false, no reason');
+  const pBoth69 = resolveKeyboardPlan(
+    cat69,
+    [mkHalf69('left', 0x0064, '3.41.0'), mkHalf69('right', 0x00c8, '3.41.0')],
+    newVault(), '3.41.0',
+  ).halves;
+  eq(pBoth69[0]?.side === 'left' && pBoth69[1]?.side === 'right', true,
+    '69 plan: halves keep input order and side');
+  eq(pBoth69[0]?.image?.blobSha256 === FWL341 && pBoth69[1]?.image?.blobSha256 === FWR341, true,
+    '69 plan: per-half images resolve independently');
+
+  // (e) catalog-by-name hazard: kb_fwl.bin appears 14 times — resolution is
+  // by ENTRY (side+gen+label → hash-bearing row), never by file name
+  const hazA69 = findKeyboardImage(cat69, 'left', 'A', '3.41.0');
+  const hazB69 = findKeyboardImage(cat69, 'left', 'A', '3.35.4');
+  eq(hazA69?.file === 'kb_fwl.bin' && hazB69?.file === 'kb_fwl.bin', true,
+    "69 hazard: both 3.41.0 and 3.35.4 left-A entries share file 'kb_fwl.bin'");
+  eq(hazA69?.blobSha256, FWL341, '69 hazard: 3.41.0 lookup → 1.25.1 blob');
+  eq(hazB69?.blobSha256, FWL335, '69 hazard: 3.35.4 lookup → 1.21.0 blob');
+  eq(hazA69?.blobSha256 !== hazB69?.blobSha256, true,
+    '69 hazard: same file name, distinct entries — never name-keyed');
+  const hazGen69 = findKeyboardImage(cat69, 'left', 'B', '3.41.0');
+  eq(hazGen69?.file === 'kb_fwl_64.bin' && hazGen69?.blobSha256 === FWL64_341, true,
+    '69 hazard: gen B splits within one version (kb_fwl_64.bin)');
+  const hazRight69 = findKeyboardImage(cat69, 'right', 'A', '3.41.0');
+  eq(hazRight69?.file === 'kb_fwr.bin' && hazRight69?.blobSha256 === FWR341, true,
+    '69 hazard: right half resolves the fwr entry');
+  eq(findKeyboardImage(cat69, 'left', 'A', '3.99.9-nope'), null,
+    '69 hazard: unknown label → null');
+
+  // (f) fetch over an injectable fetchFn: sha256 gate, size cap, status,
+  // nothing-written guarantee
+  const emptySha69 = Array.from(
+    new Uint8Array(await crypto.subtle.digest('SHA-256', new Uint8Array(0))),
+  ).map((b) => b.toString(16).padStart(2, '0')).join('');
+  eq(emptySha69, 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855',
+    '69 fetch: node 22 globalThis.crypto.subtle pins the empty SHA-256 vector');
+  const bytes69 = Uint8Array.from([0xde, 0xad, 0xbe, 0xef, 0x00, 0x42]);
+  const digest69 = Array.from(
+    new Uint8Array(await crypto.subtle.digest('SHA-256', bytes69)),
+  ).map((b) => b.toString(16).padStart(2, '0')).join('');
+  const goodEntry69: FwEntry = {
+    file: 'kb_probe.bin', target: 'keyboard', type: 'app', side: 'left', generation: 'A',
+    flashable: true, blobSha256: digest69, historyPath: 'v9.9.9/kb_probe.bin',
+    createFirmware: '9.9.9',
+  };
+  const fakeOk69: typeof fetch = async () => new Response(bytes69);
+  const vaultOk69 = newVault();
+  let got69: Uint8Array | null = null;
+  let okFail69 = '';
+  try { got69 = await fetchImage(goodEntry69, { fetchFn: fakeOk69 }); } catch (e) { okFail69 = msg69(e); }
+  eq(okFail69 === '' && got69 !== null && toHex(got69) === toHex(bytes69), true,
+    '69 fetch: ok — bytes round-trip through the fake fetchFn');
+  vaultOk69.set(goodEntry69, got69 ?? new Uint8Array(0));
+  eq(vaultOk69.has(digest69) && vaultOk69.count() === 1, true,
+    '69 fetch: vault stores under blobSha256');
+  eq(toHex(vaultOk69.get(digest69) ?? new Uint8Array(0)), toHex(bytes69),
+    '69 fetch: vault.get returns the stored bytes');
+
+  const badEntry69: FwEntry = { ...goodEntry69, blobSha256: 'ff'.repeat(32) };
+  const vaultBad69 = newVault();
+  vaultBad69.set(goodEntry69, bytes69);
+  let badFail69 = '';
+  try { await fetchImage(badEntry69, { fetchFn: fakeOk69 }); } catch (e) { badFail69 = msg69(e); }
+  eq(badFail69.includes('nothing was written'), true,
+    '69 fetch: digest mismatch — message promises nothing was written');
+  eq(badFail69.includes('expected ff'), true, '69 fetch: mismatch message names the expected digest');
+  eq(vaultBad69.count() === 1 && toHex(vaultBad69.get(digest69) ?? new Uint8Array(0)) === toHex(bytes69),
+    true, '69 fetch: mismatch — vault untouched, original bytes intact');
+
+  const fakeBig69: typeof fetch = async () => new Response(new Uint8Array(9 * 1024 * 1024));
+  let bigFail69 = '';
+  try { await fetchImage(goodEntry69, { fetchFn: fakeBig69 }); } catch (e) { bigFail69 = msg69(e); }
+  eq(bigFail69.includes('8 MiB'), true, '69 fetch: 9 MiB body refused at the 8 MiB cap');
+  eq(vaultOk69.count() === 1, true, '69 fetch: oversized — vault untouched');
+
+  const fake404_69: typeof fetch = async () => new Response(null, { status: 404 });
+  let f404_69 = '';
+  try { await fetchImage(goodEntry69, { fetchFn: fake404_69 }); } catch (e) { f404_69 = msg69(e); }
+  eq(f404_69.includes('404'), true, '69 fetch: HTTP 404 surfaces in the reason');
+
+  let noHp69 = '';
+  try {
+    await fetchImage({ ...goodEntry69, historyPath: undefined }, { fetchFn: fakeOk69 });
+  } catch (e) { noHp69 = msg69(e); }
+  eq(noHp69.includes('no historyPath'), true, '69 fetch: entry without historyPath refuses');
+  let noSha69 = '';
+  try {
+    await fetchImage({ ...goodEntry69, blobSha256: undefined as unknown as string }, { fetchFn: fakeOk69 });
+  } catch (e) { noSha69 = msg69(e); }
+  eq(noSha69.includes('no blobSha256'), true, '69 fetch: entry without blobSha256 refuses');
+
+  const missEntry69: FwEntry = { ...goodEntry69, file: 'miss.bin', historyPath: 'v9.9.9/miss.bin' };
+  const noPathEntry69: FwEntry = { ...goodEntry69, file: 'nopath.bin', historyPath: undefined };
+  const catFetch69: FwCatalog = { generated: 'probe', images: [goodEntry69, missEntry69, noPathEntry69], releases: [] };
+  const fakeSplit69: typeof fetch = (input) =>
+    (String(input).endsWith('kb_probe.bin') ? new Response(bytes69) : new Response(null, { status: 404 }));
+  const vaultV69 = newVault();
+  const seen69: boolean[] = [];
+  const rV69 = await fetchVersion(catFetch69, '9.9.9', vaultV69, {
+    fetchFn: fakeSplit69,
+    onOne: (r) => { seen69.push(r.ok); },
+  });
+  eq(rV69.fetched, 1, '69 fetchVersion: one good entry fetched');
+  eq(rV69.failed.length === 1 && rV69.failed[0].path === 'v9.9.9/miss.bin', true,
+    '69 fetchVersion: 404 entry lands in failed with its path');
+  eq(rV69.failed[0]?.reason.includes('404'), true, '69 fetchVersion: failed reason carries the status');
+  eq(seen69.length === 2 && seen69[0] === true && seen69[1] === false, true,
+    '69 fetchVersion: onOne reports both outcomes in order');
+  eq(vaultV69.count(), 1, '69 fetchVersion: only the good bytes are stored');
+  eq(noPathEntry69.historyPath === undefined && rV69.fetched === 1, true,
+    '69 fetchVersion: historyPath-less entries under the label are skipped');
+
+  const vReal69 = newVault();
+  const fakeWrong69: typeof fetch = async () => new Response(bytes69);
+  const rReal69 = await fetchVersion(cat69, '3.41.0', vReal69, { fetchFn: fakeWrong69 });
+  eq(rReal69.fetched, 0, '69 fetchVersion real: fake bytes match no digest — 0 fetched');
+  eq(rReal69.failed.length, 4, '69 fetchVersion real: exactly 4 historyPath entries under 3.41.0');
+  eq(rReal69.failed.every((f) => f.reason.includes('nothing was written')), true,
+    '69 fetchVersion real: every attempt stopped at the sha256 gate');
+  eq(vReal69.count(), 0, '69 fetchVersion real: nothing written on total mismatch');
 })();
 
 void main();
