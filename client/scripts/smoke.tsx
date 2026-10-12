@@ -23,6 +23,8 @@ import {
 } from '../src/lib/firmware-fetch';
 import { NAYA_VID, RECOVERY_PIDS, pidInfo } from '../src/lib/firmware-plat';
 import { resolveKeyboardPlan } from '../src/lib/firmware-plan';
+import { checkFlashGate } from '../src/lib/firmware-interlocks';
+import type { KeyboardGateInput, ModuleGateInput } from '../src/lib/firmware-interlocks';
 import * as fs from 'fs';
 import * as path from 'path';
 import { keyIconName, shortLabel } from '../src/lib/key-icon-map';
@@ -5964,5 +5966,153 @@ void (async () => {
     '69 fetchVersion real: every attempt stopped at the sha256 gate');
   eq(vReal69.count(), 0, '69 fetchVersion real: nothing written on total mismatch');
 })();
+
+// §70 firmware interlock gate: the full refusal matrix — every rule alone
+// (everything else passing) refuses with EXACTLY its refusal string, the
+// all-pass inputs clear with [], boundary sizes pass (cap inclusive for the
+// keyboard, exact for the module bundle), allowOlder lifts the downgrade
+// refusal, consent lifts the unknown-current refusal, and forceType lifts
+// ONLY the module type-identification blocker — never the bay, undocked,
+// right-half, arm-token, or catalog-flashable rules. Violations collect
+// (brief order), so the run log can show everything wrong at once.
+{
+  const SHA70 = 'ab'.repeat(32); // keyboard entry blobSha256
+  const SHAM70 = 'cd'.repeat(32); // module bundle blobSha256
+  const SLOT0_70 = '11'.repeat(32); // device-reported slot-0 hash (arm token)
+  const eqArr70 = (a: string[], b: string[], name: string) =>
+    eq(JSON.stringify(a), JSON.stringify(b), name);
+
+  // hand-built minimal catalog rows — the gate is pure and must not load
+  // the vendored catalog to decide
+  const kbEntry70: FwEntry = {
+    file: 'kb_fwl.bin', target: 'keyboard', type: 'app', side: 'left', generation: 'A',
+    flashable: true, blobSha256: SHA70,
+  };
+  const modEntry70: FwEntry = {
+    file: 'Touch_UserApp.bin', target: 'module', type: 'littlefs', side: null, generation: null,
+    flashable: true, blobSha256: SHAM70,
+  };
+  const kbBase70: KeyboardGateInput = {
+    kind: 'keyboard', entry: kbEntry70, heldSha256: SHA70,
+    arm: SLOT0_70, slot0Hash: SLOT0_70,
+    pidSide: 'left', pidGeneration: 'A',
+    fileSize: 663_552,
+    downgrade: false, allowOlder: false, unknownCurrent: false, consented: false,
+    modulesDocked: false, uploadImageId: 2,
+  };
+  const modBase70: ModuleGateInput = {
+    kind: 'module', entry: modEntry70, heldSha256: SHAM70,
+    arm: SLOT0_70, slot0Hash: SLOT0_70,
+    fileSize: 1_048_576, bundleNewerThanKeyboard: false,
+    downgrade: false, allowOlder: false,
+    rightConnected: false, moduleDockedSide: 'left',
+    uploadImageId: 4, forceType: null,
+  };
+
+  // refusal copy — exactly what the gate and the procedures share
+  const R70 = {
+    sha: 'sha mismatch: held bytes are not this catalog image',
+    arm: 'arm token must equal the device-reported slot-0 hash from this run',
+    crossKb: 'type cross: littlefs is never a keyboard image',
+    crossMod: 'type cross: mcuboot is never a module image',
+    idKb: 'uploadImageId must be 2 for a keyboard',
+    idMod: 'uploadImageId must be 4 for a module',
+    kbSize: 'keyboard image exceeds the 663,552-byte slot cap',
+    modSize: 'module bundle must be exactly 1,048,576 bytes',
+    docked: 'modules are docked — undock them before flashing the keyboard',
+    downgrade: 'downgrade refused without allowOlder',
+    consent: 'current firmware is unknown — consent required before flashing',
+    sideGen: 'catalog entry side/generation does not match the half',
+    right: 'right half is connected — unplug it before flashing modules',
+    bay: 'module must be docked in the left bay',
+    bundle: 'bundle is newer than the keyboard firmware — update the keyboard first',
+  };
+
+  // all-pass inputs clear
+  eqArr70(checkFlashGate(kbBase70), [], '70 gate: all-pass keyboard input → []');
+  eqArr70(checkFlashGate(modBase70), [], '70 gate: all-pass module input → []');
+
+  // --- keyboard matrix: every rule alone, all else passing ------------------
+  eqArr70(checkFlashGate({ ...kbBase70, heldSha256: 'ff'.repeat(32) }), [R70.sha],
+    '70 gate kb: sha mismatch refuses');
+  eqArr70(checkFlashGate({ ...kbBase70, entry: { ...kbEntry70, flashable: false, withheldBecause: ['beta-channel image'] } }),
+    ['not flashable: beta-channel image'], '70 gate kb: !flashable joins withheldBecause');
+  eqArr70(checkFlashGate({ ...kbBase70, entry: { ...kbEntry70, flashable: false } }),
+    ['not flashable'], '70 gate kb: !flashable without reasons → bare copy');
+  eqArr70(checkFlashGate({ ...kbBase70, entry: { ...kbEntry70, type: 'littlefs' } }), [R70.crossKb],
+    '70 gate kb: littlefs never keyboard');
+  eqArr70(checkFlashGate({ ...kbBase70, arm: null }), [R70.arm],
+    '70 gate kb: arm null refuses');
+  eqArr70(checkFlashGate({ ...kbBase70, arm: '22'.repeat(32) }), [R70.arm],
+    '70 gate kb: stale/foreign arm refuses');
+  eqArr70(checkFlashGate({ ...kbBase70, slot0Hash: null }), [R70.arm],
+    '70 gate kb: slot0Hash null — arm can never match the device, refuses');
+  eqArr70(checkFlashGate({ ...kbBase70, uploadImageId: 4 }), [R70.idKb],
+    '70 gate kb: uploadImageId ≠ 2 refuses');
+  eq(checkFlashGate({ ...kbBase70, fileSize: 663_552 }).length, 0,
+    '70 gate kb: exactly 663,552 B passes (cap inclusive)');
+  eqArr70(checkFlashGate({ ...kbBase70, fileSize: 663_553 }), [R70.kbSize],
+    '70 gate kb: one byte over the slot cap refuses');
+  eqArr70(checkFlashGate({ ...kbBase70, modulesDocked: true }), [R70.docked],
+    '70 gate kb: modules docked refuses');
+  eqArr70(checkFlashGate({ ...kbBase70, downgrade: true }), [R70.downgrade],
+    '70 gate kb: downgrade without allowOlder refuses');
+  eqArr70(checkFlashGate({ ...kbBase70, downgrade: true, allowOlder: true }), [],
+    '70 gate kb: allowOlder lifts the downgrade refusal');
+  eqArr70(checkFlashGate({ ...kbBase70, unknownCurrent: true }), [R70.consent],
+    '70 gate kb: unknown current without consent refuses');
+  eqArr70(checkFlashGate({ ...kbBase70, unknownCurrent: true, consented: true }), [],
+    '70 gate kb: consent lifts the unknown-current refusal');
+  eqArr70(checkFlashGate({ ...kbBase70, entry: { ...kbEntry70, side: 'right' } }), [R70.sideGen],
+    '70 gate kb: entry side ≠ pid side refuses');
+  eqArr70(checkFlashGate({ ...kbBase70, entry: { ...kbEntry70, generation: 'B' } }), [R70.sideGen],
+    '70 gate kb: entry generation ≠ pid generation refuses');
+
+  // --- module matrix ----------------------------------------------------------
+  eqArr70(checkFlashGate({ ...modBase70, heldSha256: 'ee'.repeat(32) }), [R70.sha],
+    '70 gate mod: sha mismatch refuses');
+  eqArr70(checkFlashGate({ ...modBase70, entry: { ...modEntry70, flashable: false, withheldBecause: ['superseded bundle'] } }),
+    ['not flashable: superseded bundle'], '70 gate mod: !flashable joins withheldBecause');
+  eqArr70(checkFlashGate({ ...modBase70, entry: { ...modEntry70, type: 'mcuboot' } }), [R70.crossMod],
+    '70 gate mod: mcuboot never module');
+  eqArr70(checkFlashGate({ ...modBase70, arm: null }), [R70.arm],
+    '70 gate mod: arm null refuses');
+  eqArr70(checkFlashGate({ ...modBase70, uploadImageId: 2 }), [R70.idMod],
+    '70 gate mod: uploadImageId ≠ 4 refuses');
+  eq(checkFlashGate({ ...modBase70, fileSize: 1_048_576 }).length, 0,
+    '70 gate mod: exactly 1,048,576 B passes');
+  eqArr70(checkFlashGate({ ...modBase70, fileSize: 1_048_575 }), [R70.modSize],
+    '70 gate mod: one byte under 1 MiB refuses');
+  eqArr70(checkFlashGate({ ...modBase70, fileSize: 1_048_577 }), [R70.modSize],
+    '70 gate mod: one byte over 1 MiB refuses');
+  eqArr70(checkFlashGate({ ...modBase70, rightConnected: true }), [R70.right],
+    '70 gate mod: right half connected refuses');
+  eqArr70(checkFlashGate({ ...modBase70, moduleDockedSide: 'right' }), [R70.bay],
+    '70 gate mod: module docked in the right bay refuses');
+  eqArr70(checkFlashGate({ ...modBase70, moduleDockedSide: null }), [R70.bay],
+    '70 gate mod: module not docked (side null) refuses');
+  eqArr70(checkFlashGate({ ...modBase70, downgrade: true }), [R70.downgrade],
+    '70 gate mod: downgrade without allowOlder refuses');
+  eqArr70(checkFlashGate({ ...modBase70, bundleNewerThanKeyboard: true }), [R70.bundle],
+    '70 gate mod: bundle newer than keyboard refuses');
+
+  // --- forceType: lifts ONLY the module type-identification blocker -----------
+  eqArr70(checkFlashGate({ ...modBase70, entry: { ...modEntry70, type: 'mcuboot' }, forceType: 'Tune' }), [],
+    '70 gate force: forceType lifts the module type-cross refusal');
+  eqArr70(checkFlashGate({ ...modBase70, moduleDockedSide: 'right', forceType: 'Tune' }), [R70.bay],
+    '70 gate force: forceType never lifts the bay rule');
+  eqArr70(checkFlashGate({ ...modBase70, moduleDockedSide: null, forceType: 'Tune' }), [R70.bay],
+    '70 gate force: forceType never lifts the undocked rule');
+  eqArr70(checkFlashGate({ ...modBase70, rightConnected: true, forceType: 'Tune' }), [R70.right],
+    '70 gate force: forceType never lifts the right-half rule');
+  eqArr70(checkFlashGate({ ...modBase70, entry: { ...modEntry70, flashable: false, withheldBecause: ['x'] }, forceType: 'Tune' }),
+    ['not flashable: x'], '70 gate force: forceType never lifts the catalog flashable rule');
+  eqArr70(checkFlashGate({ ...modBase70, arm: null, forceType: 'Tune' }), [R70.arm],
+    '70 gate force: forceType never lifts the arm-token rule');
+
+  // violations collect — two broken rules return both strings, brief order
+  eqArr70(checkFlashGate({ ...kbBase70, heldSha256: 'ff'.repeat(32), modulesDocked: true }),
+    [R70.sha, R70.docked], '70 gate: multiple violations collect in order');
+}
 
 void main();
