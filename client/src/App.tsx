@@ -4,7 +4,7 @@
 //
 // Composition root: all state lives in hooks (useSessions / useLayers /
 // useDraft / …), all views in components. This file only wires them.
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Toaster, toast } from "sonner";
 import Header from "./components/Header";
 import type { AppTab } from "./components/AppTabs";
@@ -15,6 +15,7 @@ import ModulesTab from "./components/tabs/ModulesTab";
 import BehaviorTab from "./components/tabs/BehaviorTab";
 import DevicesTab from "./components/tabs/DevicesTab";
 import TroubleshootingTab from "./components/tabs/TroubleshootingTab";
+import FirmwareTab from "./components/tabs/FirmwareTab";
 import ColorDialog from "./components/ColorDialog";
 import LogPanel from "./components/LogPanel";
 import DeviceSheet from "./components/DeviceSheet";
@@ -32,6 +33,10 @@ import { useBleSlots } from "./hooks/useBleSlots";
 import { useSelection } from "./hooks/useSelection";
 import { useDraft } from "./hooks/useDraft";
 import { useFlash } from "./hooks/useFlash";
+import { useFirmwareFlash, firmwareVault } from "./hooks/useFirmwareFlash";
+import { defaultSerialWorld } from "./lib/serial-world";
+import type { PortWithInfo } from "./lib/serial-world";
+import { NAYA_VID } from "./lib/firmware-plat";
 import { useCustomColors } from "./hooks/useCustomColors";
 import { useModuleProfiles } from "./hooks/useModuleProfiles";
 import { useKbFit } from "./hooks/useKbFit";
@@ -56,6 +61,13 @@ import {
 import type { BleIdentityRead, KeyRec, LedRec, Side } from '@create-reflow/sdk';
 import { timeoutsMs } from '@create-reflow/sdk';
 import type { EditorView } from "./components/ViewLayerTabs";
+
+// Firmware flashing seam (Phase 9): one SerialWorld + the shared in-memory
+// blob vault, instantiated once for the app. The world resolves navigator
+// serial at call time (node-safe by construction); the vault lives for the
+// browser session only — images re-fetch per session, nothing persists.
+const fwWorld = defaultSerialWorld();
+const fwVault = firmwareVault();
 
 export default function App() {
   const errMessage = (e: unknown) =>
@@ -229,6 +241,43 @@ export default function App() {
     log,
   });
   const { customColors, saveCustomColors } = useCustomColors();
+  // Firmware run hook (Phase 9, App-level per the wiring-only rule) — closes
+  // the T7 review debt: rescan hands the ports back at run end; grantPort is
+  // a parked-promise bridge (the core's grantPort() call resolves only when
+  // the dialog's button click supplies the user gesture WebSerial's
+  // requestPort() requires; the picked port flows back through the
+  // deferred). world/vault ride the module-level instances above.
+  const [fwGrantOpen, setFwGrantOpen] = useState(false);
+  const fwGrantSettle = useRef<{
+    resolve: (p: PortWithInfo) => void;
+    reject: (e: unknown) => void;
+  } | null>(null);
+  const fwGrant = useCallback((): Promise<PortWithInfo> => {
+    return new Promise<PortWithInfo>((resolve, reject) => {
+      fwGrantSettle.current = { resolve, reject };
+      setFwGrantOpen(true);
+    });
+  }, []);
+  const fwGrantPick = useCallback(async (): Promise<void> => {
+    const settle = fwGrantSettle.current;
+    if (settle === null) return;
+    try {
+      const p = await fwWorld.requestPort([{ usbVendorId: NAYA_VID }]);
+      settle.resolve(p);
+    } catch (e) {
+      settle.reject(e); // picker cancelled — the procedure reads it as such
+    } finally {
+      fwGrantSettle.current = null;
+      setFwGrantOpen(false);
+    }
+  }, []);
+  const firmware = useFirmwareFlash({
+    sesRef,
+    busyRef,
+    world: fwWorld,
+    rescan: sessions.rescan,
+    grantPort: fwGrant,
+  });
   // 'off' when the Bindings tab is hidden: the keyboard card unmounts on tab
   // switch, and useKbFit must re-attach its observer when it comes back.
   const { kbBoxRef, kbStageRef, kbScale } = useKbFit(
@@ -905,6 +954,16 @@ export default function App() {
               sesRef={sesRef}
               ble={ble}
               onDeviceInfo={() => setSheetOpen(true)}
+            />
+          )}
+
+          {tab === "firmware" && (
+            <FirmwareTab
+              flash={firmware}
+              halves={halves}
+              world={fwWorld}
+              vault={fwVault}
+              grant={{ open: fwGrantOpen, onGrant: fwGrantPick }}
             />
           )}
 

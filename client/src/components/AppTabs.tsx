@@ -12,6 +12,7 @@ export type AppTab =
   | "modules"
   | "behavior"
   | "devices"
+  | "firmware"
   | "trouble";
 
 const TABS: { id: AppTab; label: string }[] = [
@@ -20,6 +21,7 @@ const TABS: { id: AppTab; label: string }[] = [
   { id: "modules", label: "Modules" },
   { id: "behavior", label: "Behavior" },
   { id: "devices", label: "Devices" },
+  { id: "firmware", label: "Firmware" },
   { id: "trouble", label: "Troubleshooting" },
 ];
 

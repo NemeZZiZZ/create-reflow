@@ -107,6 +107,11 @@ export interface FlashDeps {
    * cleared — the sweep re-lists the granted ports and reconnects the
    * unclaimed app-mode halves. Absent (raw smoke runs) → no handover sweep. */
   rescan?: () => Promise<void>;
+  /* UI-only mirror hook: called synchronously when a procedure's run log
+   * opens (before the first await), so the mirror can subscribe to the live
+   * event stream while the run is in flight. The core never needs it; the
+   * smoke drives the core directly and leaves it unset. */
+  onBegin?: (log: FirmwareRunLog) => void;
 }
 
 /* ---- React-free lifecycle core ------------------------------------------ */
@@ -812,6 +817,7 @@ export async function startKeyboardRun(
   const T = { ...FLASH_TIMEOUT_DEFAULTS, ...deps.timeouts };
   const log = beginFirmwareRun(deps, 'keyboard');
   if (log === null) return null;
+  deps.onBegin?.(log);
 
   const failures: string[] = [];
   const advisories: string[] = [];
@@ -1662,7 +1668,23 @@ export function useFirmwareFlash(deps: FlashDeps): {
   const startKeyboard = useCallback(
     async (opts: StartKeyboardOpts): Promise<void> => {
       setStatus('running');
-      const l = await startKeyboardRun(deps, opts);
+      /* The mirror subscribes through onBegin (the log opens synchronously
+       * inside startKeyboardRun, before its first await) so the UI timeline
+       * streams live — the same subscription beginRun makes; the final
+       * setLog/setEvents below re-syncs to the finished log. */
+      const l = await startKeyboardRun(
+        {
+          ...deps,
+          onBegin: (run) => {
+            setLog(run);
+            setEvents([...run.events]);
+            run.subscribe(() => {
+              setEvents([...run.events]);
+            });
+          },
+        },
+        opts,
+      );
       if (l === null) {
         setStatus('idle'); // refused — a run is already active
         return;
