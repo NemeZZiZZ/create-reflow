@@ -17,7 +17,13 @@
  * and NO blobSha256 — a literal reading would reject the vendored file that
  * §69(a) requires to load. The check is therefore: string file/target on
  * every entry, and a string blobSha256 ?? sha256 (every entry is
- * hash-identified either way). */
+ * hash-identified either way). Sha256-only rows are NORMALIZED here —
+ * blobSha256 is filled with the sha256 value — so downstream readers
+ * (libraryGroups' `.slice`, vault keys) can rely on a string. The conflation
+ * is contained: those rows carry no historyPath, so they never enter the
+ * vault, the fetch path, or the interlock gate (all keyed off flashable /
+ * historyPath-bearing entries).
+ */
 
 export interface FwEntry {
   file: string;
@@ -84,6 +90,7 @@ export function parseFirmwareCatalog(raw: unknown): FwCatalog {
     const sha = typeof e.blobSha256 === 'string' ? e.blobSha256 : e.sha256;
     if (typeof sha !== 'string')
       throw new Error(`firmware-catalog: entry without blobSha256/sha256 (${e.file})`);
+    if (typeof e.blobSha256 !== 'string') e.blobSha256 = sha;
   }
   return c;
 }

@@ -5683,8 +5683,8 @@ void (async () => {
   eq(cat69.images.length, 69, '69 catalog: 69 images');
   eq(cat69.releases.length, 25, '69 catalog: 25 releases');
   const comp69 = cat69.images.find((e) => e.file === 'Touch_UserApp.sfb');
-  eq(comp69 !== undefined && typeof comp69.sha256 === 'string' && typeof comp69.blobSha256 !== 'string',
-    true, '69 catalog: module component entries carry sha256 (no blobSha256) and still load');
+  eq(comp69 !== undefined && typeof comp69.sha256 === 'string' && comp69.blobSha256 === comp69.sha256,
+    true, '69 catalog: sha256-only module component entry loads normalized (blobSha256 filled)');
   eq(cat69.images.filter((e) => e.target === 'keyboard' && e.flashable === true).length, 24,
     '69 catalog: 24 flashable keyboard images');
   eq((await loadFirmwareCatalog()) === cat69, true,
@@ -5714,6 +5714,13 @@ void (async () => {
     compOk69 = true;
   } catch { /* must not throw */ }
   eq(compOk69, true, '69 validate: module component entry (sha256 only) accepted');
+  {
+    const norm69 = parseFirmwareCatalog({ generated: 'x', images: [{ file: 'Touch_UserApp.sfb', target: 'module', sha256: 'ab' }] });
+    eq((norm69.images[0] as unknown as { blobSha256: unknown }).blobSha256, 'ab',
+      '69 validate: sha256-only entry normalized — blobSha256 filled for downstream readers');
+  }
+  eq(cat69.images.every((e) => typeof e.blobSha256 === 'string'), true,
+    '69 validate: every vendored entry carries string blobSha256 post-parse (libraryGroups .slice precondition)');
 
   // (c) PID/side/gen table (family 0x064/06F/07A left, 0x0C8/0D3/0DE right;
   //     gen B = pid & 0x1000; unknown → null)
