@@ -52,12 +52,14 @@ export interface KeyboardFlash {
   exportLog: () => void;
 }
 
-/* HalfSnapshot.fw ('v3.41.0.0') → the catalog label that matches it
- * ('3.41.0'). Device strings carry one more all-zero component than the
- * catalog labels, so exact string equality never matches: align by
- * trailing-zero-insensitive tuple compare against the catalog's declared
- * keyboard labels; no hit → the raw string back (the plan reads it as
- * unknown-current — which it honestly is). '—'/unparseable → null. */
+/* HalfSnapshot.fw ('v0.3.41.0') → the catalog label that matches it
+ * ('3.41.0'). Device strings are Naya's 0.MAJOR.MINOR.PATCH form — one
+ * LEADING zero component ahead of the catalog labels — so exact string
+ * equality never matches: align by leading-zero-stripped, trailing-zero-
+ * insensitive tuple compare against the catalog's declared keyboard labels;
+ * no hit → the raw string back (the plan reads it as unknown-current —
+ * which it honestly is). '—'/unparseable → null. Live-verified 2026-10-13:
+ * stock halves report 'v0.3.41.0' for catalog '3.41.0'. */
 function fwLabelOf(fw: string, declared: string[]): string | null {
   const t = (fw.split('  [')[0] ?? '').trim();
   if (t === '' || t === '—') return null;
@@ -66,6 +68,7 @@ function fwLabelOf(fw: string, declared: string[]): string | null {
     /^\d+(\.\d+)*$/.test(s) ? s.split('.').map((p) => Number.parseInt(p, 10)) : null;
   const cur = tuple(raw);
   if (cur === null) return null;
+  while (cur.length > 1 && cur[0] === 0) cur.shift();
   for (const d of declared) {
     const dt = tuple(d);
     if (dt === null) continue;
