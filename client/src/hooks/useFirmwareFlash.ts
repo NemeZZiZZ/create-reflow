@@ -528,6 +528,8 @@ export interface FlashTimeouts {
   modFindMs?: number; // module.verify: module fw+type confirm window (90 s)
   reBootResetMs?: number; // boot reset re-send cadence while a bootloader port shows (60 s)
   fwupMs?: number; // MOD_FWUP write-and-forget bounded wait (2 s)
+  /* ---- upload (SDK stall guard) ---- */
+  uploadTotalMs?: number; // whole-upload wall-clock bound — a non-advancing `off` throws (600 s)
 }
 
 /* Spec defaults — the ONLY sleeps the procedure does; smoke injects
@@ -549,6 +551,7 @@ export const FLASH_TIMEOUT_DEFAULTS = {
   modFindMs: 90_000,
   reBootResetMs: 60_000,
   fwupMs: 2_000,
+  uploadTotalMs: 600_000,
 } as const;
 
 export interface StartKeyboardTarget {
@@ -1315,15 +1318,18 @@ export async function startKeyboardRun(
       /* Steps 6-7: upload. slot.erase starts with the first chunk (the
        * erase IS that chunk's stall) and turns ok when the bootloader
        * accepts it; progress lands at 5% steps. The device-reported offset
-       * is authoritative (SDK upload loop). The upload sha is the hash the
-       * device reports for a RUNNING image (plaintextSha256; the blob
-       * digest is the file's, and only gates the held bytes). */
-      const shaHex = (entry.plaintextSha256 ?? entry.blobSha256).toLowerCase();
+       * is authoritative (SDK upload loop). Two hashes, never swapped:
+       * the WIRE sha (the first chunk's sha field) is computed inside the
+       * SDK as the digest of the uploaded bytes themselves; verify-sha
+       * below is what the device reports for the DECRYPTED running image
+       * (plaintextSha256) — swap.verify compares the post-swap slot-0
+       * readback against IT. */
+      const shaHex = (entry.plaintextSha256 ?? '').toLowerCase();
       const shaBytes = hexToBytes(shaHex);
       if (shaBytes === null) {
         await link.close();
         dumpConsole(side, probeConsole, liveConsole);
-        return abort('upload', side, 'catalog hash is not valid hex');
+        return abort('upload', side, 'the catalog carries no verifiable plaintext hash for this image');
       }
       log.start('slot.erase', side);
       log.start('upload', side);
@@ -1331,8 +1337,9 @@ export async function startKeyboardRun(
       let lastPct = -1;
       try {
         await device.uploadImage(
-          { bytes, sha256: shaBytes, imageId },
+          { bytes, verifySha256: shaBytes, imageId },
           {
+            maxTotalMs: T.uploadTotalMs,
             onProgress: (p) => {
               const pct = Math.floor((p.sent / p.total) * 100);
               if (pct >= lastPct + 5 || p.sent >= p.total) {
@@ -2120,8 +2127,13 @@ export async function startModuleRun(
       /* Upload. The erase IS the first chunk's stall (slot.erase turns ok
        * on its ack); progress lands at 5% steps. NO reset after the last
        * chunk — the half self-restarts ~1 s later, and a reset here would
-       * go into a closing port (§75(b) asserts zero post-upload resets). */
-      const shaBytes = hexToBytes((entry.plaintextSha256 ?? entry.blobSha256).toLowerCase());
+       * go into a closing port (§75(b) asserts zero post-upload resets).
+       * The wire sha (first chunk) is the SDK-computed digest of the
+       * uploaded bundle bytes; a littlefs bundle carries no plaintext
+       * hash, so the verify target rides along as the entry's own blob
+       * digest (bundle.verify checks the stored VERSION, not a readback
+       * hash). */
+      const shaBytes = hexToBytes(entry.blobSha256.toLowerCase());
       if (shaBytes === null) {
         await link.close();
         return abort('upload', 'catalog hash is not valid hex');
@@ -2132,8 +2144,9 @@ export async function startModuleRun(
       let lastPct = -1;
       try {
         await device.uploadImage(
-          { bytes, sha256: shaBytes, imageId },
+          { bytes, verifySha256: shaBytes, imageId },
           {
+            maxTotalMs: T.uploadTotalMs,
             onProgress: (p) => {
               const pct = Math.floor((p.sent / p.total) * 100);
               if (pct >= lastPct + 5 || p.sent >= p.total) {

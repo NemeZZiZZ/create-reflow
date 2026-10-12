@@ -626,6 +626,7 @@ export const SMP_DEFAULT_TIMEOUTS = {
   chunkMs: 20_000, // per-chunk after the first
   eraseMs: 90_000, // offset-0 chunk: full secondary-slot erase (measured 6-19 s stalls)
   transceiveMs: 5_000, // everything that is not an upload chunk
+  uploadTotalMs: 600_000, // whole-upload wall-clock bound (non-advancing `off` stall guard)
 } as const;
 
 // One entry of the image-state reply: { images: [ { slot, hash, flags… } ] }.
@@ -638,12 +639,6 @@ export interface ImageSlot {
   confirmed: boolean;
   active: boolean;
 }
-
-const u8Eq = (a: Uint8Array, b: Uint8Array): boolean => {
-  if (a.length !== b.length) return false;
-  for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
-  return true;
-};
 
 // A failed SMP op replies {"rc": N}; success bodies carry rc: 0 or omit it.
 function replyRc(m: { [key: string]: CborValue }): number | undefined {
@@ -662,11 +657,23 @@ function replyMap(payload: Uint8Array, what: string): { [key: string]: CborValue
   return value as { [key: string]: CborValue };
 }
 
+// sha256 over WebCrypto — globalThis.crypto.subtle exists in every browser
+// and in node 19+ (the SDK stays DOM-free). Computes the UPLOAD sha: the
+// digest of the bytes actually on the wire.
+async function sha256Digest(bytes: Uint8Array): Promise<Uint8Array> {
+  const subtle = globalThis.crypto?.subtle;
+  if (!subtle)
+    throw new Error('smp upload: WebCrypto (crypto.subtle) unavailable for the upload sha');
+  // slice(): a fresh ArrayBuffer-backed copy — accepts subarray views too
+  // and satisfies BufferSource under TS's Uint8Array<ArrayBufferLike> split.
+  return new Uint8Array(await subtle.digest('SHA-256', bytes.slice()));
+}
+
 const UPLOAD_CHUNK = 0x200; // 512 — min(remaining, 0x200), fixed (spec §1)
 
 export class SmpDevice {
   private link: SmpLink;
-  private timeouts: { chunkMs: number; eraseMs: number; transceiveMs: number };
+  private timeouts: { chunkMs: number; eraseMs: number; transceiveMs: number; uploadTotalMs: number };
 
   constructor(link: SmpLink, timeouts?: Partial<typeof SMP_DEFAULT_TIMEOUTS>) {
     this.link = link;
@@ -762,30 +769,48 @@ export class SmpDevice {
   // data}; later {image, off, data}. The device reply's off is THE resume
   // point (its ack is authoritative, never our own counter). The offset-0
   // chunk runs on the erase-class timeout, the rest on the chunk timeout.
-  // After the last chunk: re-read image state — slot 1 must carry the
-  // uploaded sha, unless the swap already happened (slot 0 == sha AND
-  // slot 1 == the pre-upload slot-0 hash captured before the first chunk).
+  //
+  // Two hashes, two jobs — never interchanged:
+  //   - upload sha (the first-chunk `sha` field) is computed HERE, as the
+  //     digest of `bytes` — the bytes actually on the wire. For an
+  //     encrypted keyboard image that is the BLOB digest, not the
+  //     plaintext one (spec §1 / OF firmware_upload parity).
+  //   - `req.verifySha256` is never sent: it is the digest the device
+  //     reports for the DECRYPTED image (the catalog's plaintextSha256),
+  //     i.e. what a post-swap readback must equal. The CALLING procedure
+  //     compares against it (keyboard swap.verify; the module flow
+  //     verifies by the stored bundle version instead) — this method has
+  //     no readback of its own to check it against.
+  //
+  // Pure upload: resolves when the last chunk is ACCEPTED — there is no
+  // internal post-upload image-state read. A real bootloader goes silent
+  // for ~100 s while the trailer-armed swap runs (OF SETTLED_TIMEOUT
+  // 300 s, 2 s re-poll), a settle window only the procedure can own.
+  // A device that keeps replying without advancing `off` is bounded by
+  // maxTotalMs (default this.timeouts.uploadTotalMs): past the deadline
+  // the loop throws instead of spinning forever.
   async uploadImage(
-    req: { bytes: Uint8Array; sha256: Uint8Array; imageId: number },
-    cb?: {
+    req: { bytes: Uint8Array; verifySha256: Uint8Array; imageId: number },
+    opts?: {
       onProgress?(p: { sent: number; total: number }): void;
       onFirstChunkAck?(): void;
       shouldContinue?(): boolean;
+      maxTotalMs?: number; // whole-upload wall-clock bound (stall guard)
     },
   ): Promise<void> {
     const total = req.bytes.length;
-    // Pre-upload capture for the swap-already-happened acceptance below —
-    // the same imageState read the final verify uses.
-    const pre = await this.imageState();
-    const preSlot0 = pre.find((s) => s.slot === 0)?.hash ?? null;
+    const uploadSha = await sha256Digest(req.bytes);
+    const maxTotalMs = opts?.maxTotalMs ?? this.timeouts.uploadTotalMs;
+    const deadline = Date.now() + maxTotalMs;
     let sent = 0;
     let firstAcked = false;
     for (;;) {
-      if (cb?.shouldContinue && !cb.shouldContinue()) throw new Error('aborted');
+      if (opts?.shouldContinue && !opts.shouldContinue()) throw new Error('aborted');
+      if (Date.now() > deadline) throw new Error(`smp upload stalled at off ${sent}`);
       const off = sent;
       const len = Math.min(total - off, UPLOAD_CHUNK);
       const body: CborValue = off === 0
-        ? { image: req.imageId, off: 0, len: total, sha: req.sha256, data: req.bytes.subarray(0, len) }
+        ? { image: req.imageId, off: 0, len: total, sha: uploadSha, data: req.bytes.subarray(0, len) }
         : { image: req.imageId, off, data: req.bytes.subarray(off, off + len) };
       const rsp = await this.link.transceive(
         SMP.OP_WRITE, SMP.GROUP_IMAGE, SMP.ID_IMAGE_UPLOAD, cborEncode(body),
@@ -799,25 +824,11 @@ export class SmpDevice {
       sent = m.off; // device authority — never trust the local counter
       if (!firstAcked) {
         firstAcked = true;
-        cb?.onFirstChunkAck?.();
+        opts?.onFirstChunkAck?.();
       }
-      cb?.onProgress?.({ sent, total });
+      opts?.onProgress?.({ sent, total });
       if (sent >= total) break;
     }
-    // Post-upload read-back (firmware_upload.py:859-890): primary rule is
-    // slot-1 == uploaded sha; the swap-already-happened shape (new hash in
-    // slot 0, armed image moved to slot 1) is accepted against the captured
-    // pre-upload slot-0 hash.
-    const post = await this.imageState();
-    const s0 = post.find((s) => s.slot === 0);
-    const s1 = post.find((s) => s.slot === 1);
-    if (s1 && u8Eq(s1.hash, req.sha256)) return;
-    if (
-      preSlot0 !== null && s0 && s1 &&
-      u8Eq(s0.hash, req.sha256) && u8Eq(s1.hash, preSlot0)
-    )
-      return;
-    throw new Error('smp upload verify: slot-1 hash != uploaded sha after upload');
   }
 }
 

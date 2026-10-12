@@ -5127,13 +5127,16 @@ void (async () => {
 
 // §68 smp device ops (SDK layer): echo / imageState / slot-info / setPending /
 // osReset on stateful scripted devices, the upload loop (chunk 512, first
-// chunk carries len+sha, later chunk neither, device-off authoritative,
-// rc-abort, erase-vs-chunk timeout classes, shouldContinue), the
-// resolveUploadImageId numbering matrix, and the enterMcuboot() wire pin —
-// exactly ONE ee/10ae frame, a bounded ~1500 ms wait resolving on any reply
-// or none (never the roundtrip retry ladder). §68-wide tripwire: no fixture
-// write log carries c0=0x10 c1=0xBE — RESET_DFU (ee/10be) is a different,
-// never-sent op.
+// chunk carries len+sha — the sha COMPUTED IN THE SDK as the digest of the
+// uploaded bytes; the caller's verifySha256 never rides the wire —, later
+// chunk neither, device-off authoritative, rc-abort, erase-vs-chunk timeout
+// classes, shouldContinue, the maxTotalMs stall guard, NO image-state read
+// of its own around the chunks — the settle window belongs to the
+// procedure), the resolveUploadImageId numbering matrix, and the
+// enterMcuboot() wire pin — exactly ONE ee/10ae frame, a bounded ~1500 ms
+// wait resolving on any reply or none (never the roundtrip retry ladder).
+// §68-wide tripwire: no fixture write log carries c0=0x10 c1=0xBE —
+// RESET_DFU (ee/10be) is a different, never-sent op.
 void (async () => {
   const smpLines68: string[] = []; // every TX line across the §68 SMP fixtures
   const nayaWrites68: Uint8Array[] = []; // every §68 Naya write (enterMcuboot)
@@ -5293,16 +5296,20 @@ void (async () => {
     });
     const link68c = await dev68c.open();
     await new SmpDevice(link68c).uploadImage(
-      { bytes: bytes68c, sha256: sha68c, imageId: 2 },
+      { bytes: bytes68c, verifySha256: sha68c, imageId: 2 },
       {
         onProgress: (p) => progress68c.push(p),
         onFirstChunkAck: () => { firstAck68c++; },
         shouldContinue: () => true,
       },
     );
-    eq(reqs68c.length, 4, '68 upload: pre-read + 2 chunks + verify read = 4 requests');
-    eq(reqs68c[0]!.op === SMP.OP_READ && reqs68c[0]!.cmdId === SMP.ID_IMAGE_STATE, true,
-      '68 upload: pre-read is an image-state READ');
+    eq(reqs68c.length, 2, '68 upload: pure upload — exactly the 2 chunk writes, nothing else');
+    eq(
+      reqs68c.every((r) => !(r.op === SMP.OP_READ && r.group === SMP.GROUP_IMAGE &&
+        r.cmdId === SMP.ID_IMAGE_STATE)),
+      true,
+      '68 upload: the SDK does NO image-state read of its own (the settle window belongs to the procedure)',
+    );
     eq(uploads68c.length, 2, '68 upload: exactly 2 chunk writes');
     eq(uploads68c[0]!.op === SMP.OP_WRITE && uploads68c[0]!.cmdId === SMP.ID_IMAGE_UPLOAD, true,
       '68 upload: chunks are WRITE img/1');
@@ -5312,7 +5319,11 @@ void (async () => {
     eq(first68.image, 2, '68 upload: first chunk image id 2');
     eq(first68.off, 0, '68 upload: first chunk off 0');
     eq(first68.len, 700, '68 upload: first chunk carries len = total');
-    eq(toHex(first68.sha), toHex(sha68c), '68 upload: first chunk carries sha');
+    const wireSha68c = new Uint8Array(await crypto.subtle.digest('SHA-256', bytes68c));
+    eq(toHex(first68.sha), toHex(wireSha68c),
+      '68 upload: first chunk sha = sha256 of the UPLOADED BYTES (computed in the SDK)');
+    eq(toHex(first68.sha) === toHex(sha68c), false,
+      '68 upload: the caller verify-sha never rides the wire (upload-sha ≠ verify-sha)');
     eq(first68.data.length, 512, '68 upload: first chunk data 512B (chunk cap 0x200)');
     eq(toHex(first68.data), toHex(bytes68c.subarray(0, 512)), '68 upload: first chunk data bytes');
     const later68 = cborDecode(uploads68c[1]!.payload).value as {
@@ -5355,7 +5366,7 @@ void (async () => {
     });
     const link68d = await dev68d.open();
     await new SmpDevice(link68d).uploadImage(
-      { bytes: bytes68d, sha256: sha68d, imageId: 2 },
+      { bytes: bytes68d, verifySha256: sha68d, imageId: 2 },
       { onProgress: (p) => progress68d.push(p) },
     );
     eq(chunks68d.length, 3, '68 offset-authoritative: 3 chunks for 1026B after the +1 lie');
@@ -5390,11 +5401,11 @@ void (async () => {
     const link68e = await dev68e.open();
     let err68e = '';
     try {
-      await new SmpDevice(link68e).uploadImage({ bytes: bytes68e, sha256: sha68e, imageId: 2 });
+      await new SmpDevice(link68e).uploadImage({ bytes: bytes68e, verifySha256: sha68e, imageId: 2 });
     } catch (e) { err68e = (e as Error).message; }
     eq(err68e.includes('rc 3'), true, '68 rc-abort: throw carries the device rc');
-    eq(JSON.stringify(seen68e), JSON.stringify(['state', 'chunk']),
-      '68 rc-abort: nothing written after the rc=3 reply');
+    eq(JSON.stringify(seen68e), JSON.stringify(['chunk']),
+      '68 rc-abort: nothing written after the rc=3 reply (no reads either — pure upload)');
     await link68e.close();
   }
 
@@ -5421,7 +5432,7 @@ void (async () => {
     const link68f = await dev68f.open();
     const t68f = Date.now();
     await new SmpDevice(link68f, { chunkMs: 30, eraseMs: 3000 })
-      .uploadImage({ bytes: bytes68f, sha256: sha68f, imageId: 2 });
+      .uploadImage({ bytes: bytes68f, verifySha256: sha68f, imageId: 2 });
     const elapsed68f = Date.now() - t68f;
     eq(elapsed68f >= 80, true, '68 erase-class: offset-0 reply really waited past chunkMs (30)');
     eq(elapsed68f < 3000, true, '68 erase-class: upload accepted within eraseMs (resolved, not timed out)');
@@ -5450,7 +5461,7 @@ void (async () => {
     let err68k = '';
     try {
       await new SmpDevice(link68k).uploadImage(
-        { bytes: bytes68k, sha256: sha68k, imageId: 2 },
+        { bytes: bytes68k, verifySha256: sha68k, imageId: 2 },
         {
           onProgress: (p) => { if (p.sent >= 512) go68k = false; },
           shouldContinue: () => go68k,
@@ -5462,67 +5473,34 @@ void (async () => {
     await link68k.close();
   }
 
-  // --- swap-already-happened acceptance: post-upload state has the new hash
-  // in slot 0 and the armed image moved to slot 1 → still resolves -----------
+  // --- stall guard: a device replying constant off:0 forever (never
+  // advancing) is bounded by maxTotalMs → throws 'stalled', exactly the
+  // first chunk sent (tiny injected window; the 200 ms reply delay trips it
+  // between chunks — without the guard this loop would spin forever) --------
   {
-    const bytes68v = Uint8Array.from({ length: 600 }, (_, i) => (i * 7 + 3) & 0xff);
-    const sha68v = Uint8Array.from({ length: 32 }, (_, i) => 0x30 + i);
-    let reads68v = 0;
-    let post68v = false;
-    const dev68v = mkSmp68((rq, push) => {
-      if (rq.group === SMP.GROUP_IMAGE && rq.cmdId === SMP.ID_IMAGE_STATE) {
-        reads68v++;
-        // 1st read = pre-upload; after the upload finished, the bootloader
-        // has ALREADY swapped: new hash in slot 0, armed image in slot 1
-        const body = reads68v === 1 || !post68v
-          ? images68(false, pre0A68, sha68v)
-          : { images: [
-              { slot: 0, hash: sha68v, flags: [] },
-              { slot: 1, hash: pre0A68, flags: ['active', 'confirmed'] },
-            ] };
-        rspLine68(rq, cborEncode(body), push);
-        return;
-      }
+    const bytes68m = Uint8Array.from({ length: 700 }, (_, i) => (i * 7 + 3) & 0xff);
+    const sha68m = Uint8Array.from({ length: 32 }, (_, i) => 0x30 + i);
+    const chunks68m: number[] = [];
+    const dev68m = mkSmp68((rq, push) => {
       if (rq.group === SMP.GROUP_IMAGE && rq.cmdId === SMP.ID_IMAGE_UPLOAD) {
-        const v = cborDecode(rq.payload).value as { off: number; data: Uint8Array };
-        if (v.off + v.data.length >= 600) post68v = true;
-        rspLine68(rq, cborEncode({ off: v.off + v.data.length, rc: 0 }), push);
+        const v = cborDecode(rq.payload).value as { off: number };
+        chunks68m.push(v.off);
+        // every ack claims off:0 — the device never advances
+        rspLine68(rq, cborEncode({ off: 0, rc: 0 }), push, 200);
         return;
       }
     });
-    const link68v = await dev68v.open();
-    let err68v = '';
+    const link68m = await dev68m.open();
+    let err68m = '';
     try {
-      await new SmpDevice(link68v).uploadImage({ bytes: bytes68v, sha256: sha68v, imageId: 2 });
-    } catch (e) { err68v = (e as Error).message; }
-    eq(err68v, '', '68 swap-accepted: upload resolves when the swap already happened (slot0=sha, slot1=pre-slot0)');
-    await link68v.close();
-  }
-
-  // --- verify refusal: post-upload state matches neither rule → throws -------
-  {
-    const bytes68w = Uint8Array.from({ length: 100 }, (_, i) => (i * 7 + 3) & 0xff);
-    const sha68w = Uint8Array.from({ length: 32 }, (_, i) => 0x40 + i);
-    const dev68w = mkSmp68((rq, push) => {
-      if (rq.group === SMP.GROUP_IMAGE && rq.cmdId === SMP.ID_IMAGE_STATE) {
-        // pre and post identical: slot 1 never took the write
-        rspLine68(rq, cborEncode(images68(false, pre0A68, sha68w)), push);
-        return;
-      }
-      if (rq.group === SMP.GROUP_IMAGE && rq.cmdId === SMP.ID_IMAGE_UPLOAD) {
-        const v = cborDecode(rq.payload).value as { off: number; data: Uint8Array };
-        rspLine68(rq, cborEncode({ off: v.off + v.data.length, rc: 0 }), push);
-        return;
-      }
-    });
-    const link68w = await dev68w.open();
-    let err68w = '';
-    try {
-      await new SmpDevice(link68w).uploadImage({ bytes: bytes68w, sha256: sha68w, imageId: 2 });
-    } catch (e) { err68w = (e as Error).message; }
-    eq(err68w.includes('slot-1 hash'), true,
-      '68 verify-refusal: unchanged slot-1 after upload throws');
-    await link68w.close();
+      await new SmpDevice(link68m)
+        .uploadImage({ bytes: bytes68m, verifySha256: sha68m, imageId: 2 }, { maxTotalMs: 50 });
+    } catch (e) { err68m = (e as Error).message; }
+    eq(err68m, 'smp upload stalled at off 0',
+      '68 stall-guard: constant off:0 past maxTotalMs throws the exact stalled message');
+    eq(chunks68m.length, 1,
+      '68 stall-guard: exactly one chunk sent — the bound is honored before every chunk write');
+    await link68m.close();
   }
 
   // --- (g) resolveUploadImageId numbering matrix ------------------------------
@@ -5687,6 +5665,7 @@ void (async () => {
   eq(SMP_DEFAULT_TIMEOUTS.chunkMs, 20000, '68 timeouts: default chunkMs 20s');
   eq(SMP_DEFAULT_TIMEOUTS.eraseMs, 90000, '68 timeouts: default eraseMs 90s');
   eq(SMP_DEFAULT_TIMEOUTS.transceiveMs, 5000, '68 timeouts: default transceiveMs 5s');
+  eq(SMP_DEFAULT_TIMEOUTS.uploadTotalMs, 600000, '68 timeouts: default uploadTotalMs 600s (stall guard)');
 })();
 
 // §69 firmware catalog + fetch + plan libs: vendored OF catalog integrity,
@@ -6486,7 +6465,8 @@ void (async () => {
   // core opens/closes the port per probe (SmpLink owns locks), like a real
   // WebSerial port that is closed and re-opened. State machine: fresh →
   // uploaded (slot-1 = sha) → swapped (slot-0 = sha); alreadySwapped lands
-  // straight in swapped (the uploadImage swap-already-happened readback).
+  // straight in swapped when the last chunk lands (the swap ran before the
+  // first swap.verify poll — the SDK upload does no readback of its own).
   const mkBoot72 = (o: {
     pid: number;
     pre0: Uint8Array;
@@ -6755,6 +6735,20 @@ void (async () => {
   const shaL72 = hexToBytes(entryL72!.plaintextSha256 ?? entryL72!.blobSha256)!;
   const shaR72 = hexToBytes(entryR72!.plaintextSha256 ?? entryR72!.blobSha256)!;
   const bytes72 = (seed: number): Uint8Array => Uint8Array.from({ length: 700 }, (_, i) => (i * 13 + seed) & 0xff);
+  // The upload's WIRE sha is the digest of the bytes on the wire (the vault
+  // bytes stand in for the encrypted blob) — never the verify-sha above.
+  const shaOf72 = async (b: Uint8Array): Promise<Uint8Array> =>
+    new Uint8Array(await crypto.subtle.digest('SHA-256', b));
+  const firstUploadSha72 = (lines: string[]): Uint8Array | null => {
+    for (const l of lines) {
+      const f = parseSmpChunks(l).frames[0];
+      if (!f || f.op !== SMP.OP_WRITE || f.group !== SMP.GROUP_IMAGE ||
+        f.cmdId !== SMP.ID_IMAGE_UPLOAD) continue;
+      const v = cborDecode(f.payload).value as { off: number; sha?: unknown };
+      if (v.off === 0 && v.sha instanceof Uint8Array) return v.sha;
+    }
+    return null;
+  };
   // fe/1002 payload shaped like the device's version bytes for a declared
   // label ('3.41.0' → 00 03 29 00 00-style four components — fwVersionText
   // decodes it as v3.41.0.0).
@@ -6917,7 +6911,13 @@ void (async () => {
       '72(a) both halves swap-verified');
     eq(c.bootL.uploadCount(), 2, '72(a) two upload chunk writes (700 B = 512 + 188) on the left bootloader');
     eq(c.bootL.osResetCount(), 1, '72(a) exactly one os reset — the T7 mcuboot.exit, sent to the answering port');
-    eq(c.bootL.reads() >= 4, true, '72(a) probe + upload pre/post reads + a swap re-poll happened');
+    eq(c.bootL.reads() >= 2, true,
+      '72(a) identify probe + swap.verify re-poll reads — the SDK upload adds none of its own');
+    const wireShaL72 = firstUploadSha72(c.bootL.linesWritten);
+    eq(wireShaL72 !== null && toHex(wireShaL72) === toHex(await shaOf72(bytes72(3))), true,
+      '72(a) first-chunk sha = sha256 of the uploaded bytes (the blob on the wire)');
+    eq(wireShaL72 !== null && toHex(wireShaL72) === toHex(shaL72), false,
+      '72(a) the wire sha is NOT the plaintext verify-sha the caller passes (two-hash rule)');
     const sm72 = log.events.find((e) => e.step === 'slot.map' && e.phase === 'ok');
     eq(sm72 !== undefined && /assumed/.test(sm72.detail ?? ''), true,
       '72(a) slot map: rc 8 → no map, ASSUMED image id noted');
@@ -6986,19 +6986,38 @@ void (async () => {
       '72(d) silent port console text surfaces as a bootloader.console note');
   };
 
-  // ---- (e) swap-already-happened: slot-0 == target sha at the post-upload
-  //      readback → swap.verify accepts without any reset loop ----------------
+  // ---- (e) swap-already-happened: slot-0 == target sha at the first
+  //      swap.verify poll → accepted without any reset loop ---------------
   const caseE72 = async (): Promise<void> => {
     const c = mkCase72({ alreadySwapped: true, boots: { left: ['smp'] }, returnToApp: true });
     const log = await begin72('72(e)', c, { targets: leftOnly72, ...kbOpts72 });
     if (log === null) return;
     eq(last72(log).step === 'run.end' && last72(log).ok === true, true,
-      '72(e) run completes — swap already happened during the upload readback');
+      '72(e) run completes — the swap already ran while the upload finished');
     const sv = log.events.find((e) => e.step === 'swap.verify' && e.phase === 'ok');
     eq(sv !== undefined && /slot-0/.test(sv.detail ?? ''), true,
       '72(e) swap.verify ok: slot-0 == target sha observed on a re-poll');
     eq(c.bootL.osResetCount(), 1, '72(e) no reset LOOP — the single mcuboot.exit reset after the verify');
-    eq(c.bootL.reads() >= 4, true, '72(e) the swap re-poll re-read image state');
+    eq(c.bootL.reads() >= 2, true, '72(e) the swap re-poll re-read image state');
+  };
+
+  // ---- (i) upload ok but the swap NEVER appears: swap.verify refuses
+  //      within its bounded window (the post-upload verification the SDK
+  //      no longer does inside uploadImage lives HERE — clear copy, the
+  //      upload itself is proven complete first) ---------------------------
+  const caseI72 = async (): Promise<void> => {
+    // no swapAfterMs, no alreadySwapped: the fixture parks in 'uploaded'
+    // (slot-0 stays the old image) for the whole swap.verify window
+    const c = mkCase72({ boots: { left: ['smp'] } });
+    const log = await begin72('72(i)', c, { targets: leftOnly72, ...kbOpts72 });
+    if (log === null) return;
+    eq(last72(log).step === 'run.end' && last72(log).ok === false, true,
+      '72(i) upload ok + swap never appearing → the run fails');
+    eq(log.events.some((e) => e.step === 'upload' && e.phase === 'ok' && e.side === 'left'), true,
+      '72(i) the upload itself completed — pure upload resolves on the last chunk');
+    const svf = log.events.find((e) => e.step === 'swap.verify' && e.phase === 'fail');
+    eq(svf !== undefined && /did not appear/.test(svf.detail ?? ''), true,
+      '72(i) swap.verify refusal: the swap did not appear within the window');
   };
 
   // ---- (f) no port appears, injected grant mechanism rejects → clear copy ---
@@ -7051,6 +7070,7 @@ void (async () => {
   await caseF72();
   await caseG72();
   await caseH72();
+  await caseI72();
   signal72done?.();
 })();
 
@@ -8632,6 +8652,16 @@ void (async () => {
     return {
       port: port as unknown as PortWithInfo,
       osResetCount: (): number => linesWritten.filter((l) => isWrite(l, SMP.GROUP_OS, SMP.ID_OS_RESET)).length,
+      firstUploadSha: (): Uint8Array | null => {
+        for (const l of linesWritten) {
+          const f = parseSmpChunks(l).frames[0];
+          if (!f || f.op !== SMP.OP_WRITE || f.group !== SMP.GROUP_IMAGE ||
+            f.cmdId !== SMP.ID_IMAGE_UPLOAD) continue;
+          const v = cborDecode(f.payload).value as { off: number; sha?: unknown };
+          if (v.off === 0 && v.sha instanceof Uint8Array) return v.sha;
+        }
+        return null;
+      },
     };
   };
 
@@ -8840,6 +8870,13 @@ void (async () => {
       eq(fwups[0]?.[0], FWUP_TYPES.Touch, '75(b) MOD_FWUP byte is FWUP_TYPES.Touch (1)');
       // NO reset after the last chunk — the half self-restarts (§6 ruling).
       eq(c.bootL.osResetCount(), 0, '75(b) ZERO os resets on the boot port — nothing is sent after the last chunk');
+      // The bundle's wire sha is the digest of the uploaded bytes themselves
+      // (littlefs bundles carry no plaintext hash — the entry's blobSha256 is
+      // the same bytes, so the two-hashes rule degenerates to one here).
+      const wireSha75 = c.bootL.firstUploadSha();
+      const expSha75 = new Uint8Array(await crypto.subtle.digest('SHA-256', oneMiB75(3)));
+      eq(wireSha75 !== null && toHex(wireSha75) === toHex(expSha75), true,
+        '75(b) first-chunk sha = sha256 of the uploaded bundle bytes');
       // bundle.verify named the target; the 1 MiB upload really ran.
       const bv = log.events.find((e) => e.step === 'bundle.verify' && e.phase === 'ok');
       eq(bv !== undefined && /2\.3\.3/.test(bv.detail ?? ''), true, '75(b) bundle.verify names the stored target');
