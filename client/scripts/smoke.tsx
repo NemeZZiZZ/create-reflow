@@ -26,6 +26,10 @@ import type { SnapMaps } from '@create-reflow/sdk';
 import { timeoutsMs, timeoutsPayload } from '@create-reflow/sdk';
 import { parseKeyScanEvent, hostOsOp, sleep } from '@create-reflow/sdk';
 import type { KeyScanEvent } from '@create-reflow/sdk';
+import {
+  SMP, crc16Xmodem, cborEncode, cborDecode, encodeSmpLine, parseSmpChunks, SmpLink,
+} from '@create-reflow/sdk';
+import type { SmpFrame, SmpSerialPortLike } from '@create-reflow/sdk';
 import Keyboard from '../src/components/Keyboard';
 import {
   saveAutoBackup,
@@ -4827,6 +4831,276 @@ void (async () => {
     "66 rank pin: 'ripple delete' top hit = Ripple Delete (Adobe Premiere Pro)");
 
   eq(detectPlatform(), 'windows', '66 platform: node (no navigator) → windows guard');
+})();
+
+// §67 smp codecs + line link (SDK layer): CRC16-XMODEM vectors, the CBOR
+// subset mcumgr speaks (uint/negint head forms, bytes/text/bool/null,
+// sorted-key maps, indefinite-length arrays), the base64 line framing
+// (\x06\x09 start / \x04\x14 continue, CRC+len verified, bad frames dropped
+// without ever throwing), and SmpLink end-to-end on a scripted line-port
+// (matching reply resolves, stale-seq frame skipped, timeout throws,
+// idempotent close). No Naya wake/handshake — a bootloader answers the
+// first frame it sees; the link owns a plain TextDecoder accumulation loop.
+void (async () => {
+  // --- constants + CRC16-XMODEM vectors -----------------------------------
+  eq(
+    JSON.stringify([SMP.OP_READ, SMP.OP_READ_RSP, SMP.OP_WRITE, SMP.GROUP_OS,
+      SMP.GROUP_IMAGE, SMP.ID_ECHO, SMP.ID_IMAGE_STATE, SMP.ID_IMAGE_UPLOAD,
+      SMP.ID_OS_RESET, SMP.ID_SLOT_INFO]),
+    '[0,1,2,0,1,0,0,1,5,6]', '67 SMP: op/group/id constants');
+  eq(crc16Xmodem(new Uint8Array(0)), 0, '67 crc: empty → 0 (init 0)');
+  eq(crc16Xmodem(new TextEncoder().encode('123456789')), 0x31c3,
+    '67 crc: "123456789" → 0x31C3 (XMODEM check vector)');
+  eq(crc16Xmodem(new TextEncoder().encode('A')), 0x58e5, '67 crc: "A" → 0x58E5');
+
+  // --- CBOR encode: integer head forms (major 0/1 boundaries) -------------
+  eq(toHex(cborEncode(0)), '00', '67 cbor: 0 → 00');
+  eq(toHex(cborEncode(23)), '17', '67 cbor: 23 → 17 (immediate top)');
+  eq(toHex(cborEncode(24)), '18 18', '67 cbor: 24 → 18 18 (1-byte form starts)');
+  eq(toHex(cborEncode(255)), '18 ff', '67 cbor: 255 → 18 ff');
+  eq(toHex(cborEncode(256)), '19 01 00', '67 cbor: 256 → 19 0100 (2-byte form)');
+  eq(toHex(cborEncode(65535)), '19 ff ff', '67 cbor: 65535 → 19 ffff');
+  eq(toHex(cborEncode(65536)), '1a 00 01 00 00', '67 cbor: 65536 → 1a 00010000 (4-byte form)');
+  eq(toHex(cborEncode(4294967295)), '1a ff ff ff ff', '67 cbor: u32 max → 1a ffffffff');
+  eq(toHex(cborEncode(4294967296)), '1b 00 00 00 01 00 00 00 00',
+    '67 cbor: u32 max+1 → 1b (8-byte form)');
+  eq(toHex(cborEncode(-1)), '20', '67 cbor: -1 → 20 (negint arg 0)');
+  eq(toHex(cborEncode(-24)), '37', '67 cbor: -24 → 37 (immediate top)');
+  eq(toHex(cborEncode(-25)), '38 18', '67 cbor: -25 → 38 18');
+  eq(toHex(cborEncode(-256)), '38 ff', '67 cbor: -256 → 38 ff');
+  eq(toHex(cborEncode(-257)), '39 01 00', '67 cbor: -257 → 39 0100');
+  eq(toHex(cborEncode(-65536)), '39 ff ff', '67 cbor: -65536 → 39 ffff');
+  eq(toHex(cborEncode('hi')), '62 68 69', "67 cbor: 'hi' → 62 6869");
+  eq(toHex(cborEncode(true)), 'f5', '67 cbor: true → f5');
+  eq(toHex(cborEncode(null)), 'f6', '67 cbor: null → f6');
+  eq(toHex(cborEncode(Uint8Array.from([0xaa, 0xbb]))), '42 aa bb', '67 cbor: bytes → 42 aabb');
+  // map keys sorted by UTF-8 bytes: data < image < off (insertion order isn't)
+  eq(
+    toHex(cborEncode({ image: 0, off: 512, data: Uint8Array.from([0xaa, 0xbb]) })),
+    'a3 64 64 61 74 61 42 aa bb 65 69 6d 61 67 65 00 63 6f 66 66 19 02 00',
+    '67 cbor: {image,off,data} → map(3), keys sorted data<image<off, exact bytes');
+
+  // --- CBOR decode: round-trips + next cursor ------------------------------
+  eq(cborDecode(cborEncode(0)).value, 0, '67 cbor: decode 0');
+  eq(cborDecode(cborEncode(255)).value, 255, '67 cbor: decode 255');
+  eq(cborDecode(cborEncode(65536)).value, 65536, '67 cbor: decode 65536');
+  eq(cborDecode(cborEncode(4294967296)).value, 4294967296,
+    '67 cbor: decode 8-byte uint → number when safe');
+  eq(cborDecode(cborEncode(-1)).value, -1, '67 cbor: decode -1');
+  eq(cborDecode(cborEncode(-65536)).value, -65536, '67 cbor: decode -65536');
+  eq(cborDecode(cborEncode('hello world')).value, 'hello world', "67 cbor: decode 'hello world'");
+  eq(cborDecode(cborEncode(true)).value, true, '67 cbor: decode true');
+  eq(cborDecode(cborEncode(null)).value, null, '67 cbor: decode null');
+  eq(toHex(cborDecode(cborEncode(Uint8Array.from([1, 2, 3]))).value as Uint8Array),
+    '01 02 03', '67 cbor: decode bytes round-trip');
+  const nested67 = cborEncode([1, [2, 3]]);
+  eq(cborDecode(nested67).next, nested67.length,
+    '67 cbor: next = full length on a nested array');
+  eq(cborDecode(Uint8Array.from([...nested67, 0xff])).next, nested67.length,
+    '67 cbor: next stops after the value (trailing byte unconsumed)');
+  const mapDec67 = cborDecode(
+    cborEncode({ image: 0, off: 512, data: Uint8Array.from([0xaa, 0xbb]) }),
+  ).value as { image: number; off: number; data: Uint8Array };
+  eq(mapDec67.image, 0, '67 cbor: decoded map .image');
+  eq(mapDec67.off, 512, '67 cbor: decoded map .off');
+  eq(toHex(mapDec67.data), 'aa bb', '67 cbor: decoded map .data');
+  eq(
+    JSON.stringify(cborDecode(Uint8Array.from([0x9f, 0x01, 0x02, 0x03, 0xff])).value),
+    '[1,2,3]', '67 cbor: indefinite-length array 9F…FF decodes');
+
+  // --- encodeSmpLine → parseSmpChunks round-trip ---------------------------
+  const line67 = encodeSmpLine(SMP.OP_READ, SMP.GROUP_OS, 7, SMP.ID_ECHO);
+  eq(line67.startsWith('\x06\x09'), true, '67 line: starts \\x06\\x09');
+  eq(line67.endsWith('\n'), true, '67 line: ends \\n');
+  const pLine67 = parseSmpChunks(line67);
+  eq(pLine67.frames.length, 1, '67 line: single line → 1 frame');
+  const fLine67 = pLine67.frames[0]!;
+  eq(fLine67.op, SMP.OP_READ, '67 line: frame op READ');
+  eq(fLine67.group, SMP.GROUP_OS, '67 line: frame group OS');
+  eq(fLine67.seq, 7, '67 line: frame seq');
+  eq(fLine67.cmdId, SMP.ID_ECHO, '67 line: frame cmdId');
+  eq(fLine67.flags, 0, '67 line: frame flags 0');
+  eq(toHex(fLine67.payload), 'a0', '67 line: default payload → single 0xA0 (empty CBOR map)');
+  eq(pLine67.rest, '', '67 line: complete frame consumed (rest empty)');
+
+  // multi-KB payload split across \x04\x14 continuation lines
+  const big67 = new Uint8Array(4096);
+  for (let i = 0; i < big67.length; i++) big67[i] = i & 0xff;
+  const bigLine67 = encodeSmpLine(SMP.OP_READ_RSP, SMP.GROUP_IMAGE, 9, SMP.ID_IMAGE_UPLOAD, big67);
+  const bigB6467 = bigLine67.slice(2, -1);
+  let wired67 = '';
+  for (let i = 0; i < bigB6467.length; i += 72) {
+    wired67 += (i === 0 ? '\x06\x09' : '\x04\x14') + bigB6467.slice(i, i + 72) + '\n';
+  }
+  eq(wired67.split('\n').length - 1, Math.ceil(bigB6467.length / 72),
+    '67 line: multi-KB response arrives as multiple lines');
+  const pBig67 = parseSmpChunks(wired67);
+  eq(pBig67.frames.length, 1, '67 line: continuation lines reassemble into 1 frame');
+  const fBig67 = pBig67.frames[0]!;
+  eq(fBig67.payload.length, 4096, '67 line: reassembled payload is whole (4096B)');
+  eq(toHex(fBig67.payload.slice(0, 4)), '00 01 02 03', '67 line: reassembled payload head intact');
+  eq(toHex(fBig67.payload.slice(-4)), 'fc fd fe ff', '67 line: reassembled payload tail intact');
+  eq(fBig67.seq, 9, '67 line: reassembled frame seq');
+  eq(fBig67.group, SMP.GROUP_IMAGE, '67 line: reassembled frame group');
+  eq(pBig67.rest, '', '67 line: multi-line frame fully consumed');
+
+  // bad CRC → dropped, never throws
+  const goodB6467 = line67.slice(2, -1);
+  let flip67 = goodB6467.length - 1;
+  while (goodB6467[flip67] === '=') flip67--;
+  const badLine67 = '\x06\x09' + goodB6467.slice(0, flip67)
+    + (goodB6467[flip67] === 'A' ? 'B' : 'A') + goodB6467.slice(flip67 + 1) + '\n';
+  let badThrew67 = false;
+  let badFrames67 = -1;
+  let badRest67 = 'unset';
+  try {
+    const r = parseSmpChunks(badLine67);
+    badFrames67 = r.frames.length;
+    badRest67 = r.rest;
+  } catch { badThrew67 = true; }
+  eq(badThrew67, false, '67 line: bad CRC never throws');
+  eq(badFrames67, 0, '67 line: bad-CRC frame dropped');
+  eq(badRest67, '', '67 line: dropped frame consumes its lines');
+
+  // partial (unterminated) line stays in rest; frame completes when fed on
+  const pPartial67 = parseSmpChunks('\x06\x09' + goodB6467.slice(0, 10));
+  eq(pPartial67.frames.length, 0, '67 line: unterminated partial line → no frame');
+  eq(pPartial67.rest, '\x06\x09' + goodB6467.slice(0, 10),
+    '67 line: partial line preserved in rest verbatim');
+  const pStart67 = parseSmpChunks('\x06\x09' + goodB6467.slice(0, 8) + '\n');
+  eq(pStart67.frames.length, 0, '67 line: decodable-but-short frame not yielded early');
+  eq(pStart67.rest, '\x06\x09' + goodB6467.slice(0, 8) + '\n',
+    '67 line: pending frame lines preserved in rest');
+  const pDone67 = parseSmpChunks(pStart67.rest + '\x04\x14' + goodB6467.slice(8) + '\n');
+  eq(pDone67.frames.length, 1, '67 line: continuation completes the pending frame');
+  eq(toHex(pDone67.frames[0]!.payload), 'a0', '67 line: completed frame payload intact');
+
+  // --- SmpLink end-to-end on a scripted line-port --------------------------
+  // Fake line-port §56/§65-style, line-shaped: the writer collects written
+  // lines; a scripted responder parses each request line and answers after
+  // ~5 ms via a controller-readable push. Block-scoped to §67.
+  const scriptedSmp67 = (
+    respond: (rq: SmpFrame, push: (t: string) => void) => void,
+  ) => {
+    const linesWritten: string[] = [];
+    let controller: ReadableStreamDefaultController<Uint8Array> | null = null;
+    const readable = new ReadableStream<Uint8Array>({
+      start(c) { controller = c; },
+    });
+    const push = (t: string) => {
+      controller!.enqueue(new TextEncoder().encode(t));
+    };
+    let pending = '';
+    const writable = new WritableStream<Uint8Array>({
+      write(b) {
+        pending += new TextDecoder().decode(b);
+        for (;;) {
+          const i = pending.indexOf('\n');
+          if (i < 0) break;
+          const line = pending.slice(0, i + 1);
+          pending = pending.slice(i + 1);
+          linesWritten.push(line);
+          const rq = parseSmpChunks(line).frames[0];
+          if (rq) respond(rq, push);
+        }
+      },
+    });
+    let closed = 0;
+    const port = {
+      readable,
+      writable,
+      open() { /* port already open (readable present) */ },
+      setSignals: () => { /* DTR/RTS sink */ },
+      close() { closed++; },
+    };
+    return {
+      linesWritten,
+      closedCount: () => closed,
+      open: () => SmpLink.open(port as unknown as SmpSerialPortLike, { settleMs: 2 }),
+    };
+  };
+
+  // --- A: matching reply resolves; wire shape round-trips
+  {
+    const reqsA: SmpFrame[] = [];
+    const devA = scriptedSmp67((rq, push) => {
+      reqsA.push(rq);
+      setTimeout(() => {
+        push(encodeSmpLine(SMP.OP_READ_RSP, rq.group, rq.seq, rq.cmdId,
+          Uint8Array.from([0xde, 0xad])));
+      }, 5);
+    });
+    const linkA = await devA.open();
+    const rspA = await linkA.transceive(SMP.OP_READ, SMP.GROUP_OS, SMP.ID_ECHO,
+      Uint8Array.from([1, 2, 3]));
+    eq(reqsA.length, 1, '67 link: responder saw exactly one request line');
+    eq(reqsA[0]!.op, SMP.OP_READ, '67 link: request op READ');
+    eq(reqsA[0]!.group, SMP.GROUP_OS, '67 link: request group OS');
+    eq(reqsA[0]!.cmdId, SMP.ID_ECHO, '67 link: request cmdId ECHO');
+    eq(reqsA[0]!.seq, 1, '67 link: first transceive seq 1 (internal counter ++ & 0xFF)');
+    eq(reqsA[0]!.flags, 0, '67 link: request flags 0');
+    eq(toHex(reqsA[0]!.payload), '01 02 03', '67 link: request payload survives the wire');
+    eq(devA.linesWritten[0]!.startsWith('\x06\x09'), true, '67 link: TX line starts \\x06\\x09');
+    eq(devA.linesWritten[0]!.endsWith('\n'), true, '67 link: TX line ends \\n');
+    eq(rspA.op, SMP.OP_READ_RSP, '67 link: reply op READ_RSP');
+    eq(rspA.seq, 1, '67 link: reply seq echoes the request');
+    eq(rspA.group, SMP.GROUP_OS, '67 link: reply group OS');
+    eq(rspA.cmdId, SMP.ID_ECHO, '67 link: reply cmdId ECHO');
+    eq(toHex(rspA.payload), 'de ad', '67 link: matching reply payload resolves');
+    const rspA2 = await linkA.transceive(SMP.OP_WRITE, SMP.GROUP_OS, SMP.ID_OS_RESET);
+    eq(reqsA.length, 2, '67 link: second transceive seen');
+    eq(toHex(reqsA[1]!.payload), 'a0', '67 link: transceive without payload sends 0xA0');
+    eq(reqsA[1]!.seq, 2, '67 link: seq counter advances');
+    eq(rspA2.cmdId, SMP.ID_OS_RESET, '67 link: reply matched on (group, cmdId, seq)');
+    await linkA.close();
+  }
+
+  // --- B: stale/mismatched-seq frame discarded silently, correct reply still
+  // resolves (late replies must never satisfy a live exchange)
+  {
+    const devB = scriptedSmp67((rq, push) => {
+      push(encodeSmpLine(SMP.OP_READ_RSP, rq.group, 0xf7, rq.cmdId,
+        Uint8Array.from([0x33]))); // stale seq — discarded
+      setTimeout(() => {
+        push(encodeSmpLine(SMP.OP_READ_RSP, rq.group, rq.seq, rq.cmdId,
+          Uint8Array.from([0x07])));
+      }, 5);
+    });
+    const linkB = await devB.open();
+    const rspB = await linkB.transceive(SMP.OP_READ, SMP.GROUP_IMAGE,
+      SMP.ID_IMAGE_STATE, undefined, { timeoutMs: 2000 });
+    eq(toHex(rspB.payload), '07', '67 link: stale-seq frame skipped, correct reply still resolves');
+    eq(rspB.group, SMP.GROUP_IMAGE, '67 link: image-state reply group');
+    await linkB.close();
+  }
+
+  // --- C: timeout throws
+  {
+    const devC = scriptedSmp67(() => { /* silent device */ });
+    const linkC = await devC.open();
+    const t067 = Date.now();
+    let errC67 = '';
+    try {
+      await linkC.transceive(SMP.OP_WRITE, SMP.GROUP_OS, SMP.ID_OS_RESET,
+        undefined, { timeoutMs: 50 });
+    } catch (e) { errC67 = (e as Error).message; }
+    eq(errC67 !== '', true, '67 link: timeout throws (50ms, silent responder)');
+    eq(Date.now() - t067 < 3000, true, '67 link: custom timeoutMs honored (not the 5s default)');
+    await linkC.close();
+  }
+
+  // --- D: close() idempotent — every step swallowed
+  {
+    const devD = scriptedSmp67(() => { /* silent */ });
+    const linkD = await devD.open();
+    let closeErr67 = '';
+    try {
+      await linkD.close();
+      await linkD.close();
+    } catch (e) { closeErr67 = (e as Error).message; }
+    eq(closeErr67, '', '67 link: close() idempotent — double close never throws');
+    eq(devD.closedCount(), 1, '67 link: port closed exactly once (second close is a no-op)');
+  }
 })();
 
 void main();

@@ -27,3 +27,4 @@ export * from './module-read';
 // legacy-snapshot clean break (exporters.ts is gone).
 export * from './openflow';
 export * from './utils';
+export * from './smp';
