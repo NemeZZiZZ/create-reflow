@@ -25,6 +25,11 @@ import { NAYA_VID, RECOVERY_PIDS, pidInfo } from '../src/lib/firmware-plat';
 import { resolveKeyboardPlan } from '../src/lib/firmware-plan';
 import { checkFlashGate } from '../src/lib/firmware-interlocks';
 import type { KeyboardGateInput, ModuleGateInput } from '../src/lib/firmware-interlocks';
+import { FirmwareRunLog, STEP_LABELS, stableStringify } from '../src/lib/firmware-run-log';
+import type { RunEvent } from '../src/lib/firmware-run-log';
+import {
+  beginFirmwareRun, capturePreflight, endFirmwareRun, firmwareRunActive, verifyPreflight,
+} from '../src/hooks/useFirmwareFlash';
 import * as fs from 'fs';
 import * as path from 'path';
 import { keyIconName, shortLabel } from '../src/lib/key-icon-map';
@@ -6114,5 +6119,316 @@ void (async () => {
   eqArr70(checkFlashGate({ ...kbBase70, heldSha256: 'ff'.repeat(32), modulesDocked: true }),
     [R70.sha, R70.docked], '70 gate: multiple violations collect in order');
 }
+
+// §71 firmware run log + procedure lifecycle: JSONL run log with fixed key
+// order (run.start meta first, run.end verdict last), the one-run lock +
+// freeze flag + unload guards on an injectable win, and preflight
+// capture/verify over scripted NayaSession fakes — fw fe/1002, BLE identity
+// be/1008|1002|1005 (the bleSplitReads set), de/1001 module presence on both
+// halves (the undock-gate input), left-only keymap+LED banks 0+1 (30/1003 +
+// 30/100d multipart — the reads whose caches useFlash's auto-backup
+// serializes; the left half owns dest 0x50). Artifact = stable-key-order
+// serialization + WebCrypto sha256, logged as a `preflight` artifact note.
+void (async () => {
+  /* ---- (a) run log shape -------------------------------------------------- */
+  const CORE71 = ['ts', 'elapsed_ms', 'step', 'label', 'phase'];
+  const log71 = new FirmwareRunLog('keyboard');
+  eq(/^keyboard-\d{8}-\d{6}$/.test(log71.id), true, '71 log: id = kind-YYYYMMDD-HHMMSS');
+  eq(log71.done, false, '71 log: not done before finish');
+  eq(log71.events.length, 1, '71 log: constructor emits run.start meta');
+  const rs71 = log71.events[0]!;
+  eq(rs71.step === 'run.start' && rs71.phase === 'start', true,
+    '71 log: first event is run.start, phase start');
+  eq(rs71.kind, 'keyboard', '71 log: run.start carries the run kind');
+  eq(rs71.elapsed_ms, 0, '71 log: run.start elapsed_ms 0');
+  eq(rs71.label, STEP_LABELS['run.start'], '71 log: label from STEP_LABELS');
+
+  log71.start('preflight.capture');
+  log71.ok('preflight.capture', undefined, { took_ms: 12 });
+  log71.start('mcuboot.enter', 'left');
+  log71.progress('upload', 'left', 5, 100, 2000);
+  log71.action('mcuboot.enter', 'left', 'grant the bootloader port');
+  log71.note('identify', 'left', 'slot-0 hash noted', { sha256: 'ab'.repeat(32) });
+  log71.note('mystery.step', undefined, 'unlabeled');
+  log71.fail('swap.verify', 'left', 'slot flags not pending');
+
+  const seen71: RunEvent[] = [];
+  const unsub71 = log71.subscribe((e) => seen71.push(e));
+  log71.note('gate.check', undefined, 'subscribed');
+  unsub71();
+  log71.note('gate.check', undefined, 'not subscribed');
+  eq(seen71.length === 1 && seen71[0]!.detail === 'subscribed', true,
+    '71 log: subscribe sees events until unsubscribe');
+
+  log71.finish(false, 'aborted', ['swap.verify: slot flags not pending'], ['version changed']);
+  eq(log71.done, true, '71 log: done after finish');
+  const le71 = log71.events[log71.events.length - 1]!;
+  eq(le71.step, 'run.end', '71 log: last event is run.end');
+  eq(le71.phase, 'fail', '71 log: run.end phase mirrors the verdict');
+  eq(le71.ok, false, '71 log: run.end carries ok');
+  eq(le71.summary, 'aborted', '71 log: run.end carries summary');
+  eq(JSON.stringify(le71.failures), JSON.stringify(['swap.verify: slot flags not pending']),
+    '71 log: run.end carries failures');
+  eq(JSON.stringify(le71.advisories), JSON.stringify(['version changed']),
+    '71 log: run.end carries advisories');
+  const frozen71 = log71.events.length;
+  log71.ok('late.step');
+  eq(log71.events.length, frozen71, '71 log: events after finish are frozen out');
+
+  const parsed71 = log71.lines().split('\n').map((l) => JSON.parse(l) as Record<string, unknown>);
+  eq(parsed71.length, log71.events.length, '71 log: lines() is parse-clean JSONL, one per event');
+  const keys71 = parsed71.map((o) => Object.keys(o));
+  eq(keys71.every((k) => k.slice(0, 5).join(',') === CORE71.join(',')), true,
+    '71 log: every line opens ts,elapsed_ms,step,label,phase in order');
+  const keysAt71 = (step: string, phase?: string): string[] => {
+    for (let i = parsed71.length - 1; i >= 0; i--) {
+      if (parsed71[i]!.step === step && (phase === undefined || parsed71[i]!.phase === phase))
+        return keys71[i]!;
+    }
+    return ['MISSING'];
+  };
+  eq(JSON.stringify(keysAt71('run.start')), JSON.stringify([...CORE71, 'kind']),
+    '71 log: run.start key order');
+  eq(JSON.stringify(keysAt71('upload')), JSON.stringify([...CORE71, 'side', 'percent', 'sent', 'total']),
+    '71 log: progress row carries percent/sent/total after side');
+  eq(JSON.stringify(keysAt71('mcuboot.enter', 'start')), JSON.stringify([...CORE71, 'side']),
+    '71 log: step start row key order');
+  eq(JSON.stringify(keysAt71('mcuboot.enter', 'action')), JSON.stringify([...CORE71, 'side', 'detail']),
+    '71 log: action row carries detail');
+  eq(JSON.stringify(keysAt71('identify', 'note')), JSON.stringify([...CORE71, 'side', 'detail', 'sha256']),
+    '71 log: note row carries detail + extras');
+  eq(JSON.stringify(keysAt71('preflight.capture', 'ok')), JSON.stringify([...CORE71, 'took_ms']),
+    '71 log: ok row hoists took_ms into the canonical slot');
+  eq(JSON.stringify(keysAt71('run.end')),
+    JSON.stringify([...CORE71, 'ok', 'summary', 'failures', 'advisories']),
+    '71 log: run.end key order');
+  const mys71 = parsed71.find((o) => o.step === 'mystery.step');
+  eq(mys71 !== undefined && mys71.label === 'mystery.step', true,
+    '71 log: unknown step label falls back to the step name');
+  eq(['run.start', 'run.end', 'preflight.capture', 'preflight.verify', 'mcuboot.enter',
+    'identify', 'slot.erase', 'upload', 'swap.verify', 'mcuboot.exit', 'version.confirm',
+    'halves.settle', 'brightness.restore', 'lighting.restore', 'verify.compare',
+    'slot.map', 'bundle.verify', 'bundle.restart', 'module.program', 'module.restart',
+    'module.verify'].every((s) => typeof STEP_LABELS[s] === 'string' && STEP_LABELS[s].length > 0),
+    true, '71 log: STEP_LABELS covers the spec step set (keyboard + module)');
+
+  /* ---- (b) lifecycle: one-run lock, freeze flag, unload guards ------------- */
+  eq(firmwareRunActive(), false, '71 life: flag starts false');
+  const map71 = new Map<'left' | 'right', NayaSession>();
+  const busy71 = { current: false };
+  const winCalls71: string[] = [];
+  const winFns71 = new Map<string, unknown>();
+  let winRefs71 = true;
+  const win71 = {
+    addEventListener(t: string, l: unknown): void { winCalls71.push(`add:${t}`); winFns71.set(t, l); },
+    removeEventListener(t: string, l: unknown): void {
+      winCalls71.push(`remove:${t}`);
+      if (winFns71.get(t) !== l) winRefs71 = false;
+    },
+  };
+  const log71b = beginFirmwareRun(
+    { sesRef: { current: map71 }, busyRef: busy71, win: win71 }, 'keyboard',
+  );
+  eq(log71b !== null, true, '71 life: beginRun returns the run log');
+  eq(firmwareRunActive() === true && busy71.current === true, true,
+    '71 life: flag true + busyRef held during the run');
+  eq(JSON.stringify(winCalls71), JSON.stringify(['add:beforeunload', 'add:pagehide']),
+    '71 life: begin registers both unload guards');
+  eq(beginFirmwareRun(
+    { sesRef: { current: map71 }, busyRef: busy71, win: win71 }, 'module',
+  ), null, '71 life: second beginRun while active refuses');
+  eq(firmwareRunActive() === true && busy71.current === true, true,
+    '71 life: refusal leaves the first run intact');
+  const handler71 = winFns71.get('beforeunload') as
+    (e: { preventDefault: () => void; returnValue?: unknown }) => void;
+  let pd71 = false;
+  const ev71 = { preventDefault: (): void => { pd71 = true; }, returnValue: undefined as unknown };
+  handler71(ev71);
+  eq(pd71 && ev71.returnValue === true, true,
+    '71 life: unload guard sets returnValue + preventDefault');
+  const ended71 = endFirmwareRun(false, 'aborted', ['swap.verify failed'], ['version changed']);
+  eq(ended71 !== null && ended71.done, true, '71 life: endRun finishes the active log');
+  const le71b = ended71!.events[ended71!.events.length - 1]!;
+  eq(le71b.step === 'run.end' && le71b.ok === false, true,
+    '71 life: run.end verdict on the active log');
+  eq(firmwareRunActive() === false && busy71.current === false, true,
+    '71 life: flag + busy released after endRun');
+  eq(JSON.stringify(winCalls71),
+    JSON.stringify(['add:beforeunload', 'add:pagehide', 'remove:beforeunload', 'remove:pagehide']),
+    '71 life: guards registered exactly while active (same handler refs)');
+  eq(winRefs71, true, '71 life: removeEventListener receives the registered handler refs');
+
+  const log71c = beginFirmwareRun({ sesRef: { current: map71 }, busyRef: busy71 }, 'module');
+  eq(log71c !== null && log71c.id.startsWith('module-') && firmwareRunActive(), true,
+    '71 life: default win (globalThis, guarded) — module run begins');
+  endFirmwareRun(true, 'ok');
+  eq(firmwareRunActive() === false && busy71.current === false, true,
+    '71 life: clean end of the module run');
+  eq(endFirmwareRun(true, 'noop'), null, '71 life: endRun without an active run is a no-op');
+  const busyFake71 = { current: true };
+  eq(beginFirmwareRun(
+    { sesRef: { current: map71 }, busyRef: busyFake71 }, 'module',
+  ), null, '71 life: begin refuses while busyRef is held by another op');
+
+  /* ---- (c) preflight capture + verify on scripted fakes -------------------- */
+  const macL71 = [0x11, 0x22, 0x33, 0x44, 0x55, 0x66];
+  const macR71 = [0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0x0f];
+  const keysA71 = [0x10, 0x20, 0x30, 0x40];
+  const keysB71 = [0x50, 0x60, 0x70, 0x80];
+  const ledsA71 = [0xb4, 0x00, 0x64, 0x11];
+  const replyL71 = (rq: Frame): Uint8Array => {
+    const k = `${rq.type.toString(16)}/${rq.c1.toString(16)}`;
+    const part = rq.payload[0] ?? 0;
+    const layer = rq.payload[1] ?? 0;
+    if (k === 'fe/2') return Uint8Array.from([0x00, 0x01, 0x02, 0x03, 0x04]); // v1.2.3.4
+    if (k === 'be/8') return Uint8Array.from(macL71);
+    if (k === 'be/2') return Uint8Array.from(macR71);
+    if (k === 'be/5') return Uint8Array.from([1, ...macR71]);
+    if (k === 'de/1') return Uint8Array.from([0x00, 0x00, 0x10, 0x00]); // absent Touch, L
+    if (k === '30/3') {
+      if (layer === 1) return Uint8Array.from([0x16]); // bank 1: nothing stored
+      return part === 0
+        ? Uint8Array.from([0x01, layer, ...keysA71])
+        : Uint8Array.from([0x00, layer, ...keysB71]);
+    }
+    if (k === '30/d') {
+      if (layer === 1) return Uint8Array.from([0x16]);
+      return Uint8Array.from([0x00, layer, ...ledsA71]);
+    }
+    return Uint8Array.from([0x00]);
+  };
+  const replyR71 = (rq: Frame): Uint8Array => {
+    const k = `${rq.type.toString(16)}/${rq.c1.toString(16)}`;
+    if (k === 'fe/2') return Uint8Array.from([0x00, 0x02, 0x00, 0x03, 0x04]); // v2.0.3.4
+    if (k === 'be/8') return Uint8Array.from(macR71);
+    if (k === 'be/2') return Uint8Array.from(macL71);
+    if (k === 'be/5') return Uint8Array.from([1, ...macL71]);
+    if (k === 'de/1') return Uint8Array.from([0x00, 0x00, 0x21, 0x00]); // absent Track, R
+    return Uint8Array.from([0x00]);
+  };
+  const scripted71 = (reply: (rq: Frame) => Uint8Array) => {
+    const reqs: Frame[] = [];
+    const queue: Uint8Array[] = [];
+    let waiter: (() => void) | null = null;
+    const reader = {
+      async read(): Promise<{ value?: Uint8Array; done?: boolean }> {
+        for (;;) {
+          const c = queue.shift();
+          if (c) return { value: c, done: false };
+          await new Promise<void>((res) => { waiter = res; });
+        }
+      },
+      cancel() { const w = waiter; waiter = null; w?.(); },
+      releaseLock() {},
+    };
+    const writer = {
+      async write(b: Uint8Array) {
+        const rq = verifyFrame(Uint8Array.from(b));
+        reqs.push(rq);
+        const resp = buildFrame(0x50, rq.type, rq.c0, rq.c1, reply(rq));
+        verifyFrame(resp);
+        setTimeout(() => { queue.push(resp); const w = waiter; waiter = null; w?.(); }, 5);
+      },
+      releaseLock() {},
+    };
+    const port = {
+      readable: { locked: false, getReader: () => reader },
+      writable: { getWriter: () => writer },
+      async open() {}, async setSignals() {}, async close() {},
+    };
+    return {
+      reqs,
+      session() {
+        const r = port.readable.getReader() as unknown as ReadableStreamDefaultReader<Uint8Array>;
+        const w = port.writable.getWriter() as unknown as WritableStreamDefaultWriter<Uint8Array>;
+        return new NayaSession(
+          port as unknown as SerialPort, 0x50,
+          new FrameReader(r), w, r,
+          async (b) => { await w.write(b); }, null,
+        );
+      },
+    };
+  };
+  const leftDev71 = scripted71(replyL71);
+  const rightDev71 = scripted71(replyR71);
+  const sessions71 = new Map<'left' | 'right', NayaSession>();
+  sessions71.set('left', leftDev71.session());
+  sessions71.set('right', rightDev71.session());
+
+  const lf71 = beginFirmwareRun(
+    { sesRef: { current: sessions71 }, busyRef: { current: false } }, 'keyboard',
+  );
+  eq(lf71 !== null, true, '71 preflight: run begun for the capture');
+  const cap71 = await capturePreflight(sessions71, ['left', 'right']);
+  eq(cap71.kind, 'preflight', '71 preflight: capture tagged kind preflight');
+  const hl71 = cap71.data.halves.left!;
+  const hr71 = cap71.data.halves.right!;
+  eq(hl71.fwHex, '00 01 02 03 04', '71 preflight: left fw fe/1002 raw hex');
+  eq((hl71.fwText ?? '').startsWith('v1.2.3.4'), true, '71 preflight: left fwText via fwVersionText');
+  eq(hl71.bleAddress, '11 22 33 44 55 66', '71 preflight: left BLE address (be/1008)');
+  eq(hl71.pairAddress, 'aa bb cc dd ee 0f', '71 preflight: left pair address (be/1002)');
+  eq(JSON.stringify(hl71.bondedPeers), JSON.stringify(['aa bb cc dd ee 0f']),
+    '71 preflight: left bond table (be/1005)');
+  eq(hl71.modulePresent === false && hl71.moduleType === 'none' && hl71.moduleHalfBit === 0, true,
+    '71 preflight: left module absent → none, halfBit L');
+  eq(hr71.fwHex, '00 02 00 03 04', '71 preflight: right fw read separately');
+  eq(hr71.bleAddress === 'aa bb cc dd ee 0f' && hr71.pairAddress === '11 22 33 44 55 66', true,
+    '71 preflight: right BLE identity mirrored');
+  eq(JSON.stringify(hr71.bondedPeers), JSON.stringify(['11 22 33 44 55 66']),
+    '71 preflight: right bond table');
+  eq(hr71.modulePresent === false && hr71.moduleType === 'none' && hr71.moduleHalfBit === 1, true,
+    '71 preflight: right module absent, halfBit R (undock-gate input, both halves)');
+  const kb71 = cap71.data.keymapBanks!;
+  eq(kb71['0'].keysStatus === 'ok' && kb71['0'].keysHex === '10 20 30 40 50 60 70 80', true,
+    '71 preflight: bank-0 keymap stitched from 2 multipart parts');
+  eq(kb71['0'].ledsStatus === 'ok' && kb71['0'].ledsHex === 'b4 00 64 11', true,
+    '71 preflight: bank-0 LED map captured');
+  eq(kb71['1'].keysStatus === 'empty' && kb71['1'].keysHex === null, true,
+    '71 preflight: bank-1 keymap empty → status, no hex');
+  eq(kb71['1'].ledsStatus === 'empty' && kb71['1'].ledsHex === null, true,
+    '71 preflight: bank-1 LED map empty → status, no hex');
+
+  const cnt71 = (d: { reqs: Frame[] }, t: number, c1: number): number =>
+    d.reqs.filter((r) => r.type === t && r.c1 === c1).length;
+  eq(cnt71(leftDev71, 0xfe, 0x02), 1, '71 preflight wire: left fe/1002 asked once');
+  eq(cnt71(leftDev71, 0xbe, 0x08) === 1 && cnt71(leftDev71, 0xbe, 0x02) === 1 &&
+      cnt71(leftDev71, 0xbe, 0x05) === 1, true,
+    '71 preflight wire: left BLE identity trio asked once each');
+  eq(cnt71(leftDev71, 0xde, 0x01), 1, '71 preflight wire: left de/1001 asked once');
+  eq(cnt71(leftDev71, 0x30, 0x03) === 3 && cnt71(leftDev71, 0x30, 0x0d) === 2, true,
+    '71 preflight wire: left keymap 2+1 parts, ledmap 1+1 (banks 0+1)');
+  eq(cnt71(rightDev71, 0xde, 0x01), 1,
+    '71 preflight wire: right de/1001 asked (undock gate covers both halves)');
+  eq(cnt71(rightDev71, 0x30, 0x03) === 0 && cnt71(rightDev71, 0x30, 0x0d) === 0, true,
+    '71 preflight wire: keymap/LED reads are LEFT-only (left owns dest 0x50)');
+
+  eq(/^[0-9a-f]{64}$/.test(cap71.sha256), true, '71 preflight: sha256 is 64-hex');
+  eq(cap71.serialized, stableStringify(cap71.data),
+    '71 preflight: serialized = stable-key-order serialization of the doc');
+  const note71 = lf71!.events.find((e) => e.phase === 'note' && e.step === 'preflight.capture');
+  eq(note71 !== undefined && note71!.artifact === 'preflight' && note71!.sha256 === cap71.sha256,
+    true, '71 preflight: artifact note in the run log carries the sha256');
+  eq((await verifyPreflight(cap71)).ok, true, '71 preflight: re-serialize verify passes');
+  endFirmwareRun(true, 'preflight captured');
+
+  // determinism: a fresh capture over fresh fakes with the SAME world yields
+  // the same sha256 (no timestamps inside the artifact doc)
+  const leftDev71b = scripted71(replyL71);
+  const rightDev71b = scripted71(replyR71);
+  const sessions71b = new Map<'left' | 'right', NayaSession>();
+  sessions71b.set('left', leftDev71b.session());
+  sessions71b.set('right', rightDev71b.session());
+  const cap71b = await capturePreflight(sessions71b, ['left', 'right']);
+  eq(cap71b.sha256, cap71.sha256, '71 preflight: same world → same sha256 (stable serialization)');
+  const mut71 = JSON.parse(JSON.stringify(cap71)) as typeof cap71;
+  mut71.data.halves.left!.fwHex = 'ff';
+  const vr71 = await verifyPreflight(mut71);
+  eq(vr71.ok === false && (vr71.reason ?? '').length > 0, true,
+    '71 preflight: mutated snapshot fails verify with a reason');
+  await sessions71.get('left')!.close();
+  await sessions71.get('right')!.close();
+  await sessions71b.get('left')!.close();
+  await sessions71b.get('right')!.close();
+})();
 
 void main();
