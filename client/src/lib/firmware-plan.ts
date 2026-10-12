@@ -67,11 +67,25 @@ function groupReleaseOrder(cat: FwCatalog, label: string): number | null {
   return best;
 }
 
-/* Strict dot-version tuple ('3.41.0' → [3,41,0]); null when the string is
- * not one (anchored pattern, no nesting — safe). */
+/* Naya devices report a leading-zero form ('v0.3.41.0' on fe/1002,
+ * 'v0.2.3.3' on de/1008) while the catalog labels bare semver ('3.41.0',
+ * '2.3.3') — live-proven on real hardware on both verbs (phase 10,
+ * 2026-10-13). Drop one leading zero component when it leaves a valid
+ * remainder with a nonzero head; genuine '0.0.x' is never mangled. */
+export function stripNayaLeadingZero(v: string): string {
+  if (!v.startsWith('0.')) return v;
+  const rest = v.slice(2);
+  if (!/^\d+(\.\d+)*$/.test(rest)) return v;
+  const head = rest.split('.')[0];
+  return head !== undefined && head !== '' && head !== '0' ? rest : v;
+}
+
+/* Strict dot-version tuple ('3.41.0' → [3,41,0], Naya '0.3.41.0' → [3,41,0]);
+ * null when the string is not one (anchored pattern, no nesting — safe). */
 function parseDotVersion(v: string): number[] | null {
-  if (!/^\d+(\.\d+)*$/.test(v)) return null;
-  return v.split('.').map((p) => Number.parseInt(p, 10));
+  const s = stripNayaLeadingZero(v);
+  if (!/^\d+(\.\d+)*$/.test(s)) return null;
+  return s.split('.').map((p) => Number.parseInt(p, 10));
 }
 
 function tupleCompare(a: number[], b: number[]): number {

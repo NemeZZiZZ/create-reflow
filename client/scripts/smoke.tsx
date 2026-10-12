@@ -22,7 +22,7 @@ import {
   FIRMWARE_SOURCE_BASE, newVault, fetchImage, fetchVersion,
 } from '../src/lib/firmware-fetch';
 import { NAYA_VID, RECOVERY_PIDS, pidInfo } from '../src/lib/firmware-plat';
-import { resolveKeyboardPlan, moduleBundles } from '../src/lib/firmware-plan';
+import { resolveKeyboardPlan, resolveModulePlan, moduleBundles } from '../src/lib/firmware-plan';
 import { checkFlashGate } from '../src/lib/firmware-interlocks';
 import type { KeyboardGateInput, ModuleGateInput } from '../src/lib/firmware-interlocks';
 import { FirmwareRunLog, STEP_LABELS, stableStringify } from '../src/lib/firmware-run-log';
@@ -5961,6 +5961,17 @@ void (async () => {
   eq(rReal69.failed.every((f) => f.reason.includes('nothing was written')), true,
     '69 fetchVersion real: every attempt stopped at the sha256 gate');
   eq(vReal69.count(), 0, '69 fetchVersion real: nothing written on total mismatch');
+
+  // Naya leading-zero device form (live-proven 2026-10-13: fe/1002 reports
+  // 'v0.3.41.0', de/1008 'v0.2.3.3', catalog labels '3.41.0'/'2.3.3') —
+  // the plan must resolve exactly as with the bare catalog form.
+  const nayaPlan69 = resolveModulePlan(cat69, '0.3.41.0', '0.2.3.3');
+  eq(nayaPlan69.target, '2.3.3', '69 module plan: Naya kb form resolves the newest bundle');
+  eq(nayaPlan69.bundleNewerThanKeyboard, false, '69 module plan: 3.41.0 meets the 3.40.0 range floor');
+  eq(nayaPlan69.unchanged, true, '69 module plan: Naya module form equals the 2.3.3 target');
+  eq(nayaPlan69.downgrade, false, '69 module plan: equal versions are not a downgrade');
+  const nayaDown69 = resolveModulePlan(cat69, '0.3.41.0', '0.2.3.3', '2.3.2');
+  eq(nayaDown69.downgrade, true, '69 module plan: 2.3.3 → 2.3.2 is a downgrade in Naya form too');
 })();
 
 // §70 firmware interlock gate: the full refusal matrix — every rule alone

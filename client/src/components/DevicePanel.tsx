@@ -3,6 +3,7 @@
 import { Badge } from "./ui/badge";
 import { Card, CardContent, CardHeader, CardTitle } from "./ui/card";
 import type { HalfSnapshot } from '@create-reflow/sdk';
+import { stripNayaLeadingZero } from '../lib/firmware-plan';
 
 export default function DevicePanel({
   title,
@@ -39,7 +40,7 @@ export default function DevicePanel({
           <span className="font-mono text-xs break-all">
             {!half.modPresent
               ? "absent"
-              : `${half.modType}${half.modFw ? ` fw ${half.modFw}` : ""}${
+              : `${half.modType}${half.modFw ? ` fw ${stripNayaLeadingZero(half.modFw.replace(/^v/, ""))}` : ""}${
                   half.modMv === null
                     ? ""
                     : ` ${half.modMv} mV (≈${half.modPctVal}% host-est)`

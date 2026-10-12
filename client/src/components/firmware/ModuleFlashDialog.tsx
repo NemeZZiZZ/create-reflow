@@ -28,7 +28,7 @@ import { Button } from '../ui/button';
 import { Checkbox } from '../ui/checkbox';
 import FlashTimeline, { currentAction, currentLabel, stepRows } from './FlashTimeline';
 import type { FwCatalog, FwEntry } from '../../lib/firmware-catalog';
-import { moduleBundles } from '../../lib/firmware-plan';
+import { moduleBundles, stripNayaLeadingZero } from '../../lib/firmware-plan';
 import type { Vault } from '../../lib/firmware-fetch';
 import type { HalfSnapshot } from '@create-reflow/sdk';
 import type { FlashRunStatus, ModuleForceType, StartModuleOpts } from '../../hooks/useFirmwareFlash';
@@ -46,18 +46,21 @@ export interface ModuleFlash {
   exportLog: () => void;
 }
 
-/* HalfSnapshot.fw ('v3.41.0.0') → a comparable dot-version string, null
- * when unreadable (display-side only — the authoritative checks happen in
- * the procedure). */
+/* HalfSnapshot.fw ('v0.3.41.0' Naya form, live-proven 2026-10-13) → a
+ * comparable dot-version string ('3.41.0'), null when unreadable
+ * (display-side only — the authoritative checks happen in the
+ * procedure). */
 function kbVersionOf(fw: string): string | null {
   const t = (fw.split('  [')[0] ?? '').trim();
   if (t === '' || t === '—') return null;
   const raw = t.startsWith('v') ? t.slice(1) : t;
-  return /^\d+(\.\d+)*$/.test(raw) ? raw : null;
+  if (!/^\d+(\.\d+)*$/.test(raw)) return null;
+  return stripNayaLeadingZero(raw);
 }
 
 function tupleOf(v: string): number[] | null {
-  return /^\d+(\.\d+)*$/.test(v) ? v.split('.').map((p) => Number.parseInt(p, 10)) : null;
+  const s = stripNayaLeadingZero(v);
+  return /^\d+(\.\d+)*$/.test(s) ? s.split('.').map((p) => Number.parseInt(p, 10)) : null;
 }
 
 function tupleAtLeast(a: number[], b: number[]): boolean {
@@ -114,6 +117,10 @@ export default function ModuleFlashDialog({
   const bundleNewer = kbFrom !== null && (kbTuple === null || !bundleEnabled(kbFrom));
 
   const dockedType = left.modPresent ? left.modType : 'none';
+  /* Dock-reported module fw ('v0.2.3.3' Naya form) → catalog form ('2.3.3')
+   * for display; the raw value never compares (dockTuple strips too). */
+  const shownModFw =
+    left.modFw !== null ? stripNayaLeadingZero(left.modFw.replace(/^v/, '')) : null;
   const typeUnknown = dockedType !== 'Touch' && dockedType !== 'Track' && dockedType !== 'Tune';
   const inVault = entry !== null && vault.has(entry.blobSha256);
   const target = label;
@@ -137,7 +144,7 @@ export default function ModuleFlashDialog({
     blockers.push(`the ${label} bundle needs keyboard ${kbFrom} or newer — update the keyboard first`);
   }
   if (entry !== null && !inVault) blockers.push(`the ${label} bundle is not downloaded yet`);
-  if (downgrade && !allowOlder) blockers.push(`this is a downgrade from ${left.modFw ?? 'the running version'} — consent required`);
+  if (downgrade && !allowOlder) blockers.push(`this is a downgrade from ${shownModFw ?? 'the running version'} — consent required`);
 
   const canStart = blockers.length === 0 && !running && target !== null;
 
@@ -220,7 +227,7 @@ export default function ModuleFlashDialog({
                 </span>
                 <Badge variant={left.modPresent ? 'ok' : 'bad'}>
                   {left.modPresent
-                    ? `docked · ${dockedType}${left.modFw !== null ? ` · fw ${left.modFw}` : ''}`
+                    ? `docked · ${dockedType}${shownModFw !== null ? ` · fw ${shownModFw}` : ''}`
                     : 'nothing docked'}
                 </Badge>
               </div>

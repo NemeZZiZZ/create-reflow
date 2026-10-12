@@ -74,7 +74,7 @@ import { FirmwareRunLog, sha256Hex, stableStringify } from '../lib/firmware-run-
 import type { RunEvent } from '../lib/firmware-run-log';
 import { loadFirmwareCatalog } from '../lib/firmware-catalog';
 import type { FwEntry } from '../lib/firmware-catalog';
-import { resolveKeyboardPlan, resolveModulePlan } from '../lib/firmware-plan';
+import { resolveKeyboardPlan, resolveModulePlan, stripNayaLeadingZero } from '../lib/firmware-plan';
 import type { HalfPlan, ModulePlan } from '../lib/firmware-plan';
 import { checkFlashGate } from '../lib/firmware-interlocks';
 import type { KeyboardGateInput, ModuleGateInput } from '../lib/firmware-interlocks';
@@ -769,11 +769,13 @@ function fwTextOf(payload: Uint8Array): string {
   return t.startsWith('v') ? t.slice(1) : t;
 }
 
-/* Strict dot-version tuple ('3.41.0' → [3, 41, 0]); null when the string is
- * not one (non-versioned labels like 'NayaFlow 1.14.3' never compare). */
+/* Strict dot-version tuple ('3.41.0' → [3, 41, 0], Naya '0.3.41.0' →
+ * [3, 41, 0]); null when the string is not one (non-versioned labels
+ * like 'NayaFlow 1.14.3' never compare). */
 function dotTupleOf(v: string): number[] | null {
-  if (!/^\d+(\.\d+)*$/.test(v)) return null;
-  return v.split('.').map((p) => Number.parseInt(p, 10));
+  const s = stripNayaLeadingZero(v);
+  if (!/^\d+(\.\d+)*$/.test(s)) return null;
+  return s.split('.').map((p) => Number.parseInt(p, 10));
 }
 
 /* The device reports four components ('3.41.0.0'), the catalog labels three
@@ -1704,13 +1706,16 @@ function typeMatches(decoded: string | null, want: ModuleForceType): boolean {
 }
 
 /* 'v3.41.0.0  [hex]' → '3.41.0.0' when it is a clean dot-version, else
- * null ('—', 'NayaFlow 1.14.3', unreadable — never compared). */
+ * null ('—', 'NayaFlow 1.14.3', unreadable — never compared). The Naya
+ * leading-zero form ('v0.3.41.0', live-proven 2026-10-13) normalizes to
+ * the catalog form ('3.41.0'). */
 function labelOfFwText(t: string | null): string | null {
   if (t === null) return null;
   const s = (t.split('  [')[0] ?? '').trim();
   if (s === '' || s === '—') return null;
   const raw = s.startsWith('v') ? s.slice(1) : s;
-  return dotTupleOf(raw) !== null ? raw : null;
+  if (dotTupleOf(raw) === null) return null;
+  return stripNayaLeadingZero(raw);
 }
 
 /* de/1008 — the dock-reported module firmware ('v2.3.3.0'), null when the
