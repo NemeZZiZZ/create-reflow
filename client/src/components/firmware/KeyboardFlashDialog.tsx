@@ -27,7 +27,7 @@ import {
 import { Badge } from '../ui/badge';
 import { Button } from '../ui/button';
 import { Checkbox } from '../ui/checkbox';
-import FlashTimeline, { currentLabel, stepRows } from './FlashTimeline';
+import FlashTimeline, { currentAction, currentLabel, stepRows } from './FlashTimeline';
 import type { FwCatalog } from '../../lib/firmware-catalog';
 import { keyboardVersions } from '../../lib/firmware-catalog';
 import { fetchVersion } from '../../lib/firmware-fetch';
@@ -130,6 +130,18 @@ export default function KeyboardFlashDialog({
     setDlNote(null);
   }
 
+  // Closing the dialog un-answers every per-attempt consent: a backed-out
+  // session must never reopen with "there is no way back" pre-answered (or
+  // with a stale download notice). Event-driven — all close paths (Close
+  // button, X, Escape, outside click) funnel through here.
+  function closeDialog(): void {
+    setConsent(false);
+    setAllowOlder(false);
+    setDl('idle');
+    setDlNote(null);
+    onOpenChange(false);
+  }
+
   // Per-half PID (→ generation) comes from the granted app-mode ports while
   // they still speak app mode. Re-listed when the dialog opens or a half's
   // connection flips; a failed listing leaves nulls (the row then reports
@@ -184,7 +196,16 @@ export default function KeyboardFlashDialog({
       : null;
   const planBySide = new Map<Side, HalfPlan>(plan?.map((h) => [h.side, h]));
 
-  const selected = plan?.filter((h) => pick[h.side]) ?? [];
+  // A half counts as chosen only when its checkbox is checked AND its plan
+  // resolves to an image: a checkbox disabled for "no image for this
+  // half+generation" (unidentified half, gen without a catalog row) never
+  // becomes a target — the procedure supports target subsets, so flashing
+  // exactly the one attached half stays reachable.
+  const chosen = (side: Side): boolean => {
+    const h = planBySide.get(side);
+    return pick[side] && h !== undefined && h.image !== null;
+  };
+  const selected = plan?.filter((h) => chosen(h.side)) ?? [];
   const missing =
     label !== null &&
     selected.length > 0 &&
@@ -202,7 +223,6 @@ export default function KeyboardFlashDialog({
         typeof e.historyPath === 'string' &&
         e.historyPath !== '',
     );
-  const noImage = selected.some((h) => h.image === null);
   const anyUnknown = selected.some((h) => h.unknownCurrent);
   const anyDowngrade = selected.some((h) => h.downgrade);
   const anyDocked = halves.left.modPresent || halves.right.modPresent;
@@ -214,7 +234,6 @@ export default function KeyboardFlashDialog({
     label !== null &&
     selected.length > 0 &&
     connectedSel &&
-    !noImage &&
     selected.every((h) => h.image !== null && vault.has(h.image.blobSha256)) &&
     !(anyUnknown && !consent) &&
     !(anyDowngrade && !allowOlder) &&
@@ -222,15 +241,13 @@ export default function KeyboardFlashDialog({
 
   const startTitle = !connectedSel
     ? `Connect the ${disconnected.map((h) => h.side).join(' and ')} half${disconnected.length === 1 ? '' : 's'} first`
-    : noImage
-      ? 'No catalog image for this half and version'
-      : missing
-        ? 'Download the selected version first'
-        : anyUnknown && !consent
-          ? 'Consent is required for an unknown running version'
-          : anyDowngrade && !allowOlder
-            ? 'Downgrades need the older-version consent'
-            : 'Run the keyboard flash procedure';
+    : missing
+      ? 'Download the selected version first'
+      : anyUnknown && !consent
+        ? 'Consent is required for an unknown running version'
+        : anyDowngrade && !allowOlder
+          ? 'Downgrades need the older-version consent'
+          : 'Run the keyboard flash procedure';
 
   async function downloadSelected(): Promise<void> {
     if (catalog === null || label === null) return;
@@ -260,14 +277,10 @@ export default function KeyboardFlashDialog({
   }
 
   const rows = stepRows(flash.events);
-  // The headline: the current step — replaced by the action prompt only
-  // while that action is the newest thing happening (a resolved grant/replug
-  // prompt hands the headline back to the step that followed it).
-  const lastEv = flash.events[flash.events.length - 1];
-  const actionLive =
-    running && lastEv !== undefined && lastEv.phase === 'action'
-      ? (lastEv.detail ?? null)
-      : null;
+  // The headline: the current step, replaced by the action prompt only
+  // while that prompt is the newest event (currentAction resolves it the
+  // moment any step reports after it).
+  const actionLive = running ? currentAction(flash.events) : null;
   const headline = actionLive ?? currentLabel(rows);
   const endEv =
     flash.log !== null
@@ -287,7 +300,9 @@ export default function KeyboardFlashDialog({
     <Dialog
       open={open}
       onOpenChange={(v) => {
-        if (!running) onOpenChange(v); // non-dismissable while a run is in flight
+        if (running) return; // non-dismissable while a run is in flight
+        if (v) onOpenChange(true);
+        else closeDialog();
       }}
     >
       <DialogContent
@@ -339,7 +354,11 @@ export default function KeyboardFlashDialog({
                   >
                     <Checkbox
                       className="mt-0.5"
-                      checked={pick[side]}
+                      // Reflects the EFFECTIVE choice: an unusable half is
+                      // disabled and shows unchecked, even though the stored
+                      // pick survives (it re-applies automatically if a
+                      // version with an image for this half is selected).
+                      checked={chosen(side)}
                       disabled={running || h === undefined || h.image === null}
                       onCheckedChange={(v) => setPick((p) => ({ ...p, [side]: v === true }))}
                       aria-label={`Flash the ${side} half`}
@@ -524,7 +543,7 @@ export default function KeyboardFlashDialog({
         )}
 
         <DialogFooter>
-          <Button variant="outline" disabled={running} onClick={() => onOpenChange(false)}>
+          <Button variant="outline" disabled={running} onClick={closeDialog}>
             {running ? 'Running…' : 'Close'}
           </Button>
           {!running && (

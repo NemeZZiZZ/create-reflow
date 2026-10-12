@@ -91,14 +91,16 @@ export function currentLabel(rows: readonly FlashRow[]): string {
   return '';
 }
 
-/* The latest action-phase event's text — the replug/grant prompt that
- * replaces the headline while the procedure waits on the user. */
+/* The live action prompt (replug/grant) — the text that replaces the
+ * headline. Encodes the resolves-when-superseded rule: the prompt answers
+ * only while the action is the NEWEST event in the stream; the moment any
+ * step reports after it, the prompt is resolved and the caller falls back
+ * to currentLabel. A stale prompt from earlier in the run is never
+ * returned, so consumers can lift this naively. */
 export function currentAction(events: readonly RunEvent[]): string | null {
-  for (let i = events.length - 1; i >= 0; i--) {
-    const e = events[i]!;
-    if (e.phase === 'action') return e.detail ?? null;
-  }
-  return null;
+  const last = events[events.length - 1];
+  if (last === undefined || last.phase !== 'action') return null;
+  return last.detail ?? null;
 }
 
 const MARK: Record<FlashRow['phase'], string> = {
