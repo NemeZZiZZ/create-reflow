@@ -8483,7 +8483,10 @@ void (async () => {
     let dead = false;
     const storedBytes = (): Uint8Array => {
       const v = o.stage() === 'before' ? o.storedOld : o.storedNew;
-      return Uint8Array.from([0x00, ...v]); // [00, VER...] — moduleFileFwVersion reads p[1..4]
+      // Live de/100a body (2026-10-13, 3 identical pairs): [flags 00, 00, 00,
+      // maj, min, patch] — 6 bytes; moduleFileFwVersion reads p[3..5]. The
+      // tuples carry a vestigial 4th element (the pre-fix [00, VER...] model).
+      return Uint8Array.from([0x00, 0x00, 0x00, v[0]!, v[1]!, v[2]!]);
     };
     const dockFwBytes = (): Uint8Array => {
       if (o.stage() === 'before') return Uint8Array.from([0x00, o.typeByte, 0x00, ...o.dockOld]);
@@ -8695,6 +8698,26 @@ void (async () => {
   };
   const OLD_BUNDLE: [number, number, number, number] = [2, 2, 0, 0]; // 2.2.0 — the dock's old fw/stored
   const NEW_BUNDLE: [number, number, number, number] = [2, 3, 3, 0]; // 2.3.3 — the catalog's newest
+
+  // de/100a decode pins (live layout 2026-10-13): the device answers
+  // [flags 00, 00, 00, maj, min, patch]; the pre-fix [00, VER...] model
+  // misread every stored version as unreadable.
+  {
+    const mkSes75 = (stored: [number, number, number, number]): NayaSession =>
+      mkApp75({
+        pid: 0x064, kbFw: KB_FW75, stage: () => 'before' as Stage75,
+        storedOld: stored, storedNew: NEW_BUNDLE,
+        dockOld: OLD_BUNDLE, dockNew: NEW_BUNDLE,
+        typeByte: 0x20, afterFwupTypeByte: 0x20,
+        sink: { reqs: [], writes: [] },
+      }).session();
+    eq(await mkSes75(OLD_BUNDLE).moduleFileFwVersion(), '2.2.0',
+      '75 de/100a: 6-byte live layout decodes the old stored bundle');
+    eq(await mkSes75(NEW_BUNDLE).moduleFileFwVersion(), '2.3.3',
+      '75 de/100a: live vector [00,00,00,02,03,03] decodes to 2.3.3');
+    eq(await mkSes75([0, 0, 0, 0] as [number, number, number, number]).moduleFileFwVersion(), null,
+      '75 de/100a: all-zero version reads as blank/unreadable');
+  }
 
   // Left-only module case builder. World re-enumeration chain:
   //   enter → appBefore dies, boot port in;

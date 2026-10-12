@@ -663,8 +663,14 @@ export class NayaSession {
     try {
       const f = await this.cmd(0xde, 0x10, 0x0a, new Uint8Array([0]));
       const p = f.payload;
-      if (p.length < 5 || p[1] === 0) return null;
-      return `${p[1]}.${p[2]}.${p[3]}.${p[4]}`;
+      // Live reply (2026-10-13, 3 identical pairs): payload =
+      // [flags 00, 00, 00, 02, 03, 03] — the version is p[3..5]; the
+      // de/1008-style p[1]===0 'absent' guard misfires here (p[1] is
+      // version padding, this verb has no addr byte). All-zero
+      // version = blank/unwritten bundle → null (KB firmware/modules).
+      if (p.length < 6) return null;
+      if (p[3] === 0 && p[4] === 0 && p[5] === 0) return null;
+      return `${p[3]}.${p[4]}.${p[5]}`;
     } catch {
       return null;
     }
