@@ -28,8 +28,12 @@ import type { KeyboardGateInput, ModuleGateInput } from '../src/lib/firmware-int
 import { FirmwareRunLog, STEP_LABELS, stableStringify } from '../src/lib/firmware-run-log';
 import type { RunEvent } from '../src/lib/firmware-run-log';
 import {
-  beginFirmwareRun, capturePreflight, endFirmwareRun, firmwareRunActive, verifyPreflight,
+  beginFirmwareRun, capturePreflight, endFirmwareRun, firmwareRunActive, startKeyboardRun,
+  verifyPreflight,
 } from '../src/hooks/useFirmwareFlash';
+import { defaultSerialWorld } from '../src/lib/serial-world';
+import type { PortWithInfo, SerialWorld } from '../src/lib/serial-world';
+import type { Vault } from '../src/lib/firmware-fetch';
 import * as fs from 'fs';
 import * as path from 'path';
 import { keyIconName, shortLabel } from '../src/lib/key-icon-map';
@@ -6129,6 +6133,11 @@ void (async () => {
 // 30/100d multipart — the reads whose caches useFlash's auto-backup
 // serializes; the left half owns dest 0x50). Artifact = stable-key-order
 // serialization + WebCrypto sha256, logged as a `preflight` artifact note.
+/* §71 owns the module-level one-run lock while it runs; later procedure
+ * sections (§72+) must not interleave with it. It signals completion here
+ * and they await the signal before their first beginFirmwareRun. */
+let signal71done: (() => void) | null = null;
+const after71: Promise<void> = new Promise<void>((r) => { signal71done = r; });
 void (async () => {
   /* ---- (a) run log shape -------------------------------------------------- */
   const CORE71 = ['ts', 'elapsed_ms', 'step', 'label', 'phase'];
@@ -6429,6 +6438,544 @@ void (async () => {
   await sessions71.get('right')!.close();
   await sessions71b.get('left')!.close();
   await sessions71b.get('right')!.close();
+  signal71done?.();
+})();
+
+// §72 keyboard flash-one-side core (startKeyboardRun): mcuboot entry through
+// the app-session fake, scripted fake mcuboot line-ports behind an injectable
+// SerialWorld (getPorts only — the smoke never opens a user gesture), probe
+// discipline (first imageState answer wins, silent port → bootloader.console
+// note), gate refusal BEFORE any upload write, upload progress + slot.erase
+// ok on first chunk ack, swap.verify re-poll with early success, injected
+// millisecond timeouts everywhere (the core never sleeps on raw constants).
+// Fixtures: mkSmp68-style SMP line ports (streams rebuild on open — the port
+// re-opens per probe like real WebSerial), §71-style NayaSession fakes whose
+// writer triggers re-enumeration when the ee/10ae enter frame lands.
+void (async () => {
+  const msg72 = (e: unknown): string => (e instanceof Error ? e.message : String(e));
+  const hex32 = (u8: Uint8Array): string => toHex(u8).replace(/ /g, '');
+  const last72 = (log: FirmwareRunLog): RunEvent => log.events[log.events.length - 1]!;
+
+  // ---- serial-world seam: node-safe, throws lazily -------------------------
+  {
+    const w = defaultSerialWorld();
+    eq(typeof w.getPorts === 'function' && typeof w.requestPort === 'function', true,
+      '72 world: defaultSerialWorld() constructs node-safe (no navigator access at build)');
+    let gpErr = '';
+    try { await w.getPorts(); } catch (e) { gpErr = msg72(e); }
+    eq(/WebSerial/.test(gpErr), true, '72 world: getPorts rejects lazily with the no-WebSerial reason');
+    let rpErr = '';
+    try { await w.requestPort([{ usbVendorId: NAYA_VID }]); } catch (e) { rpErr = msg72(e); }
+    eq(/WebSerial/.test(rpErr), true, '72 world: requestPort rejects lazily with the same reason');
+  }
+
+  // ---- fixtures --------------------------------------------------------------
+  const portInfo72 = (pid: number): { usbVendorId: number; usbProductId: number } =>
+    ({ usbVendorId: NAYA_VID, usbProductId: pid });
+  // world-only stub (the core reads only getInfo off app ports pre-enter)
+  const stubPort72 = (pid: number): PortWithInfo =>
+    ({ getInfo: () => portInfo72(pid) }) as unknown as PortWithInfo;
+
+  // Stateful fake mcuboot line-port. Streams REBUILD on open(): the flash
+  // core opens/closes the port per probe (SmpLink owns locks), like a real
+  // WebSerial port that is closed and re-opened. State machine: fresh →
+  // uploaded (slot-1 = sha) → swapped (slot-0 = sha); alreadySwapped lands
+  // straight in swapped (the uploadImage swap-already-happened readback).
+  const mkBoot72 = (o: {
+    pid: number;
+    pre0: Uint8Array;
+    sha: Uint8Array;
+    alreadySwapped?: boolean;
+    swapAfterMs?: number | null;
+    failRc?: number | null;
+  }) => {
+    const linesWritten: string[] = [];
+    let reads = 0;
+    let stage: 'fresh' | 'uploaded' | 'swapped' = 'fresh';
+    let total = -1;
+    let controller: ReadableStreamDefaultController<Uint8Array> | null = null;
+    let pending = '';
+    let streams: {
+      readable: ReadableStream<Uint8Array>;
+      writable: WritableStream<Uint8Array>;
+    } | null = null;
+    const build = (): void => {
+      pending = '';
+      const enc = new TextEncoder();
+      const dec = new TextDecoder();
+      const readable = new ReadableStream<Uint8Array>({
+        start(c) { controller = c; },
+      });
+      const push = (t: string, delayMs = 5): void => {
+        setTimeout(() => { controller?.enqueue(enc.encode(t)); }, delayMs);
+      };
+      const writable = new WritableStream<Uint8Array>({
+        write(b) {
+          pending += dec.decode(b);
+          for (;;) {
+            const i = pending.indexOf('\n');
+            if (i < 0) break;
+            const line = pending.slice(0, i + 1);
+            pending = pending.slice(i + 1);
+            linesWritten.push(line);
+            const rq = parseSmpChunks(line).frames[0];
+            if (!rq) continue;
+            if (rq.op === SMP.OP_READ && rq.group === SMP.GROUP_IMAGE && rq.cmdId === SMP.ID_IMAGE_STATE) {
+              reads++;
+              const slots = stage === 'swapped'
+                ? [
+                    { slot: 0, hash: o.sha, flags: ['active', 'confirmed'] },
+                    { slot: 1, hash: o.pre0, flags: [] },
+                  ]
+                : stage === 'uploaded'
+                  ? [
+                      { slot: 0, hash: o.pre0, flags: ['active', 'confirmed'] },
+                      { slot: 1, hash: o.sha, flags: ['pending'] },
+                    ]
+                  : [
+                      { slot: 0, hash: o.pre0, flags: ['active', 'confirmed'] },
+                      { slot: 1, hash: o.pre0, flags: [] },
+                    ];
+              push(encodeSmpLine(SMP.OP_READ_RSP, rq.group, rq.seq, rq.cmdId, cborEncode({ rc: 0, images: slots })));
+              continue;
+            }
+            if (rq.op === SMP.OP_READ && rq.group === SMP.GROUP_IMAGE && rq.cmdId === SMP.ID_SLOT_INFO) {
+              // rc 8 ENOTSUP — no numbering map → the ASSUMED-2 rule
+              push(encodeSmpLine(SMP.OP_READ_RSP, rq.group, rq.seq, rq.cmdId, cborEncode({ rc: 8 })));
+              continue;
+            }
+            if (rq.op === SMP.OP_WRITE && rq.group === SMP.GROUP_IMAGE && rq.cmdId === SMP.ID_IMAGE_UPLOAD) {
+              const v = cborDecode(rq.payload).value as { off: number; len?: number; data: Uint8Array };
+              if (o.failRc !== null && o.failRc !== undefined) {
+                push(encodeSmpLine(SMP.OP_READ_RSP, rq.group, rq.seq, rq.cmdId, cborEncode({ rc: o.failRc })));
+                continue;
+              }
+              if (v.off === 0) total = typeof v.len === 'number' ? v.len : -1;
+              const end = v.off + v.data.length;
+              if (total >= 0 && end >= total) {
+                stage = o.alreadySwapped === true ? 'swapped' : 'uploaded';
+                const delay = o.swapAfterMs;
+                if (typeof delay === 'number') setTimeout(() => { stage = 'swapped'; }, delay);
+              }
+              push(encodeSmpLine(SMP.OP_READ_RSP, rq.group, rq.seq, rq.cmdId, cborEncode({ off: end, rc: 0 })));
+              continue;
+            }
+          }
+        },
+      });
+      streams = { readable, writable };
+    };
+    build();
+    const port = {
+      get readable() { return streams?.readable ?? null; },
+      get writable() { return streams?.writable ?? null; },
+      async open() { build(); },
+      async setSignals() {},
+      async close() { streams = null; },
+      getInfo: () => portInfo72(o.pid),
+    };
+    const isWrite = (l: string, group: number, cmdId: number): boolean => {
+      const f = parseSmpChunks(l).frames[0];
+      return !!f && f.op === SMP.OP_WRITE && f.group === group && f.cmdId === cmdId;
+    };
+    return {
+      port: port as unknown as PortWithInfo,
+      linesWritten,
+      reads: (): number => reads,
+      uploadCount: (): number => linesWritten.filter((l) => isWrite(l, SMP.GROUP_IMAGE, SMP.ID_IMAGE_UPLOAD)).length,
+      osResetCount: (): number => linesWritten.filter((l) => isWrite(l, SMP.GROUP_OS, SMP.ID_OS_RESET)).length,
+    };
+  };
+
+  // The OTHER CDC interface: a log port that swallows SMP frames (never
+  // answers) and babbles console text. Same rebuildable-stream contract.
+  const mkLogPort72 = (pid: number, banner: string) => {
+    const linesWritten: string[] = [];
+    let streams: {
+      readable: ReadableStream<Uint8Array>;
+      writable: WritableStream<Uint8Array>;
+    } | null = null;
+    const build = (): void => {
+      const readable = new ReadableStream<Uint8Array>({
+        start(c) { setTimeout(() => { c.enqueue(new TextEncoder().encode(banner)); }, 5); },
+      });
+      const dec = new TextDecoder();
+      const writable = new WritableStream<Uint8Array>({
+        write(b) { linesWritten.push(dec.decode(b)); },
+      });
+      streams = { readable, writable };
+    };
+    build();
+    const port = {
+      get readable() { return streams?.readable ?? null; },
+      get writable() { return streams?.writable ?? null; },
+      async open() { build(); },
+      async setSignals() {},
+      async close() { streams = null; },
+      getInfo: () => portInfo72(pid),
+    };
+    return { port: port as unknown as PortWithInfo, linesWritten };
+  };
+
+  // Injected SerialWorld: mutable port list behind getPorts.
+  const mkWorld72 = (initial: PortWithInfo[]): { world: SerialWorld; list: PortWithInfo[] } => {
+    const list = [...initial];
+    return {
+      list,
+      world: {
+        getPorts: async () => [...list],
+        requestPort: async () => { throw new Error('no user gesture in the smoke world'); },
+      },
+    };
+  };
+
+  // App-mode session fake (§71 scripted71 shape) + re-enumeration: the
+  // writer fires onEnter 30 ms after the ee/10ae enter frame lands.
+  const scripted72 = (
+    reply: (rq: Frame) => Uint8Array,
+    onEnter?: () => void,
+  ) => {
+    const reqs: Frame[] = [];
+    const queue: Uint8Array[] = [];
+    let waiter: (() => void) | null = null;
+    const reader = {
+      async read(): Promise<{ value?: Uint8Array; done?: boolean }> {
+        for (;;) {
+          const c = queue.shift();
+          if (c) return { value: c, done: false };
+          await new Promise<void>((res) => { waiter = res; });
+        }
+      },
+      cancel() { const w = waiter; waiter = null; w?.(); },
+      releaseLock() {},
+    };
+    const writer = {
+      async write(b: Uint8Array) {
+        const rq = verifyFrame(Uint8Array.from(b));
+        reqs.push(rq);
+        if (rq.type === 0xee && rq.c0 === 0x10 && rq.c1 === 0xae) setTimeout(() => onEnter?.(), 30);
+        const resp = buildFrame(0x50, rq.type, rq.c0, rq.c1, reply(rq));
+        verifyFrame(resp);
+        setTimeout(() => { queue.push(resp); const w = waiter; waiter = null; w?.(); }, 5);
+      },
+      releaseLock() {},
+    };
+    const port = {
+      readable: { locked: false, getReader: () => reader },
+      writable: { getWriter: () => writer },
+      async open() {}, async setSignals() {}, async close() {},
+    };
+    return {
+      reqs,
+      session() {
+        const r = port.readable.getReader() as unknown as ReadableStreamDefaultReader<Uint8Array>;
+        const w = port.writable.getWriter() as unknown as WritableStreamDefaultWriter<Uint8Array>;
+        return new NayaSession(
+          port as unknown as SerialPort, 0x50,
+          new FrameReader(r), w, r,
+          async (b) => { await w.write(b); }, null,
+        );
+      },
+    };
+  };
+  const replyApp72 = (o: { docked?: boolean }) => (rq: Frame): Uint8Array => {
+    const k = `${rq.type.toString(16)}/${rq.c1.toString(16)}`;
+    if (k === 'ee/ae') return Uint8Array.from([0]); // half acks, then reboots
+    if (k === 'fe/2') return Uint8Array.from([0, 1, 2, 3, 4]);
+    if (k === 'be/8') return Uint8Array.from([0x11, 0x22, 0x33, 0x44, 0x55, 0x66]);
+    if (k === 'be/2') return Uint8Array.from([0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0x0f]);
+    if (k === 'be/5') return Uint8Array.from([1, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0x0f]);
+    if (k === 'de/1') {
+      return o.docked === true
+        ? Uint8Array.from([0x00, 0x01, 0x10, 0x00]) // Touch present (undock-gate trip)
+        : Uint8Array.from([0x00, 0x00, 0x10, 0x00]); // absent
+    }
+    if (k === '30/3') {
+      const part = rq.payload[0] ?? 0;
+      const layer = rq.payload[1] ?? 0;
+      if (layer === 1) return Uint8Array.from([0x16]);
+      return part === 0
+        ? Uint8Array.from([0x01, layer, 0x10, 0x20, 0x30, 0x40])
+        : Uint8Array.from([0x00, layer, 0x50, 0x60, 0x70, 0x80]);
+    }
+    if (k === '30/d') {
+      if ((rq.payload[1] ?? 0) === 1) return Uint8Array.from([0x16]);
+      return Uint8Array.from([0x00, rq.payload[1] ?? 0, 0xb4, 0x00, 0x64, 0x11]);
+    }
+    return Uint8Array.from([0x00]);
+  };
+
+  // ---- catalog picks: newest dual-side gen-A label + an older running entry
+  const cat72 = await loadFirmwareCatalog();
+  let label72: string | undefined;
+  let entryL72: FwEntry | null = null;
+  let entryR72: FwEntry | null = null;
+  for (const v of keyboardVersions(cat72)) {
+    const l = findKeyboardImage(cat72, 'left', 'A', v.label);
+    const r = findKeyboardImage(cat72, 'right', 'A', v.label);
+    if (l === null || r === null) continue;
+    if (typeof l.plaintextSha256 !== 'string' || typeof r.plaintextSha256 !== 'string') continue;
+    label72 = v.label;
+    entryL72 = l;
+    entryR72 = r;
+    break;
+  }
+  let runEntry72: FwEntry | null = null; // an OLDER left/A entry = the running image
+  for (const v of keyboardVersions(cat72)) {
+    if (v.label === label72) continue;
+    const l = findKeyboardImage(cat72, 'left', 'A', v.label);
+    if (l === null || typeof l.plaintextSha256 !== 'string') continue;
+    if (typeof l.releaseOrder === 'number' && entryL72 !== null &&
+        typeof entryL72.releaseOrder === 'number' && l.releaseOrder < entryL72.releaseOrder) {
+      runEntry72 = l;
+      break;
+    }
+  }
+  eq(label72 !== undefined && entryL72 !== null && entryR72 !== null && runEntry72 !== null, true,
+    '72 fixture: newest dual-side gen-A label with plaintext hashes + an older running entry exist');
+  const pre072 = hexToBytes(runEntry72!.plaintextSha256!)!; // left slot-0 while running the older image
+  const pre0R72 = hexToBytes(entryR72!.plaintextSha256!)!; // right slot-0 (unchanged case)
+  const foreign72 = Uint8Array.from({ length: 32 }, (_, i) => 0x70 + i);
+  const shaL72 = hexToBytes(entryL72!.plaintextSha256 ?? entryL72!.blobSha256)!;
+  const shaR72 = hexToBytes(entryR72!.plaintextSha256 ?? entryR72!.blobSha256)!;
+  const bytes72 = (seed: number): Uint8Array => Uint8Array.from({ length: 700 }, (_, i) => (i * 13 + seed) & 0xff);
+  const mkVault72 = (): Vault => {
+    const v = newVault();
+    v.set(entryL72!, bytes72(3));
+    v.set(entryR72!, bytes72(5));
+    return v;
+  };
+
+  // Injected timeouts — millisecond scale; nothing in the core may sleep on
+  // raw constants (swapMs 400 < settle+poll of a SECOND re-poll, so any
+  // early-success path is proven by finishing at all).
+  const T72 = { pollMs: 15, enterMs: 1200, swapMs: 400, rePollMs: 10, probeMs: 150 };
+
+  const mkCase72 = (o: {
+    foreign?: boolean; // slot-0 hash matches no catalog entry
+    failRc?: number | null;
+    alreadySwapped?: boolean;
+    swapAfterMs?: number | null;
+    boots?: { left?: Array<'smp' | 'log'>; right?: Array<'smp'> };
+    docked?: 'left' | 'right' | null;
+    grant?: 'reject' | null;
+    enterMs?: number;
+  }) => {
+    const appL = stubPort72(0x064);
+    const appR = stubPort72(0x0c8);
+    const w = mkWorld72([appL, appR]);
+    const bootL = mkBoot72({
+      pid: 0x06f,
+      pre0: o.foreign === true ? foreign72 : pre072,
+      sha: shaL72,
+      alreadySwapped: o.alreadySwapped,
+      swapAfterMs: o.swapAfterMs ?? null,
+      failRc: o.failRc ?? null,
+    });
+    const bootR = mkBoot72({ pid: 0x0d3, pre0: pre0R72, sha: shaR72, swapAfterMs: o.swapAfterMs ?? null });
+    const logL = mkLogPort72(0x06f, 'Naya bootloader log port — verbosity high\n');
+    const onEnter = (side: 'left' | 'right'): void => {
+      const i = w.list.indexOf(side === 'left' ? appL : appR);
+      if (i >= 0) w.list.splice(i, 1); // the app port is gone — OS re-enumerated
+      const boots = side === 'left' ? (o.boots?.left ?? ['smp']) : (o.boots?.right ?? ['smp']);
+      for (const b of boots) {
+        if (side === 'left' && b === 'smp') w.list.push(bootL.port);
+        if (side === 'left' && b === 'log') w.list.push(logL.port);
+        if (side === 'right' && b === 'smp') w.list.push(bootR.port);
+      }
+    };
+    const leftDev = scripted72(replyApp72({ docked: o.docked === 'left' }), () => onEnter('left'));
+    const rightDev = scripted72(replyApp72({ docked: o.docked === 'right' }), () => onEnter('right'));
+    const sesRef = { current: new Map<'left' | 'right', NayaSession>() };
+    sesRef.current.set('left', leftDev.session());
+    sesRef.current.set('right', rightDev.session());
+    let grantCalls = 0;
+    const deps = {
+      sesRef,
+      busyRef: { current: false },
+      world: w.world,
+      vault: mkVault72(),
+      timeouts: { ...T72, ...(o.enterMs !== undefined ? { enterMs: o.enterMs } : {}) },
+      ...(o.grant === 'reject'
+        ? {
+            grantPort: async (): Promise<PortWithInfo> => {
+              grantCalls++;
+              throw new Error('user cancelled the port picker');
+            },
+          }
+        : {}),
+    };
+    return {
+      deps, bootL, bootR, logL, leftDev, rightDev,
+      grantCalls: (): number => grantCalls,
+    };
+  };
+  const leftOnly72 = [{ side: 'left' as const, label: label72! }];
+  const kbOpts72 = { allowOlder: false, acceptUnknown: false, consentedUnknown: false };
+
+  /* Cases run SEQUENTIALLY (each owns the module-level one-run lock for its
+   * duration) and only after §71 has released it. Each case is its own
+   * function so a refused run (null) fails its assert instead of crashing
+   * the remaining sections. */
+  const begin72 = async (name: string, c: ReturnType<typeof mkCase72>, opts: Parameters<typeof startKeyboardRun>[1]): Promise<FirmwareRunLog | null> => {
+    const log = await startKeyboardRun(c.deps, opts);
+    if (log === null) eq(false, true, `${name}: run began (null = refused — the one-run lock was held)`);
+    return log;
+  };
+
+  // ---- (a) happy path, targets listed [right, left], run goes LEFT first ----
+  const caseA72 = async (): Promise<void> => {
+    const c = mkCase72({ boots: { left: ['smp'], right: ['smp'] }, swapAfterMs: 40 });
+    const log = await begin72('72(a)', c, {
+      targets: [{ side: 'right', label: label72! }, { side: 'left', label: label72! }],
+      ...kbOpts72,
+    });
+    if (log === null) return;
+    const enterOkL = log.events.findIndex((e) => e.step === 'mcuboot.enter' && e.phase === 'ok' && e.side === 'left');
+    const identOkL = log.events.findIndex((e) => e.step === 'identify' && e.phase === 'ok' && e.side === 'left');
+    const eraseOkL = log.events.findIndex((e) => e.step === 'slot.erase' && e.phase === 'ok' && e.side === 'left');
+    const progL = log.events.findIndex((e) => e.step === 'upload' && e.phase === 'progress' && e.side === 'left');
+    const swapOkL = log.events.findIndex((e) => e.step === 'swap.verify' && e.phase === 'ok' && e.side === 'left');
+    eq(enterOkL >= 0 && enterOkL < identOkL && identOkL < eraseOkL && eraseOkL < progL && progL < swapOkL, true,
+      '72(a) order: mcuboot.enter → identify → slot.erase(ok) → upload(progress) → swap.verify(ok)');
+    const firstEnter = log.events.find((e) => e.step === 'mcuboot.enter' && e.phase === 'start');
+    eq(firstEnter?.side, 'left', '72(a) left-first: targets listed [right, left], the run starts with LEFT');
+    eq(c.leftDev.reqs.filter((f) => f.type === 0xee && f.c0 === 0x10 && f.c1 === 0xae).length, 1,
+      '72(a) ON: exactly one ee/10ae through the left app-session fake');
+    eq(c.rightDev.reqs.filter((f) => f.type === 0xee && f.c0 === 0x10 && f.c1 === 0xae).length, 1,
+      '72(a) ON: right half entered too (second target)');
+    const le72a = last72(log);
+    eq(le72a.step === 'run.end' && le72a.ok === true, true, '72(a) run.end ok');
+    eq(log.events.filter((e) => e.step === 'swap.verify' && e.phase === 'ok').length, 2,
+      '72(a) both halves swap-verified');
+    eq(c.bootL.uploadCount(), 2, '72(a) two upload chunk writes (700 B = 512 + 188) on the left bootloader');
+    eq(c.bootL.osResetCount(), 0, '72(a) no os reset from the core (mcuboot.exit belongs to T7/T8)');
+    eq(c.bootL.reads() >= 4, true, '72(a) probe + upload pre/post reads + a swap re-poll happened');
+    const sm72 = log.events.find((e) => e.step === 'slot.map' && e.phase === 'ok');
+    eq(sm72 !== undefined && /assumed/.test(sm72.detail ?? ''), true,
+      '72(a) slot map: rc 8 → no map, ASSUMED image id noted');
+    const note72 = log.events.find((e) => e.step === 'identify' && e.phase === 'note' && e.side === 'left');
+    eq(note72 !== undefined && note72.sha256 === hex32(pre072), true,
+      '72(a) identify note carries the slot-0 hash as arm token');
+    eq(log.events.some((e) => e.step === 'gate.check' && e.phase === 'ok' && e.side === 'right'), true,
+      '72(a) gate passed on live values for the right half too');
+  };
+
+  // ---- (b) foreign running hash → gate refusal, ZERO upload writes ----------
+  const caseB72 = async (): Promise<void> => {
+    const c = mkCase72({ foreign: true, boots: { left: ['smp'] } });
+    const log = await begin72('72(b)', c, { targets: leftOnly72, ...kbOpts72 });
+    if (log === null) return;
+    eq(last72(log).step === 'run.end' && last72(log).ok === false, true,
+      '72(b) run fails on the foreign running hash');
+    const gf = log.events.find((e) => e.step === 'gate.check' && e.phase === 'fail');
+    eq(gf !== undefined && /consent required/.test(gf.detail ?? ''), true,
+      '72(b) gate refusal: unknown current firmware needs consent');
+    eq(c.bootL.uploadCount(), 0, '72(b) ZERO upload writes on the bootloader port');
+    eq(log.events.some((e) => e.step === 'upload'), false, '72(b) upload never started');
+  };
+
+  // ---- (c) upload rc≠0 abort: run fails, no rescue (T8), no swap.verify -----
+  const caseC72 = async (): Promise<void> => {
+    const c = mkCase72({ failRc: 5, boots: { left: ['smp'] } });
+    const log = await begin72('72(c)', c, { targets: leftOnly72, ...kbOpts72 });
+    if (log === null) return;
+    eq(last72(log).step === 'run.end' && last72(log).ok === false, true, '72(c) run fails on rc≠0');
+    const uf = log.events.find((e) => e.step === 'upload' && e.phase === 'fail');
+    eq(uf !== undefined && /rc 5/.test(uf.detail ?? ''), true, '72(c) upload rc≠0 surfaces as the upload failure');
+    eq(c.bootL.uploadCount(), 1, '72(c) exactly one chunk write attempted (abort on the first rc≠0)');
+    eq(c.bootL.osResetCount(), 0, '72(c) rescue path not yet (T8): no os reset sent');
+    eq(log.events.some((e) => e.step === 'rescue'), false, '72(c) no rescue step events');
+    eq(log.events.some((e) => e.step === 'swap.verify'), false, '72(c) swap.verify never started');
+    eq(log.events.some((e) => e.step === 'gate.check' && e.phase === 'ok'), true,
+      '72(c) the gate had passed before the abort');
+  };
+
+  // ---- (d) probe discipline: silent log port first, answering port second ---
+  const caseD72 = async (): Promise<void> => {
+    const c = mkCase72({ boots: { left: ['log', 'smp'] }, swapAfterMs: 40 });
+    const log = await begin72('72(d)', c, { targets: leftOnly72, ...kbOpts72 });
+    if (log === null) return;
+    eq(last72(log).step === 'run.end' && last72(log).ok === true, true,
+      '72(d) probe discipline lands on the answering port — run completes');
+    eq(c.bootL.uploadCount(), 2, '72(d) upload went to the ANSWERING port');
+    const logUpload72 = c.logL.linesWritten.some((l) => {
+      const f = parseSmpChunks(l).frames[0];
+      return !!f && f.op === SMP.OP_WRITE && f.group === SMP.GROUP_IMAGE && f.cmdId === SMP.ID_IMAGE_UPLOAD;
+    });
+    eq(logUpload72, false, '72(d) the silent port saw probes only — no upload writes (it is re-probed each swap re-poll)');
+    eq(c.logL.linesWritten.length >= 1, true,
+      '72(d) the silent port was probed (its silence is what the console tap records)');
+    const con = log.events.find((e) => e.step === 'bootloader.console');
+    eq(con !== undefined && /log port/.test(con.detail ?? ''), true,
+      '72(d) silent port console text surfaces as a bootloader.console note');
+  };
+
+  // ---- (e) swap-already-happened: slot-0 == target sha at the post-upload
+  //      readback → swap.verify accepts without any reset loop ----------------
+  const caseE72 = async (): Promise<void> => {
+    const c = mkCase72({ alreadySwapped: true, boots: { left: ['smp'] } });
+    const log = await begin72('72(e)', c, { targets: leftOnly72, ...kbOpts72 });
+    if (log === null) return;
+    eq(last72(log).step === 'run.end' && last72(log).ok === true, true,
+      '72(e) run completes — swap already happened during the upload readback');
+    const sv = log.events.find((e) => e.step === 'swap.verify' && e.phase === 'ok');
+    eq(sv !== undefined && /slot-0/.test(sv.detail ?? ''), true,
+      '72(e) swap.verify ok: slot-0 == target sha observed on a re-poll');
+    eq(c.bootL.osResetCount(), 0, '72(e) no reset loop — pure observation');
+    eq(c.bootL.reads() >= 4, true, '72(e) the swap re-poll re-read image state');
+  };
+
+  // ---- (f) no port appears, injected grant mechanism rejects → clear copy ---
+  const caseF72 = async (): Promise<void> => {
+    const c = mkCase72({ boots: { left: [] }, grant: 'reject' });
+    const log = await begin72('72(f)', c, { targets: leftOnly72, ...kbOpts72 });
+    if (log === null) return;
+    const act = log.events.find((e) => e.phase === 'action');
+    eq(act !== undefined && act.step === 'mcuboot.enter' && /grant/.test(act.detail ?? ''), true,
+      '72(f) action event asks the user to grant the bootloader port');
+    eq(c.grantCalls(), 1, '72(f) the injected grant mechanism was awaited');
+    const le72f = last72(log);
+    eq(le72f.step === 'run.end' && le72f.ok === false && /grant/.test(le72f.summary ?? ''), true,
+      '72(f) grant rejection fails the run with clear copy');
+  };
+
+  // ---- (g) no port appears, NO grant mechanism → bounded fail, no action ----
+  const caseG72 = async (): Promise<void> => {
+    const c = mkCase72({ boots: { left: [] }, enterMs: 90 });
+    const t072g = Date.now();
+    const log = await begin72('72(g)', c, { targets: leftOnly72, ...kbOpts72 });
+    if (log === null) return;
+    const dt72g = Date.now() - t072g;
+    const le72g = last72(log);
+    eq(le72g.step === 'run.end' && le72g.ok === false && /replug/.test(le72g.summary ?? ''), true,
+      '72(g) no grant mechanism + no port → clear replug copy');
+    eq(log.events.some((e) => e.phase === 'action'), false, '72(g) no action event without a grant mechanism');
+    eq(dt72g < 10000, true, '72(g) the wait is bounded by the injected enterMs (never raw constants)');
+  };
+
+  // ---- (h) module docked → refuse before anything moves ---------------------
+  const caseH72 = async (): Promise<void> => {
+    const c = mkCase72({ docked: 'left', boots: { left: ['smp'] } });
+    const log = await begin72('72(h)', c, { targets: leftOnly72, ...kbOpts72 });
+    if (log === null) return;
+    const le72h = last72(log);
+    eq(le72h.step === 'run.end' && le72h.ok === false && /undock/.test(le72h.summary ?? ''), true,
+      '72(h) docked module refuses the keyboard flash');
+    eq(c.leftDev.reqs.some((f) => f.type === 0xee), false, '72(h) no bootloader entry on the dock refusal');
+    eq(log.events.some((e) => e.step === 'mcuboot.enter' && e.phase === 'start'), false,
+      '72(h) the refusal lands during preflight — no per-side steps started');
+  };
+
+  await after71; // §71 owns the one-run lock while it runs — never interleave
+  await caseA72();
+  await caseB72();
+  await caseC72();
+  await caseD72();
+  await caseE72();
+  await caseF72();
+  await caseG72();
+  await caseH72();
 })();
 
 void main();
