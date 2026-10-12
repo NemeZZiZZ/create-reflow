@@ -4,6 +4,10 @@
  * store; stays a text-only recipe, never a button), be/1004 (UNPAIR ALL —
  * drops every Bluetooth bond including computers; text-only repair).
  *
+ * Firmware flashing (Phase 9) does not ride this guard: its SMP traffic
+ * goes over a procedure-only, consent-gated lane — SmpLink writes raw
+ * lines on its own port and NayaSession writes never carry SMP frames.
+ *
  * Verdicts (checked, allowed — NOT banned):
  * - fe/1008 keyscan test-mode toggle: benign one-byte SET ([0x01] on /
  *   [0x00] off). Reversible by sending the opposite byte; no erase, no

@@ -7,11 +7,11 @@ export default {
     "Both halves type, but the peripheral half is dark and its replies look hollow.",
   details: [
     "Seen when the halves run different firmware: key events still flow (the split link is up), but the peripheral half's lighting desyncs and its aux replies come back thin.",
-    "Fix is on the vendor side: this app does not flash firmware.",
+    "Fix: flash both halves to the same version — the Firmware tab does it in one run (both halves picked by default, left first).",
   ],
   steps: [
     "Compare the two firmware versions in the Devices tab — they must match.",
-    "Flash BOTH halves to the same version with the vendor tooling (NayaFlow / NayaCore).",
+    "Flash both halves to the same version in the Firmware tab — pick the version once; the run flashes each half in turn.",
     "Reconnect both halves and Refresh.",
   ],
 } satisfies TroubleEntry;

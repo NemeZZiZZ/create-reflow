@@ -422,6 +422,20 @@ refs for `special:1` — an imported MO(2) is counted `unknown` on re-export
     multi-key chords out of behavior slots (OF shortcut_alias parity), and
     palette search gains a ranked scorer ported from OpenFlow. See the
     app-shortcuts notes below.
+12. **SMP firmware flashing (Phase 9)** — ✅ DONE 2026-10-12 (commits
+     8f566d4..41c2d10 + the plan commit 38c7dad + this docs commit).
+     Browser-side firmware flashing over the MCUboot SMP protocol,
+     ported from OpenFlow's uploader: the SMP line codec + `SmpDevice`
+     op layer (`sdk/src/smp.ts`), the vendored firmware catalog with
+     sha256-gated downloads, the interlock gate (arm-token, slot/side/
+     size caps, consent rules), the keyboard flash procedure — mcuboot
+     entry, SMP upload, swap verify, post-flash return, stranded rescue —
+     with a live run-log timeline, and the module bundle procedure
+     (upload + MOD_FWUP programming, replug UX). The wire-guard block
+     list is untouched (SMP rides its own consent-gated lane); the
+     bootloader-parked/firmware-mismatch KB entries now point at the
+     Firmware tab. Live first run is phase 10, owner-present. See the
+     firmware flashing notes below.
 
 ## BLE notes (Phase 6) — wire provenance & known limitations
 
@@ -442,9 +456,6 @@ refs for `special:1` — an imported MO(2) is counted `unknown` on re-export
 - **Phase-10 live-confirm**: negative-cache stickiness on transient
   failures (M2 — any non-BusySkip error records the negative);
   empty-payload replies count as ANSWERED by the cache (M3).
-- Stale wording, eventual cleanup: `firmware-mismatch.ts`'s "vendor
-  tooling" flash advice — this app flashes keymaps itself (FW flashing is
-  still external).
 
 ## Keyscan notes (Phase 7) — wire provenance & known limitations
 
@@ -530,6 +541,92 @@ refs for `special:1` — an imported MO(2) is counted `unknown` on re-export
   the palette (not OF's full unified-tabs sweep); per-app shortcut search
   is substring, not ranked; a failed corpus load memoizes the rejection —
   no retry until page reload.
+
+## Firmware flashing notes (Phase 9) — wire provenance & known limitations
+
+- **SMP line protocol** (`sdk/src/smp.ts`): mcumgr serial framing — TX
+  is `\x06\x09` + base64(`[u16BE len][8B header][payload][u16BE crc16]`)
+  + `\n`; an RX frame STARTS on a `\x06\x09` line and CONTINUES on
+  `\x04\x14` lines, any other line is device noise. Header is 8 bytes,
+  `>BBHHBB`: `[(version=1<<3)|op, flags, len, group, seq, cmdId]` —
+  version 1, flags always 0 from us. CRC16-XMODEM (init 0, poly 0x1021,
+  check vector "123456789" → 0x31C3) over header+payload. CBOR encode
+  is byte-stable — map keys sorted by UTF-8 bytes. Ops: READ=0 /
+  WRITE=2; groups: OS=0 / IMAGE=1; ids: echo=0, image-state=0,
+  upload=1, os-reset=5, slot-info=6.
+- **Upload loop**: fixed 512-B chunks; the offset-0 chunk carries
+  len+sha256 and runs on the erase-class timeout (90 s default — OF
+  measured 6-19 s stalls); the device's reply `off` is the authoritative
+  resume point, never the local counter. Post-upload read-back accepts
+  slot-1 == uploaded sha OR the swap-already-happened shape (new sha in
+  slot 0, captured pre-upload slot-0 hash in slot 1).
+- **Upload numbering** (`resolveUploadImageId`, `sdk/src/smp.ts`):
+  keyboard uploads image 2, modules image 4. A device slot-info map must
+  CONFIRM ("0,1"→2, "0,2"→4) — anything else throws, never guessed. No
+  map: keyboard falls back to the ASSUMED 2·image+slot+1 = 2; modules
+  only with an exactly-1 MiB bundle, else refusal.
+- **PID table** (`client/src/lib/firmware-plat.ts`): VID 0x37D1; left
+  app/mcuboot/third = 0x064/0x06F/0x07A, right = 0x0C8/0x0D3/0x0DE;
+  generation B = `pid & 0x1000`. RECOVERY_PIDS = {0x06F, 0x106F, 0x0D3,
+  0x10D3} — gen-B MCUboot is 0x106F/0x10D3 (the earlier 0x16F/0x1D3
+  draft was a transcription slip, fixed in e538328).
+- **Interlocks** (`client/src/lib/firmware-interlocks.ts`, OF §7
+  parity): held bytes must digest-match the catalog `blobSha256`;
+  non-flashable entries refuse with their `withheldBecause` text; the
+  arm token must equal the device-reported slot-0 hash of THIS run;
+  type cross — littlefs never a keyboard image, mcuboot never a module
+  image (`forceType` lifts ONLY that identification blocker); keyboard
+  image ≤ 663,552 B, module bundle exactly 1,048,576 B; keyboard flash
+  refuses with any module docked; module flash refuses with the right
+  half connected and requires the LEFT bay; downgrade needs `allowOlder`
+  (a releaseOrder comparison when versions are unknown); unknown current
+  firmware needs explicit consent; catalog entry side/generation must
+  match the PID-derived half; a module bundle newer than the keyboard
+  firmware is a pairing refusal.
+- **Module FWUP codes**: MOD_FWUP = `0xDE/0x1005` (dest 0x50), exactly
+  ONE payload byte, no reply — write-and-forget with a 2 s bounded wait
+  (`NayaSession.modFwup`, `sdk/src/naya.ts`). The type codes are
+  `FWUP_TYPES {Touch:1, Tune:2, Track:3}`
+  (`client/src/hooks/useFirmwareFlash.ts`) — deliberately NOT nayactl's
+  `MODULE_TYPES` order (TOUCH, TRACK, TUNE, FLOAT); the historical
+  mismatch gave a Tune the Track app. MODULE_FILE_FW_VERSION =
+  `0xDE/0x100A` reads the stored bundle version; its `[00, VER…]`
+  decode follows the de-family convention — live-unproven (below).
+- **Lane discipline**: SMP never rides the trouble-lane wire guard —
+  `SmpLink` writes its raw lines on its own port and `NayaSession`
+  writes never carry SMP frames. The firmware procedure's vendor writes
+  (MCUboot entry `ee/10ae`, MOD_FWUP `de/1005`) are dedicated
+  consent-gated methods; `assertWireAllowed` still blocks `ee/10be` /
+  `ee/10ae` in the troubleshooting lane, untouched
+  (`sdk/src/troubleshooting/wire-guard.ts`).
+- **Rescue**: every failure path — and a belt check before the verdict —
+  rescues halves the run parked: probe the ANSWERING bootloader port
+  (a silent twin never sees a write), os-reset, poll the app PID for up
+  to 5 min re-resetting on a 30 s cadence. Still parked ends in the
+  power-cycle note; rescue never softens the original failure verdict.
+  The bootloader-parked KB entry now points here.
+- **Smoke**: §67-§75 — SMP codecs + line link, device ops, catalog/
+  fetch/plan, the full interlock matrix, run log + lifecycle, keyboard
+  flash core, post-flash return, flash tail + failure path, module
+  procedure. Total 1697 ok / 0 FAIL, ~5.5 min wall.
+- **Phase-10 live unknowns** (each with its designed fallback):
+  WebSerial re-grant on PID change — fallback: the action-step
+  requestPort button in the dialog (grantPort → requestPort, VID 0x37D1),
+  and the power-cycle → app-mode rescue beyond that; real erase/swap
+  timings — fallback: the OF-measured spec defaults (erase 90 s, chunk
+  20 s, swap window 300 s vs ~100 s measured), every wait an injectable
+  timeout; CORS on the raw.githubusercontent.com image downloads —
+  fallback: the fetch fails cleanly into the per-image error copy (no
+  images held, nothing written); MOD_FWUP no-reply semantics —
+  fallback: the 2 s write-and-forget plus `module.verify` polling the
+  real dock state (de/1008) afterwards; the de/100A payload layout —
+  convention-based decode, phase-10 probe; the image-id-4 read-back
+  shape (what image-state reports for the uploaded module bundle) —
+  phase-10 probe; the Tune dock byte (de/1008 TYPE: Touch 0x10 / Track
+  0x20 live-proven, Tune's byte unseen) — fallback: an 'unknown' decode
+  is accepted when programming a Tune.
+- Live first run is phase 10, owner-present, with the recovery recipe
+  (rescue, power-cycle, unplug-replug) in the dialog copy.
 
 ## Ecosystem / diplomacy context
 
