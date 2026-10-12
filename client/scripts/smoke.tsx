@@ -5609,7 +5609,10 @@ void (async () => {
     eq(f68i.dst, 0x50, '68 enterMcuboot: dst = session dst');
     eq(f68i.src, 0x00, '68 enterMcuboot: sender 0x00, id 0x00');
     eq(f68i.id, 0x00, '68 enterMcuboot: id 0x00');
-    eq(f68i.payload.length, 0, '68 enterMcuboot: empty params');
+    eq(f68i.payload.length, 1, '68 enterMcuboot: one flags byte, OF-exact');
+    eq(f68i.payload[0], 0x00, '68 enterMcuboot: flags byte is 0x00');
+    eq(toHex(writes68i[0]!), 'aa 00 50 00 ee 03 10 ae 00 be 04',
+      '68 enterMcuboot: raw bytes byte-identical to OF nayactl build_message');
     eq(elapsed68i >= 1500 && elapsed68i < 3000, true,
       '68 enterMcuboot: silent device — bounded ~1500 ms wait then resolves (never roundtrip retries)');
     nayaWrites68.push(...writes68i);

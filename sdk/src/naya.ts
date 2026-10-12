@@ -608,16 +608,21 @@ export class NayaSession {
   // OF flash_procedure.py:597 (and module_procedure.py:356) sends through
   // the app-mode session to drop a running half into SMP bootloader mode.
   // RESET_DFU = 0x10BE is a DIFFERENT, never-sent op (both stay blocked in
-  // the troubleshooting wire lane). Deliberately NOT cmd()/roundtrip(): the
+  // the troubleshooting wire lane). The single 0x00 params byte is the
+  // flags byte OF's nayactl build_message always emits (data_size 3, not
+  // 2) — it is LOAD-BEARING, not padding: live-proven 2026-10-13 that
+  // without it the half treats ee/10ae as a plain reboot-to-app (session
+  // drops, half re-enumerates as the app PID, no MCUboot park), while
+  // OF's byte-identical frame parks it. Deliberately NOT cmd()/roundtrip(): the
   // half reboots mid-exchange, so the 6-try retry ladder would stall for
   // seconds past the reboot. One write, then a bounded wait (1500 ms) for
   // ANY valid frame — a reply or the timeout both resolve; what happens
   // next is the OS re-enumerating the port with the MCUboot PID, not a
   // reply on this session. The only new unguarded write on NayaSession.
   async enterMcuboot(): Promise<void> {
-    const req = buildFrame(this.dst, 0xee, 0x10, 0xae);
+    const req = buildFrame(this.dst, 0xee, 0x10, 0xae, new Uint8Array([0x00]));
     try {
-      this.ioLog.push({ dir: '>', type: 0xee, c0: 0x10, c1: 0xae, len: 0, hex: '' });
+      this.ioLog.push({ dir: '>', type: 0xee, c0: 0x10, c1: 0xae, len: 1, hex: '00' });
     } catch {
       /* logging must never break an exchange */
     }
