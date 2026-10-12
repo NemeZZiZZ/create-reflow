@@ -613,3 +613,241 @@ export class SmpLink {
     }
   }
 }
+
+// ---------------------------------------------------------------------------
+// SmpDevice — the op layer on top of SmpLink: the calls the firmware flash
+// procedure makes (port of OF firmware_upload.py:158-929 + recovery.py).
+// The link is wire-safe under concurrency (seq-keyed waiters) but the upload
+// loop still serializes its own transceives — every chunk awaits its reply
+// before the next write, never fire-and-forget.
+// ---------------------------------------------------------------------------
+
+export const SMP_DEFAULT_TIMEOUTS = {
+  chunkMs: 20_000, // per-chunk after the first
+  eraseMs: 90_000, // offset-0 chunk: full secondary-slot erase (measured 6-19 s stalls)
+  transceiveMs: 5_000, // everything that is not an upload chunk
+} as const;
+
+// One entry of the image-state reply: { images: [ { slot, hash, flags… } ] }.
+// flags are mcumgr strings — active / confirmed / pending / permanent.
+export interface ImageSlot {
+  slot: number;
+  hash: Uint8Array;
+  pending: boolean;
+  permanent: boolean;
+  confirmed: boolean;
+  active: boolean;
+}
+
+const u8Eq = (a: Uint8Array, b: Uint8Array): boolean => {
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
+  return true;
+};
+
+// A failed SMP op replies {"rc": N}; success bodies carry rc: 0 or omit it.
+function replyRc(m: { [key: string]: CborValue }): number | undefined {
+  const rc = m.rc;
+  return typeof rc === 'number' ? rc : undefined;
+}
+
+// Decode a reply body as a CBOR map (the only shape our ops answer with).
+function replyMap(payload: Uint8Array, what: string): { [key: string]: CborValue } {
+  const { value } = cborDecode(payload);
+  if (
+    typeof value !== 'object' || value === null ||
+    Array.isArray(value) || value instanceof Uint8Array
+  )
+    throw new Error(`smp ${what}: reply is not a map`);
+  return value as { [key: string]: CborValue };
+}
+
+const UPLOAD_CHUNK = 0x200; // 512 — min(remaining, 0x200), fixed (spec §1)
+
+export class SmpDevice {
+  private link: SmpLink;
+  private timeouts: { chunkMs: number; eraseMs: number; transceiveMs: number };
+
+  constructor(link: SmpLink, timeouts?: Partial<typeof SMP_DEFAULT_TIMEOUTS>) {
+    this.link = link;
+    this.timeouts = { ...SMP_DEFAULT_TIMEOUTS, ...timeouts };
+  }
+
+  // os/0 echo — the cheapest liveness probe (bootloader port discovery).
+  // Any reply at all means alive; the body is not inspected.
+  async echo(opts?: { timeoutMs?: number }): Promise<void> {
+    await this.link.transceive(
+      SMP.OP_READ, SMP.GROUP_OS, SMP.ID_ECHO, undefined,
+      { timeoutMs: opts?.timeoutMs ?? this.timeouts.transceiveMs },
+    );
+  }
+
+  // img/0 READ — image state: { images: [ { slot, hash, flags… } ] }.
+  async imageState(): Promise<ImageSlot[]> {
+    const rsp = await this.link.transceive(
+      SMP.OP_READ, SMP.GROUP_IMAGE, SMP.ID_IMAGE_STATE, undefined,
+      { timeoutMs: this.timeouts.transceiveMs },
+    );
+    const m = replyMap(rsp.payload, 'image-state');
+    const rc = replyRc(m);
+    if (rc !== undefined && rc !== 0) throw new Error(`smp image-state rc ${rc}`);
+    const images = m.images;
+    if (!Array.isArray(images)) return [];
+    const out: ImageSlot[] = [];
+    for (const raw of images) {
+      if (typeof raw !== 'object' || raw === null) continue;
+      const e = raw as { [key: string]: CborValue };
+      const flags = Array.isArray(e.flags)
+        ? e.flags.filter((f): f is string => typeof f === 'string')
+        : [];
+      out.push({
+        slot: typeof e.slot === 'number' ? e.slot : 0,
+        hash: e.hash instanceof Uint8Array ? e.hash : new Uint8Array(0),
+        pending: flags.includes('pending'),
+        permanent: flags.includes('permanent'),
+        confirmed: flags.includes('confirmed'),
+        active: flags.includes('active'),
+      });
+    }
+    return out;
+  }
+
+  // img/6 READ — the upload-image numbering map ("image,slot" → upload id).
+  // This bootloader answers ENOTSUP (rc 8) where the map doesn't exist —
+  // that returns null and callers fall back to the ASSUMED rules; they never
+  // guess against a map they never saw.
+  async slotInfoMap(): Promise<Map<string, number> | null> {
+    const rsp = await this.link.transceive(
+      SMP.OP_READ, SMP.GROUP_IMAGE, SMP.ID_SLOT_INFO, undefined,
+      { timeoutMs: this.timeouts.transceiveMs },
+    );
+    const m = replyMap(rsp.payload, 'slot-info');
+    const rc = replyRc(m);
+    if (rc === 8) return null; // ENOTSUP — no numbering map on this build
+    if (rc !== undefined && rc !== 0) throw new Error(`smp slot-info rc ${rc}`);
+    const out = new Map<string, number>();
+    for (const [k, v] of Object.entries(m)) {
+      if (typeof v === 'number') out.set(k, v);
+    }
+    return out;
+  }
+
+  // img/0 WRITE — set pending (and optionally confirm) the image with the
+  // given hash. OF parity: the hash is plaintextSha256 (what the device
+  // reports for a running image); no hash-less form is ever sent.
+  async setPending(hash: Uint8Array, confirm: boolean): Promise<void> {
+    const rsp = await this.link.transceive(
+      SMP.OP_WRITE, SMP.GROUP_IMAGE, SMP.ID_IMAGE_STATE,
+      cborEncode({ hash, confirm }),
+      { timeoutMs: this.timeouts.transceiveMs },
+    );
+    const rc = replyRc(replyMap(rsp.payload, 'set-pending'));
+    if (rc !== undefined && rc !== 0) throw new Error(`smp set-pending rc ${rc}`);
+  }
+
+  // os/5 WRITE — reboot into the (swapped) image. The reply usually never
+  // comes: the device reboots mid-reply, so a missing/late reply IS success.
+  async osReset(): Promise<void> {
+    try {
+      await this.link.transceive(
+        SMP.OP_WRITE, SMP.GROUP_OS, SMP.ID_OS_RESET, undefined,
+        { timeoutMs: this.timeouts.chunkMs },
+      );
+    } catch {
+      /* missing reply = success (device reboots mid-reply) */
+    }
+  }
+
+  // img/1 WRITE loop — the upload. First chunk {image, off:0, len, sha,
+  // data}; later {image, off, data}. The device reply's off is THE resume
+  // point (its ack is authoritative, never our own counter). The offset-0
+  // chunk runs on the erase-class timeout, the rest on the chunk timeout.
+  // After the last chunk: re-read image state — slot 1 must carry the
+  // uploaded sha, unless the swap already happened (slot 0 == sha AND
+  // slot 1 == the pre-upload slot-0 hash captured before the first chunk).
+  async uploadImage(
+    req: { bytes: Uint8Array; sha256: Uint8Array; imageId: number },
+    cb?: {
+      onProgress?(p: { sent: number; total: number }): void;
+      onFirstChunkAck?(): void;
+      shouldContinue?(): boolean;
+    },
+  ): Promise<void> {
+    const total = req.bytes.length;
+    // Pre-upload capture for the swap-already-happened acceptance below —
+    // the same imageState read the final verify uses.
+    const pre = await this.imageState();
+    const preSlot0 = pre.find((s) => s.slot === 0)?.hash ?? null;
+    let sent = 0;
+    let firstAcked = false;
+    for (;;) {
+      if (cb?.shouldContinue && !cb.shouldContinue()) throw new Error('aborted');
+      const off = sent;
+      const len = Math.min(total - off, UPLOAD_CHUNK);
+      const body: CborValue = off === 0
+        ? { image: req.imageId, off: 0, len: total, sha: req.sha256, data: req.bytes.subarray(0, len) }
+        : { image: req.imageId, off, data: req.bytes.subarray(off, off + len) };
+      const rsp = await this.link.transceive(
+        SMP.OP_WRITE, SMP.GROUP_IMAGE, SMP.ID_IMAGE_UPLOAD, cborEncode(body),
+        { timeoutMs: off === 0 ? this.timeouts.eraseMs : this.timeouts.chunkMs },
+      );
+      const m = replyMap(rsp.payload, 'upload');
+      const rc = replyRc(m);
+      if (rc !== undefined && rc !== 0)
+        throw new Error(`smp upload rc ${rc} at off ${off}`);
+      if (typeof m.off !== 'number') throw new Error('smp upload: reply missing off');
+      sent = m.off; // device authority — never trust the local counter
+      if (!firstAcked) {
+        firstAcked = true;
+        cb?.onFirstChunkAck?.();
+      }
+      cb?.onProgress?.({ sent, total });
+      if (sent >= total) break;
+    }
+    // Post-upload read-back (firmware_upload.py:859-890): primary rule is
+    // slot-1 == uploaded sha; the swap-already-happened shape (new hash in
+    // slot 0, armed image moved to slot 1) is accepted against the captured
+    // pre-upload slot-0 hash.
+    const post = await this.imageState();
+    const s0 = post.find((s) => s.slot === 0);
+    const s1 = post.find((s) => s.slot === 1);
+    if (s1 && u8Eq(s1.hash, req.sha256)) return;
+    if (
+      preSlot0 !== null && s0 && s1 &&
+      u8Eq(s0.hash, req.sha256) && u8Eq(s1.hash, preSlot0)
+    )
+      return;
+    throw new Error('smp upload verify: slot-1 hash != uploaded sha after upload');
+  }
+}
+
+// Upload-target numbering (firmware_upload.py:158-194, 304-353). A device-
+// provided map WINS: keyboard must confirm "0,1" → 2, modules "0,2" → 4 —
+// anything else throws. With no map at all: keyboard falls back to the
+// ASSUMED rule 2*image + slot + 1 (= 2 here, allowed by the spec decision);
+// modules may go unmapped only for an exactly-1 MiB bundle.
+export function resolveUploadImageId(
+  map: Map<string, number> | null,
+  kind: 'keyboard' | 'modules',
+  bundleSize?: number,
+): number {
+  if (kind === 'keyboard') {
+    if (map) {
+      const id = map.get('0,1');
+      if (id !== 2)
+        throw new Error(`keyboard upload id unconfirmed: map "0,1" → ${String(id)}, need 2`);
+      return 2;
+    }
+    return 2; // ASSUMED 2*image + slot + 1 for image 0, slot 1
+  }
+  if (map) {
+    const id = map.get('0,2');
+    if (id !== 4)
+      throw new Error(`modules upload id unconfirmed: map "0,2" → ${String(id)}, need 4`);
+    return 4;
+  }
+  if (bundleSize === 1_048_576) return 4; // exact 1 MiB bundle, unmapped allowed
+  throw new Error(
+    `modules upload id unmapped and bundle size ${String(bundleSize)} is not exactly 1 MiB`,
+  );
+}

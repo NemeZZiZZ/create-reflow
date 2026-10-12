@@ -604,6 +604,49 @@ export class NayaSession {
     await sleep(300);
   }
 
+  // MCUboot entry — vendor reset ee/10ae (nayactl RESET_MCU_BOOT), the op
+  // OF flash_procedure.py:597 (and module_procedure.py:356) sends through
+  // the app-mode session to drop a running half into SMP bootloader mode.
+  // RESET_DFU = 0x10BE is a DIFFERENT, never-sent op (both stay blocked in
+  // the troubleshooting wire lane). Deliberately NOT cmd()/roundtrip(): the
+  // half reboots mid-exchange, so the 6-try retry ladder would stall for
+  // seconds past the reboot. One write, then a bounded wait (1500 ms) for
+  // ANY valid frame — a reply or the timeout both resolve; what happens
+  // next is the OS re-enumerating the port with the MCUboot PID, not a
+  // reply on this session. The only new unguarded write on NayaSession.
+  async enterMcuboot(): Promise<void> {
+    const req = buildFrame(this.dst, 0xee, 0x10, 0xae);
+    try {
+      this.ioLog.push({ dir: '>', type: 0xee, c0: 0x10, c1: 0xae, len: 0, hex: '' });
+    } catch {
+      /* logging must never break an exchange */
+    }
+    try {
+      await this.writeFn(req);
+    } catch {
+      /* port died mid-write — the reboot is the goal */
+    }
+    if (this.onFrame) this.onFrame('>', req);
+    try {
+      const f = await this.fr.readFrame(1500);
+      try {
+        this.ioLog.push({
+          dir: '<',
+          type: f.type,
+          c0: f.c0,
+          c1: f.c1,
+          len: f.payload.length,
+          hex: hexHead(f.payload),
+        });
+      } catch {
+        /* observational */
+      }
+      if (this.onFrame) this.onFrame('<', f.raw);
+    } catch {
+      /* no reply within 1500 ms — expected: the half is already rebooting */
+    }
+  }
+
   // Per-session promise mutex: concurrent callers (1s presence tick, 30s
   // sweep, dumpAll, manual ops) share one port. Without serialization their
   // request/response pairs interleave and both roundtrips eat each other's

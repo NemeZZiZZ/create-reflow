@@ -28,6 +28,7 @@ import { parseKeyScanEvent, hostOsOp, sleep } from '@create-reflow/sdk';
 import type { KeyScanEvent } from '@create-reflow/sdk';
 import {
   SMP, crc16Xmodem, cborEncode, cborDecode, encodeSmpLine, parseSmpChunks, SmpLink,
+  SmpDevice, SMP_DEFAULT_TIMEOUTS, resolveUploadImageId,
 } from '@create-reflow/sdk';
 import type { SmpFrame, SmpSerialPortLike } from '@create-reflow/sdk';
 import Keyboard from '../src/components/Keyboard';
@@ -5101,6 +5102,570 @@ void (async () => {
     eq(closeErr67, '', '67 link: close() idempotent — double close never throws');
     eq(devD.closedCount(), 1, '67 link: port closed exactly once (second close is a no-op)');
   }
+})();
+
+// §68 smp device ops (SDK layer): echo / imageState / slot-info / setPending /
+// osReset on stateful scripted devices, the upload loop (chunk 512, first
+// chunk carries len+sha, later chunk neither, device-off authoritative,
+// rc-abort, erase-vs-chunk timeout classes, shouldContinue), the
+// resolveUploadImageId numbering matrix, and the enterMcuboot() wire pin —
+// exactly ONE ee/10ae frame, a bounded ~1500 ms wait resolving on any reply
+// or none (never the roundtrip retry ladder). §68-wide tripwire: no fixture
+// write log carries c0=0x10 c1=0xBE — RESET_DFU (ee/10be) is a different,
+// never-sent op.
+void (async () => {
+  const smpLines68: string[] = []; // every TX line across the §68 SMP fixtures
+  const nayaWrites68: Uint8Array[] = []; // every §68 Naya write (enterMcuboot)
+  const b64Bytes68 = (line: string): Uint8Array =>
+    new Uint8Array(Buffer.from(line.slice(2).replace(/\n$/, ''), 'base64'));
+
+  // Stateful scripted SMP device — §67's line-port shape plus a stateful
+  // closure (upload offset / post-upload flag) and an injectable reply delay
+  // (the erase-classification test). TX lines feed the §68-wide tripwire.
+  const mkSmp68 = (
+    respond: (rq: SmpFrame, push: (t: string, delayMs?: number) => void) => void,
+  ) => {
+    const linesWritten: string[] = [];
+    let controller: ReadableStreamDefaultController<Uint8Array> | null = null;
+    const readable = new ReadableStream<Uint8Array>({ start(c) { controller = c; } });
+    const push = (t: string, delayMs = 5) => {
+      setTimeout(() => { controller!.enqueue(new TextEncoder().encode(t)); }, delayMs);
+    };
+    let pending = '';
+    const writable = new WritableStream<Uint8Array>({
+      write(b) {
+        pending += new TextDecoder().decode(b);
+        for (;;) {
+          const i = pending.indexOf('\n');
+          if (i < 0) break;
+          const line = pending.slice(0, i + 1);
+          pending = pending.slice(i + 1);
+          linesWritten.push(line);
+          smpLines68.push(line);
+          const rq = parseSmpChunks(line).frames[0];
+          if (rq) respond(rq, push);
+        }
+      },
+    });
+    const port = { readable, writable, open() {}, setSignals() {}, close() {} };
+    return {
+      linesWritten,
+      open: () => SmpLink.open(port as unknown as SmpSerialPortLike, { settleMs: 2 }),
+    };
+  };
+
+  // Fixture hashes/bytes: patterns chosen so no adjacent 0x10 0xBE byte pair
+  // ever lands in a TX log — keeps the §68-wide DFU tripwire meaningful.
+  const pre0A68 = Uint8Array.from({ length: 32 }, (_, i) => 0x20 + i);
+  const old1A68 = Uint8Array.from({ length: 32 }, (_, i) => 0x90 + i);
+  // stateful image-state bodies: pre = old slot 1, post = uploaded sha in slot 1
+  const images68 = (
+    post: boolean,
+    pre0: Uint8Array,
+    uploaded: Uint8Array,
+    extraFlags?: string[],
+  ): { images: { slot: number; hash: Uint8Array; flags: string[] }[] } => ({
+    images: [
+      { slot: 0, hash: pre0, flags: extraFlags ?? ['active', 'confirmed'] },
+      { slot: 1, hash: post ? uploaded : old1A68, flags: [] },
+    ],
+  });
+  const rspLine68 = (
+    rq: SmpFrame,
+    payload: Uint8Array,
+    push: (t: string, delayMs?: number) => void,
+    delayMs = 5,
+  ): void => {
+    push(encodeSmpLine(SMP.OP_READ_RSP, rq.group, rq.seq, rq.cmdId, payload), delayMs);
+  };
+
+  // --- (a) echo round-trip --------------------------------------------------
+  {
+    const reqs68a: SmpFrame[] = [];
+    const dev68a = mkSmp68((rq, push) => {
+      reqs68a.push(rq);
+      rspLine68(rq, cborEncode({ rc: 0 }), push);
+    });
+    const link68a = await dev68a.open();
+    await new SmpDevice(link68a).echo();
+    eq(reqs68a.length, 1, '68 echo: one request on the wire');
+    eq(reqs68a[0]!.op, SMP.OP_READ, '68 echo: op READ');
+    eq(reqs68a[0]!.group, SMP.GROUP_OS, '68 echo: group OS');
+    eq(reqs68a[0]!.cmdId, SMP.ID_ECHO, '68 echo: id ECHO');
+    eq(toHex(reqs68a[0]!.payload), 'a0', '68 echo: default empty-map payload');
+    await link68a.close();
+  }
+
+  // --- (b) imageState parse: 2 slots, all four flags pinned ------------------
+  {
+    const slot0Hash68 = Uint8Array.from({ length: 32 }, (_, i) => 0x30 + i);
+    const slot1Hash68 = Uint8Array.from({ length: 32 }, (_, i) => 0x40 + i);
+    const dev68b = mkSmp68((rq, push) => {
+      rspLine68(rq, cborEncode({
+        rc: 0,
+        images: [
+          { slot: 0, hash: slot0Hash68, version: '1.2.3', bootable: true, flags: ['active', 'confirmed'] },
+          { slot: 1, hash: slot1Hash68, version: '9.9.9', bootable: true, flags: ['pending', 'permanent'] },
+        ],
+      }), push);
+    });
+    const link68b = await dev68b.open();
+    const slots68 = await new SmpDevice(link68b).imageState();
+    eq(slots68.length, 2, '68 imageState: 2 slots parsed');
+    eq(slots68[0]!.slot, 0, '68 imageState: slot 0 index');
+    eq(toHex(slots68[0]!.hash), toHex(slot0Hash68), '68 imageState: slot-0 hash bytes');
+    eq(slots68[0]!.active, true, '68 imageState: slot-0 active');
+    eq(slots68[0]!.confirmed, true, '68 imageState: slot-0 confirmed');
+    eq(slots68[0]!.pending, false, '68 imageState: slot-0 not pending');
+    eq(slots68[0]!.permanent, false, '68 imageState: slot-0 not permanent');
+    eq(slots68[1]!.slot, 1, '68 imageState: slot 1 index');
+    eq(toHex(slots68[1]!.hash), toHex(slot1Hash68), '68 imageState: slot-1 hash bytes');
+    eq(slots68[1]!.pending, true, '68 imageState: slot-1 pending');
+    eq(slots68[1]!.permanent, true, '68 imageState: slot-1 permanent');
+    eq(slots68[1]!.active, false, '68 imageState: slot-1 not active');
+    eq(slots68[1]!.confirmed, false, '68 imageState: slot-1 not confirmed');
+    await link68b.close();
+  }
+
+  // --- slot-info: reply map parsed; rc 8 (ENOTSUP) → null --------------------
+  {
+    const dev68s = mkSmp68((rq, push) => {
+      rspLine68(rq, cborEncode({ '0,1': 2, '0,2': 4 }), push);
+    });
+    const link68s = await dev68s.open();
+    const map68s = await new SmpDevice(link68s).slotInfoMap();
+    eq(map68s !== null && map68s.get('0,1') === 2 && map68s.get('0,2') === 4, true,
+      '68 slot-info: reply map parsed ("0,1"→2, "0,2"→4)');
+    await link68s.close();
+    const dev68n = mkSmp68((rq, push) => {
+      rspLine68(rq, cborEncode({ rc: 8 }), push);
+    });
+    const link68n = await dev68n.open();
+    eq(await new SmpDevice(link68n).slotInfoMap(), null,
+      '68 slot-info: rc 8 (ENOTSUP) → null');
+    await link68n.close();
+  }
+
+  // --- (c) upload happy path (2 chunks): first chunk len+sha, later neither,
+  // seq increments & 0xFF, progress + first-ack callbacks --------------------
+  {
+    const bytes68c = Uint8Array.from({ length: 700 }, (_, i) => (i * 7 + 3) & 0xff);
+    const sha68c = Uint8Array.from({ length: 32 }, (_, i) => 0x50 + i);
+    const reqs68c: SmpFrame[] = [];
+    const uploads68c: SmpFrame[] = [];
+    let post68c = false;
+    const progress68c: { sent: number; total: number }[] = [];
+    let firstAck68c = 0;
+    const dev68c = mkSmp68((rq, push) => {
+      reqs68c.push(rq);
+      if (rq.group === SMP.GROUP_IMAGE && rq.cmdId === SMP.ID_IMAGE_STATE) {
+        rspLine68(rq, cborEncode(images68(post68c, pre0A68, sha68c)), push);
+        return;
+      }
+      if (rq.group === SMP.GROUP_IMAGE && rq.cmdId === SMP.ID_IMAGE_UPLOAD) {
+        uploads68c.push(rq);
+        const v = cborDecode(rq.payload).value as { off: number; data: Uint8Array };
+        if (v.off + v.data.length >= 700) post68c = true;
+        rspLine68(rq, cborEncode({ off: v.off + v.data.length, rc: 0 }), push);
+        return;
+      }
+    });
+    const link68c = await dev68c.open();
+    await new SmpDevice(link68c).uploadImage(
+      { bytes: bytes68c, sha256: sha68c, imageId: 2 },
+      {
+        onProgress: (p) => progress68c.push(p),
+        onFirstChunkAck: () => { firstAck68c++; },
+        shouldContinue: () => true,
+      },
+    );
+    eq(reqs68c.length, 4, '68 upload: pre-read + 2 chunks + verify read = 4 requests');
+    eq(reqs68c[0]!.op === SMP.OP_READ && reqs68c[0]!.cmdId === SMP.ID_IMAGE_STATE, true,
+      '68 upload: pre-read is an image-state READ');
+    eq(uploads68c.length, 2, '68 upload: exactly 2 chunk writes');
+    eq(uploads68c[0]!.op === SMP.OP_WRITE && uploads68c[0]!.cmdId === SMP.ID_IMAGE_UPLOAD, true,
+      '68 upload: chunks are WRITE img/1');
+    const first68 = cborDecode(uploads68c[0]!.payload).value as {
+      image: number; off: number; len: number; sha: Uint8Array; data: Uint8Array;
+    };
+    eq(first68.image, 2, '68 upload: first chunk image id 2');
+    eq(first68.off, 0, '68 upload: first chunk off 0');
+    eq(first68.len, 700, '68 upload: first chunk carries len = total');
+    eq(toHex(first68.sha), toHex(sha68c), '68 upload: first chunk carries sha');
+    eq(first68.data.length, 512, '68 upload: first chunk data 512B (chunk cap 0x200)');
+    eq(toHex(first68.data), toHex(bytes68c.subarray(0, 512)), '68 upload: first chunk data bytes');
+    const later68 = cborDecode(uploads68c[1]!.payload).value as {
+      off: number; data: Uint8Array; len?: number; sha?: Uint8Array;
+    };
+    eq(later68.off, 512, '68 upload: later chunk off 512');
+    eq(later68.data.length, 188, '68 upload: later chunk data = remaining (188B)');
+    eq(toHex(later68.data), toHex(bytes68c.subarray(512)), '68 upload: later chunk data bytes');
+    eq('len' in later68 && 'sha' in later68, false, '68 upload: later chunk carries no len/sha');
+    eq(uploads68c[1]!.seq, (uploads68c[0]!.seq + 1) & 0xff, '68 upload: chunk seq increments & 0xFF');
+    eq(JSON.stringify(progress68c),
+      JSON.stringify([{ sent: 512, total: 700 }, { sent: 700, total: 700 }]),
+      '68 upload: progress follows the device acks');
+    eq(firstAck68c, 1, '68 upload: onFirstChunkAck fired exactly once');
+    await link68c.close();
+  }
+
+  // --- (d) device-off authoritative: reply off one byte higher than local →
+  // the next chunk resumes at the DEVICE value --------------------------------
+  {
+    const bytes68d = Uint8Array.from({ length: 1026 }, (_, i) => (i * 7 + 3) & 0xff);
+    const sha68d = Uint8Array.from({ length: 32 }, (_, i) => 0x60 + i);
+    const chunks68d: { off: number; data: Uint8Array }[] = [];
+    let post68d = false;
+    const progress68d: { sent: number; total: number }[] = [];
+    const dev68d = mkSmp68((rq, push) => {
+      if (rq.group === SMP.GROUP_IMAGE && rq.cmdId === SMP.ID_IMAGE_STATE) {
+        rspLine68(rq, cborEncode(images68(post68d, pre0A68, sha68d)), push);
+        return;
+      }
+      if (rq.group === SMP.GROUP_IMAGE && rq.cmdId === SMP.ID_IMAGE_UPLOAD) {
+        const v = cborDecode(rq.payload).value as { off: number; data: Uint8Array };
+        chunks68d.push({ off: v.off, data: v.data });
+        // lie one byte forward on the first ack: device claims 513, we sent 512
+        const next = Math.min(v.off + v.data.length + (v.off === 0 ? 1 : 0), 1026);
+        if (next >= 1026) post68d = true;
+        rspLine68(rq, cborEncode({ off: next, rc: 0 }), push);
+        return;
+      }
+    });
+    const link68d = await dev68d.open();
+    await new SmpDevice(link68d).uploadImage(
+      { bytes: bytes68d, sha256: sha68d, imageId: 2 },
+      { onProgress: (p) => progress68d.push(p) },
+    );
+    eq(chunks68d.length, 3, '68 offset-authoritative: 3 chunks for 1026B after the +1 lie');
+    eq(chunks68d[1]!.off, 513, '68 offset-authoritative: chunk 2 off = DEVICE 513 (not local 512)');
+    eq(toHex(chunks68d[1]!.data), toHex(bytes68d.subarray(513, 1025)),
+      '68 offset-authoritative: chunk 2 data resumes at the device offset');
+    eq(chunks68d[2]!.off, 1025, '68 offset-authoritative: chunk 3 off 1025');
+    eq(chunks68d[2]!.data.length, 1, '68 offset-authoritative: chunk 3 carries the last byte');
+    eq(JSON.stringify(progress68d),
+      JSON.stringify([{ sent: 513, total: 1026 }, { sent: 1025, total: 1026 }, { sent: 1026, total: 1026 }]),
+      '68 offset-authoritative: progress reports the device offsets');
+    await link68d.close();
+  }
+
+  // --- (e) rc 3 on the first chunk → throws, nothing further written ---------
+  {
+    const bytes68e = Uint8Array.from({ length: 700 }, (_, i) => (i * 7 + 3) & 0xff);
+    const sha68e = Uint8Array.from({ length: 32 }, (_, i) => 0x60 + i);
+    const seen68e: string[] = [];
+    const dev68e = mkSmp68((rq, push) => {
+      if (rq.group === SMP.GROUP_IMAGE && rq.cmdId === SMP.ID_IMAGE_STATE) {
+        seen68e.push('state');
+        rspLine68(rq, cborEncode(images68(false, pre0A68, sha68e)), push);
+        return;
+      }
+      if (rq.group === SMP.GROUP_IMAGE && rq.cmdId === SMP.ID_IMAGE_UPLOAD) {
+        seen68e.push('chunk');
+        rspLine68(rq, cborEncode({ rc: 3 }), push); // EINVAL — first-chunk too large
+        return;
+      }
+    });
+    const link68e = await dev68e.open();
+    let err68e = '';
+    try {
+      await new SmpDevice(link68e).uploadImage({ bytes: bytes68e, sha256: sha68e, imageId: 2 });
+    } catch (e) { err68e = (e as Error).message; }
+    eq(err68e.includes('rc 3'), true, '68 rc-abort: throw carries the device rc');
+    eq(JSON.stringify(seen68e), JSON.stringify(['state', 'chunk']),
+      '68 rc-abort: nothing written after the rc=3 reply');
+    await link68e.close();
+  }
+
+  // --- (f) erase classification: offset-0 reply delayed past chunkMs but
+  // within eraseMs (tiny injected timeouts) → accepted ------------------------
+  {
+    const bytes68f = Uint8Array.from({ length: 100 }, (_, i) => (i * 7 + 3) & 0xff);
+    const sha68f = Uint8Array.from({ length: 32 }, (_, i) => 0x30 + i);
+    let post68f = false;
+    const dev68f = mkSmp68((rq, push) => {
+      if (rq.group === SMP.GROUP_IMAGE && rq.cmdId === SMP.ID_IMAGE_STATE) {
+        rspLine68(rq, cborEncode(images68(post68f, pre0A68, sha68f)), push);
+        return;
+      }
+      if (rq.group === SMP.GROUP_IMAGE && rq.cmdId === SMP.ID_IMAGE_UPLOAD) {
+        const v = cborDecode(rq.payload).value as { off: number; data: Uint8Array };
+        if (v.off + v.data.length >= 100) post68f = true;
+        // single-chunk image: the offset-0 reply IS the erase window — arrives
+        // after the chunk class (30 ms) but well inside the erase class (3 s)
+        rspLine68(rq, cborEncode({ off: 100, rc: 0 }), push, 80);
+        return;
+      }
+    });
+    const link68f = await dev68f.open();
+    const t68f = Date.now();
+    await new SmpDevice(link68f, { chunkMs: 30, eraseMs: 3000 })
+      .uploadImage({ bytes: bytes68f, sha256: sha68f, imageId: 2 });
+    const elapsed68f = Date.now() - t68f;
+    eq(elapsed68f >= 80, true, '68 erase-class: offset-0 reply really waited past chunkMs (30)');
+    eq(elapsed68f < 3000, true, '68 erase-class: upload accepted within eraseMs (resolved, not timed out)');
+    await link68f.close();
+  }
+
+  // --- shouldContinue() === false between chunks → 'aborted' -----------------
+  {
+    const bytes68k = Uint8Array.from({ length: 700 }, (_, i) => (i * 7 + 3) & 0xff);
+    const sha68k = Uint8Array.from({ length: 32 }, (_, i) => 0x70 + i);
+    const chunks68k: number[] = [];
+    const dev68k = mkSmp68((rq, push) => {
+      if (rq.group === SMP.GROUP_IMAGE && rq.cmdId === SMP.ID_IMAGE_STATE) {
+        rspLine68(rq, cborEncode(images68(false, pre0A68, sha68k)), push);
+        return;
+      }
+      if (rq.group === SMP.GROUP_IMAGE && rq.cmdId === SMP.ID_IMAGE_UPLOAD) {
+        const v = cborDecode(rq.payload).value as { off: number };
+        chunks68k.push(v.off);
+        rspLine68(rq, cborEncode({ off: v.off + 512, rc: 0 }), push);
+        return;
+      }
+    });
+    const link68k = await dev68k.open();
+    let go68k = true;
+    let err68k = '';
+    try {
+      await new SmpDevice(link68k).uploadImage(
+        { bytes: bytes68k, sha256: sha68k, imageId: 2 },
+        {
+          onProgress: (p) => { if (p.sent >= 512) go68k = false; },
+          shouldContinue: () => go68k,
+        },
+      );
+    } catch (e) { err68k = (e as Error).message; }
+    eq(err68k, 'aborted', '68 shouldContinue: false between chunks → throws aborted');
+    eq(chunks68k.length, 1, '68 shouldContinue: only the first chunk was sent');
+    await link68k.close();
+  }
+
+  // --- swap-already-happened acceptance: post-upload state has the new hash
+  // in slot 0 and the armed image moved to slot 1 → still resolves -----------
+  {
+    const bytes68v = Uint8Array.from({ length: 600 }, (_, i) => (i * 7 + 3) & 0xff);
+    const sha68v = Uint8Array.from({ length: 32 }, (_, i) => 0x30 + i);
+    let reads68v = 0;
+    let post68v = false;
+    const dev68v = mkSmp68((rq, push) => {
+      if (rq.group === SMP.GROUP_IMAGE && rq.cmdId === SMP.ID_IMAGE_STATE) {
+        reads68v++;
+        // 1st read = pre-upload; after the upload finished, the bootloader
+        // has ALREADY swapped: new hash in slot 0, armed image in slot 1
+        const body = reads68v === 1 || !post68v
+          ? images68(false, pre0A68, sha68v)
+          : { images: [
+              { slot: 0, hash: sha68v, flags: [] },
+              { slot: 1, hash: pre0A68, flags: ['active', 'confirmed'] },
+            ] };
+        rspLine68(rq, cborEncode(body), push);
+        return;
+      }
+      if (rq.group === SMP.GROUP_IMAGE && rq.cmdId === SMP.ID_IMAGE_UPLOAD) {
+        const v = cborDecode(rq.payload).value as { off: number; data: Uint8Array };
+        if (v.off + v.data.length >= 600) post68v = true;
+        rspLine68(rq, cborEncode({ off: v.off + v.data.length, rc: 0 }), push);
+        return;
+      }
+    });
+    const link68v = await dev68v.open();
+    let err68v = '';
+    try {
+      await new SmpDevice(link68v).uploadImage({ bytes: bytes68v, sha256: sha68v, imageId: 2 });
+    } catch (e) { err68v = (e as Error).message; }
+    eq(err68v, '', '68 swap-accepted: upload resolves when the swap already happened (slot0=sha, slot1=pre-slot0)');
+    await link68v.close();
+  }
+
+  // --- verify refusal: post-upload state matches neither rule → throws -------
+  {
+    const bytes68w = Uint8Array.from({ length: 100 }, (_, i) => (i * 7 + 3) & 0xff);
+    const sha68w = Uint8Array.from({ length: 32 }, (_, i) => 0x40 + i);
+    const dev68w = mkSmp68((rq, push) => {
+      if (rq.group === SMP.GROUP_IMAGE && rq.cmdId === SMP.ID_IMAGE_STATE) {
+        // pre and post identical: slot 1 never took the write
+        rspLine68(rq, cborEncode(images68(false, pre0A68, sha68w)), push);
+        return;
+      }
+      if (rq.group === SMP.GROUP_IMAGE && rq.cmdId === SMP.ID_IMAGE_UPLOAD) {
+        const v = cborDecode(rq.payload).value as { off: number; data: Uint8Array };
+        rspLine68(rq, cborEncode({ off: v.off + v.data.length, rc: 0 }), push);
+        return;
+      }
+    });
+    const link68w = await dev68w.open();
+    let err68w = '';
+    try {
+      await new SmpDevice(link68w).uploadImage({ bytes: bytes68w, sha256: sha68w, imageId: 2 });
+    } catch (e) { err68w = (e as Error).message; }
+    eq(err68w.includes('slot-1 hash'), true,
+      '68 verify-refusal: unchanged slot-1 after upload throws');
+    await link68w.close();
+  }
+
+  // --- (g) resolveUploadImageId numbering matrix ------------------------------
+  eq(resolveUploadImageId(new Map([['0,1', 2]]), 'keyboard'), 2,
+    '68 numbering: keyboard map confirms 2');
+  eq(resolveUploadImageId(null, 'keyboard'), 2,
+    '68 numbering: keyboard ASSUMED 2 on a null map');
+  let threw68g = '';
+  try { resolveUploadImageId(new Map([['0,1', 3]]), 'keyboard'); } catch (e) { threw68g = (e as Error).message; }
+  eq(threw68g !== '', true, '68 numbering: disagreeing keyboard map throws');
+  eq(resolveUploadImageId(new Map([['0,2', 4]]), 'modules', 1_048_576), 4,
+    '68 numbering: modules map wins 4');
+  threw68g = '';
+  try { resolveUploadImageId(null, 'modules', 1_000_000); } catch (e) { threw68g = (e as Error).message; }
+  eq(threw68g !== '', true, '68 numbering: modules unmapped with a wrong size throws');
+  eq(resolveUploadImageId(null, 'modules', 1_048_576), 4,
+    '68 numbering: modules unmapped, exact 1 MiB → 4');
+  threw68g = '';
+  try { resolveUploadImageId(new Map([['0,2', 5]]), 'modules', 1_048_576); } catch (e) { threw68g = (e as Error).message; }
+  eq(threw68g !== '', true, '68 numbering: disagreeing modules map throws (map wins)');
+
+  // --- (h) setPending frame bytes; osReset on a silent link resolves ---------
+  {
+    const hash68h = Uint8Array.from({ length: 32 }, (_, i) => 0x11 + i);
+    const hash68h2 = Uint8Array.from({ length: 32 }, (_, i) => 0x60 + i);
+    const reqs68h: SmpFrame[] = [];
+    const dev68h = mkSmp68((rq, push) => {
+      reqs68h.push(rq);
+      if (rq.group === SMP.GROUP_OS && rq.cmdId === SMP.ID_OS_RESET) return; // silent: reboots mid-reply
+      rspLine68(rq, cborEncode({ rc: 0 }), push);
+    });
+    const link68h = await dev68h.open();
+    const dev68 = new SmpDevice(link68h, { chunkMs: 60 });
+    await dev68.setPending(hash68h, true);
+    eq(reqs68h.length, 1, '68 setPending: one WRITE on the wire');
+    eq(reqs68h[0]!.op, SMP.OP_WRITE, '68 setPending: op WRITE');
+    eq(reqs68h[0]!.group, SMP.GROUP_IMAGE, '68 setPending: group IMAGE');
+    eq(reqs68h[0]!.cmdId, SMP.ID_IMAGE_STATE, '68 setPending: id 0 (img-state channel)');
+    const pend68 = cborDecode(reqs68h[0]!.payload).value as { hash: Uint8Array; confirm: boolean };
+    eq(pend68.hash.length, 32, '68 setPending: hash is 32B');
+    eq(toHex(pend68.hash), toHex(hash68h), '68 setPending: hash bytes');
+    eq(pend68.confirm, true, '68 setPending: confirm true');
+    await dev68.setPending(hash68h2, false);
+    const pend68b = cborDecode(reqs68h[1]!.payload).value as { hash: Uint8Array; confirm: boolean };
+    eq(pend68b.confirm === false && toHex(pend68b.hash) === toHex(hash68h2), true,
+      '68 setPending: confirm false + second hash bytes');
+    const dev68h2 = mkSmp68((rq, push) => {
+      rspLine68(rq, cborEncode({ rc: 4 }), push);
+    });
+    const link68h2 = await dev68h2.open();
+    let err68h = '';
+    try { await new SmpDevice(link68h2).setPending(hash68h, true); } catch (e) { err68h = (e as Error).message; }
+    eq(err68h.includes('rc 4'), true, '68 setPending: rc != 0 throws carrying rc');
+    await link68h2.close();
+    const t68h = Date.now();
+    await dev68.osReset();
+    const osElapsed68 = Date.now() - t68h;
+    eq(reqs68h.length, 3, '68 osReset: request reached the device');
+    eq(reqs68h[2]!.op === SMP.OP_WRITE && reqs68h[2]!.group === SMP.GROUP_OS
+      && reqs68h[2]!.cmdId === SMP.ID_OS_RESET, true, '68 osReset: WRITE os/5 on the wire');
+    eq(toHex(reqs68h[2]!.payload), 'a0', '68 osReset: empty-map payload');
+    eq(osElapsed68 < 3000, true, '68 osReset: silent link resolves (missing reply = success, bounded wait)');
+    await link68h.close();
+  }
+
+  // --- (i) enterMcuboot() wire pin -------------------------------------------
+  {
+    // Pend-forever reader: the pump parks in read(), readFrame hits its own
+    // deadline — the session never sees a reply.
+    const pendReader68 = () => {
+      let wake: (() => void) | null = null;
+      const done = new Promise<void>((r) => { wake = r; });
+      return {
+        async read(): Promise<{ value?: Uint8Array; done?: boolean }> {
+          await done;
+          return { value: undefined, done: true };
+        },
+        cancel() { wake?.(); },
+        releaseLock() {},
+      };
+    };
+    const writes68i: Uint8Array[] = [];
+    const port68i = { readable: null, writable: null, async open() {}, async setSignals() {}, async close() {} };
+    const mkSes68i = (
+      reader: unknown,
+      writeFn: (b: Uint8Array) => Promise<void>,
+    ): NayaSession =>
+      new NayaSession(
+        port68i as unknown as SerialPort, 0x50,
+        new FrameReader(reader as ReadableStreamDefaultReader<Uint8Array>),
+        { releaseLock() {} } as unknown as WritableStreamDefaultWriter<Uint8Array>,
+        reader as ReadableStreamDefaultReader<Uint8Array>,
+        writeFn,
+        null,
+      );
+    // silent device: exactly one frame, resolves on the bounded ~1500 ms wait
+    const ses68i = mkSes68i(pendReader68(), async (b) => { writes68i.push(Uint8Array.from(b)); });
+    const t68i = Date.now();
+    await ses68i.enterMcuboot();
+    const elapsed68i = Date.now() - t68i;
+    eq(writes68i.length, 1, '68 enterMcuboot: exactly ONE frame written');
+    const f68i = verifyFrame(writes68i[0]!);
+    eq(f68i.type, 0xee, '68 enterMcuboot: type 0xEE');
+    eq(f68i.c0, 0x10, '68 enterMcuboot: c0 0x10');
+    eq(f68i.c1, 0xae, '68 enterMcuboot: c1 0xAE');
+    eq(f68i.dst, 0x50, '68 enterMcuboot: dst = session dst');
+    eq(f68i.src, 0x00, '68 enterMcuboot: sender 0x00, id 0x00');
+    eq(f68i.id, 0x00, '68 enterMcuboot: id 0x00');
+    eq(f68i.payload.length, 0, '68 enterMcuboot: empty params');
+    eq(elapsed68i >= 1500 && elapsed68i < 3000, true,
+      '68 enterMcuboot: silent device — bounded ~1500 ms wait then resolves (never roundtrip retries)');
+    nayaWrites68.push(...writes68i);
+    // an early reply also resolves (bounded wait ends on ANY reply, swallowed)
+    {
+      let wake: (() => void) | null = null;
+      const done = new Promise<void>((r) => { wake = r; });
+      let served = false;
+      const reader68 = {
+        async read(): Promise<{ value?: Uint8Array; done?: boolean }> {
+          if (!served) {
+            served = true;
+            await sleep(20);
+            return { value: buildFrame(0x50, 0xee, 0x10, 0xae, new Uint8Array([0x00])), done: false };
+          }
+          await done;
+          return { value: undefined, done: true };
+        },
+        cancel() { wake?.(); },
+        releaseLock() {},
+      };
+      const writes68i2: Uint8Array[] = [];
+      const ses68i2 = mkSes68i(reader68, async (b) => { writes68i2.push(Uint8Array.from(b)); });
+      const t68i2 = Date.now();
+      await ses68i2.enterMcuboot();
+      const elapsed68i2 = Date.now() - t68i2;
+      eq(writes68i2.length, 1, '68 enterMcuboot: reply path still sends exactly one frame');
+      eq(elapsed68i2 < 1200, true, '68 enterMcuboot: an arriving reply ends the wait early (swallowed)');
+      nayaWrites68.push(...writes68i2);
+    }
+  }
+
+  // --- §68-wide tripwire: no DFU reset anywhere in the fixture write logs -----
+  // RESET_DFU = ee/10be is a different, never-sent op. Naya writes are
+  // checked structurally (verifyFrame + c0/c1); raw SMP lines are decoded
+  // and scanned byte-wise (a Naya frame could only reach that log as bytes).
+  let dfu68 = 0;
+  for (const w of nayaWrites68) {
+    try {
+      const f = verifyFrame(w);
+      if (f.c0 === 0x10 && f.c1 === 0xbe) dfu68++;
+    } catch { dfu68++; }
+  }
+  for (const line of smpLines68) {
+    const dec = b64Bytes68(line);
+    for (let i = 0; i + 1 < dec.length; i++) {
+      if (dec[i] === 0x10 && dec[i + 1] === 0xbe) { dfu68++; break; }
+    }
+  }
+  eq(smpLines68.length > 0 && nayaWrites68.length === 2, true,
+    '68 tripwire: fixture write logs were actually captured');
+  eq(dfu68, 0, '68 tripwire: no fixture write carries c0=0x10 c1=0xBE (DFU reset never sent)');
+  eq(SMP_DEFAULT_TIMEOUTS.chunkMs, 20000, '68 timeouts: default chunkMs 20s');
+  eq(SMP_DEFAULT_TIMEOUTS.eraseMs, 90000, '68 timeouts: default eraseMs 90s');
+  eq(SMP_DEFAULT_TIMEOUTS.transceiveMs, 5000, '68 timeouts: default transceiveMs 5s');
 })();
 
 void main();
