@@ -3,7 +3,15 @@
  * teardown. Owns the session map and the per-half aux snapshots.
  *
  * Auto-identifies the side per picked port (fa/1001 payload length: 33B
- * left / 21B right; 30/1001 handshake answers left-only). */
+ * left / 21B right; 30/1001 handshake answers left-only).
+ *
+ * Port sweeps (auto-connect on load, hot-plug, and the firmware run's
+ * end-of-run rescan) share ONE React-free core below (rescanSweep): it
+ * lists ports, skips every non-app PID (MCUboot/third-mode ports are never
+ * auto-connected — a bootloader must not be claimed as a session), and
+ * connects the unclaimed halves. While a firmware run owns the halves the
+ * sweep is FROZEN (firmwareRunActive() → no-op): a half going dark for a
+ * re-enumeration must not trigger teardown or a bogus connect. */
 
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { toast } from 'sonner';
@@ -18,8 +26,55 @@ import type { FrameHandler, Side } from '@create-reflow/sdk';
 import { emptyHalf, readAux } from '@create-reflow/sdk';
 import type { HalfSnapshot } from '@create-reflow/sdk';
 import { bleCaps } from '../lib/bleCaps';
+import { pidInfo } from '../lib/firmware-plat';
+import { firmwareRunActive } from './useFirmwareFlash';
 import { usePersistentFlag } from './usePersistentFlag';
 import type { LogFn } from './useLog';
+
+/* The slice of a serial port the sweep needs: the optional USB identity
+ * reader. Real SerialPort always carries getInfo; the smoke's fake ports
+ * are plain objects. */
+export interface SweepPort {
+  getInfo?: () => { usbVendorId?: number; usbProductId?: number };
+}
+
+/** One sweep pass over the granted ports: skip non-app PIDs, connect the
+ * unclaimed halves through the injected connect (connectPort). FROZEN to a
+ * no-op while a firmware run is active — the run's own handover calls it
+ * again after the flag clears. Returns the number of connect attempts. */
+export async function rescanSweep(o: {
+  getPorts: () => Promise<SweepPort[]>;
+  connect: (port: SweepPort, hint: Side) => Promise<void>;
+  claimed: (side: Side) => boolean;
+}): Promise<number> {
+  if (firmwareRunActive()) return 0;
+  let ports: SweepPort[];
+  try {
+    ports = await o.getPorts();
+  } catch {
+    return 0;
+  }
+  let n = 0;
+  for (const p of ports) {
+    let vid: number | undefined;
+    let pid: number | undefined;
+    try {
+      const i = p.getInfo?.();
+      vid = i?.usbVendorId;
+      pid = i?.usbProductId;
+    } catch {
+      continue;
+    }
+    if (pid === undefined) continue;
+    if (vid !== undefined && vid !== VID) continue;
+    const info = pidInfo(pid);
+    if (info === null || info.mode !== 'app') continue;
+    if (o.claimed(info.side)) continue;
+    n += 1;
+    await o.connect(p, info.side);
+  }
+  return n;
+}
 
 export function useSessions({
   log,
@@ -212,6 +267,19 @@ export function useSessions({
     [log, setHalf, onLeftCleared],
   );
 
+  // Run-end handover + re-sweep: re-list the granted ports, skip non-app
+  // PIDs, connect the unclaimed halves. No-op while a firmware run holds
+  // the freeze — the run clears its flag BEFORE calling this.
+  const rescan = useCallback(async (): Promise<void> => {
+    if (!('serial' in navigator)) return;
+    const n = await rescanSweep({
+      getPorts: () => navigator.serial.getPorts(),
+      connect: (p, hint) => connectPort(p as SerialPort, hint),
+      claimed: (side) => sesRef.current.has(side),
+    });
+    if (n > 0) log('inf', `rescan: ${n} half${n === 1 ? '' : 's'} reconnected`);
+  }, [connectPort, log]);
+
   // Auto-connect: previously-granted ports need no picker gesture.
   // getPorts() on load + 'connect' on hot-plug; side hint from USB PID
   // (100=left / 200=right), wire wake-identify as fallback. Unplug drops
@@ -221,6 +289,7 @@ export function useSessions({
     autoRan.current = true;
     if (!('serial' in navigator)) return;
     const onPlug = (e: Event) => {
+      if (firmwareRunActive()) return; // freeze: a firmware run owns the ports
       if (!autoRef.current) return;
       const port = e.target as SerialPort;
       let info: { usbVendorId?: number; usbProductId?: number };
@@ -255,6 +324,7 @@ export function useSessions({
     navigator.serial.addEventListener('connect', onPlug);
     navigator.serial.addEventListener('disconnect', onUnplug);
     (async () => {
+      if (firmwareRunActive()) return; // freeze: a firmware run owns the ports
       if (!autoRef.current) return;
       let ports: SerialPort[] = [];
       try {
@@ -305,5 +375,6 @@ export function useSessions({
     toggleAutoConn,
     connectPicked,
     disconnect,
+    rescan,
   };
 }

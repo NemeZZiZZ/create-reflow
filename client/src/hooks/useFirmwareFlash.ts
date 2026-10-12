@@ -3,9 +3,9 @@
  * later task):
  *
  * - ONE run at a time: a module-level lock (firmwareRunActive) refuses a
- *   second beginRun while one is in flight — the freeze flag a later task's
- *   useSessions wiring will consult to hold back auto-connect/hot-plug
- *   teardown while a half is dark.
+ *   second beginRun while one is in flight — the freeze flag useSessions'
+ *   shared sweep consults to hold back auto-connect/hot-plug while a half
+ *   is dark.
  * - busyRef held for the WHOLE run (useFlash.ts:170 precedent) so every
  *   other device op refuses while a run owns the halves.
  * - beforeunload + pagehide guards registered on begin, removed on end, so
@@ -32,24 +32,30 @@
  * read never throws the capture — it records null/'error' so the artifact
  * stays honest about what was and wasn't readable.
  *
- * The keyboard procedure (startKeyboardRun, spec §5 steps 1-8) runs over an
+ * The keyboard procedure (startKeyboardRun, spec §5 steps 1-11) runs over an
  * injectable SerialWorld (lib/serial-world.ts): after `enterMcuboot()` it
  * polls getPorts for the re-enumerated MCUboot PID of the side, probes
  * every candidate CDC port with image-state (first answer wins; a silent
  * port's console text surfaces as a `bootloader.console` note), identifies
  * the running image by slot-0 hash against the catalog's plaintextSha256
  * values, re-checks the interlock gate with live values, uploads through
- * SmpDevice.uploadImage (slot.erase ok = first chunk ack), and observes the
- * swap. Every wait is an injected `timeouts` value — the core never sleeps
- * on raw constants (the smoke runs millisecond-scale). */
+ * SmpDevice.uploadImage (slot.erase ok = first chunk ack), observes the
+ * swap, os-resets the answering port (mcuboot.exit — the silent twin never
+ * sees an SMP write), confirms the flashed version on a procedure-owned
+ * app session (mismatch refuses; non-versioned target is advisory-only),
+ * settles BOTH halves (fail-and-continue on timeout), and hands the ports
+ * back: owned sessions closed, dead pre-flash sessions disconnected, flag
+ * cleared, rescan(). Every wait is an injected `timeouts` value — the core
+ * never sleeps on raw constants (the smoke runs millisecond-scale). */
 
 import { useCallback, useState } from 'react';
 import type { RefObject } from 'react';
 import {
-  bleGetAddress, bleGetAllPairs, bleGetPairAddress, fwVersionText, hexToBytes, modPresence,
-  resolveUploadImageId, sleep, SmpDevice, SmpLink, SMP_DEFAULT_TIMEOUTS, toHex,
+  bleGetAddress, bleGetAllPairs, bleGetPairAddress, buildFrame, DST_LEFT, DST_RIGHT,
+  fwVersionText, hexToBytes, modPresence, NayaSession, resolveUploadImageId, sleep, SmpDevice,
+  SmpLink, SMP_DEFAULT_TIMEOUTS, toHex,
 } from '@create-reflow/sdk';
-import type { ImageSlot, NayaSession, Side } from '@create-reflow/sdk';
+import type { ImageSlot, Side } from '@create-reflow/sdk';
 import { saveText } from '../lib/save';
 import { FirmwareRunLog, sha256Hex, stableStringify } from '../lib/firmware-run-log';
 import type { RunEvent } from '../lib/firmware-run-log';
@@ -84,6 +90,10 @@ export interface FlashDeps {
    * back the picked port. Absent → no grant is possible and a missing port
    * fails with replug copy. */
   grantPort?: () => Promise<PortWithInfo>;
+  /* The run-end handover (useSessions.rescan): called after the freeze flag
+   * cleared — the sweep re-lists the granted ports and reconnects the
+   * unclaimed app-mode halves. Absent (raw smoke runs) → no handover sweep. */
+  rescan?: () => Promise<void>;
 }
 
 /* ---- React-free lifecycle core ------------------------------------------ */
@@ -96,9 +106,10 @@ interface ActiveRun {
 
 let activeRun: ActiveRun | null = null;
 
-/** True from beginRun to endRun — the freeze flag. Nothing consults it yet:
- * a later task's useSessions wiring reads it to hold back auto-connect and
- * hot-plug teardown while a firmware run owns the halves. */
+/** True from beginRun to endRun — the freeze flag. useSessions consults it
+ * to hold back auto-connect and hot-plug sweeps while a firmware run owns
+ * the halves (its shared rescanSweep core checks it first); the run's own
+ * handover clears the flag BEFORE calling rescan(). */
 export function firmwareRunActive(): boolean {
   return activeRun !== null;
 }
@@ -333,7 +344,11 @@ export interface FlashTimeouts {
   enterMs?: number; // window for the bootloader port to appear after enter
   swapMs?: number; // swap.verify observation window
   rePollMs?: number; // swap.verify re-poll cadence
-  probeMs?: number; // per-probe image-state timeout (port probing)
+  probeMs?: number; // per-probe image-state timeout (port probing + settle identity probes)
+  resetMs?: number; // os reset bounded wait (SmpDevice chunkMs class)
+  confirmMs?: number; // version.confirm window for the app PID to (re)appear
+  reResetMs?: number; // version.confirm re-reset cadence while the app port is missing
+  settleMs?: number; // halves.settle window for BOTH halves to answer again
 }
 
 /* Spec defaults — the ONLY sleeps the procedure does; smoke injects
@@ -344,6 +359,10 @@ export const FLASH_TIMEOUT_DEFAULTS = {
   swapMs: 300_000,
   rePollMs: 2_000,
   probeMs: 5_000,
+  resetMs: 20_000,
+  confirmMs: 300_000,
+  reResetMs: 30_000,
+  settleMs: 90_000,
 } as const;
 
 export interface StartKeyboardTarget {
@@ -482,8 +501,10 @@ interface ProbeOutcome {
 /* Probe ONE candidate port with an image-state read. First answer wins
  * (spec §2: keep the answering port for the whole visit); a silent port
  * times out on probeMs, closes, and its console text rides back. SmpLink's
- * default 250 ms open-settle applies (spec §1: bootloader settle window). */
-async function probeOnce(port: PortWithInfo, probeMs: number): Promise<ProbeOutcome> {
+ * default 250 ms open-settle applies (spec §1: bootloader settle window).
+ * resetMs feeds the device's chunkMs class — os reset (mcuboot.exit) uses
+ * that timeout, so it must be injectable wherever a probe device exists. */
+async function probeOnce(port: PortWithInfo, probeMs: number, resetMs: number): Promise<ProbeOutcome> {
   const con: SideConsole = { text: '' };
   let link: SmpLink | null = null;
   try {
@@ -493,7 +514,7 @@ async function probeOnce(port: PortWithInfo, probeMs: number): Promise<ProbeOutc
      * through a cast instead of narrowing the SDK's own API from here. */
     const device = new SmpDevice(
       link,
-      { transceiveMs: probeMs } as unknown as Partial<typeof SMP_DEFAULT_TIMEOUTS>,
+      { transceiveMs: probeMs, chunkMs: resetMs } as unknown as Partial<typeof SMP_DEFAULT_TIMEOUTS>,
     );
     const slots = await device.imageState();
     return { winner: { link, device, slots, port, console: con }, consoleText: con.text };
@@ -503,13 +524,120 @@ async function probeOnce(port: PortWithInfo, probeMs: number): Promise<ProbeOutc
   }
 }
 
-/** The keyboard flash procedure (spec §5 steps 1-8): preflight → per target
+/* ---- return-to-app helpers (spec §5 steps 9-11) --------------------------- */
+
+/* fe/1002 payload → the declared version string the catalog labels use:
+ * the aux text convention ('v3.41.0.0  [hex]' → '3.41.0.0', v-prefix
+ * stripped). */
+function fwTextOf(payload: Uint8Array): string {
+  const t = fwVersionText(payload).split('  [')[0] ?? '';
+  return t.startsWith('v') ? t.slice(1) : t;
+}
+
+/* Strict dot-version tuple ('3.41.0' → [3, 41, 0]); null when the string is
+ * not one (non-versioned labels like 'NayaFlow 1.14.3' never compare). */
+function dotTupleOf(v: string): number[] | null {
+  if (!/^\d+(\.\d+)*$/.test(v)) return null;
+  return v.split('.').map((p) => Number.parseInt(p, 10));
+}
+
+/* The device reports four components ('3.41.0.0'), the catalog labels three
+ * ('3.41.0') — trailing all-zero dot components compare equal. Anything
+ * non-numeric on either side refuses to match (never a false mismatch). */
+function versionsMatch(device: string, label: string): boolean {
+  const a = dotTupleOf(device);
+  const b = dotTupleOf(label);
+  if (a === null || b === null) return false;
+  while (a.length > 1 && a[a.length - 1] === 0) a.pop();
+  while (b.length > 1 && b[b.length - 1] === 0) b.pop();
+  return a.join('.') === b.join('.');
+}
+
+/* os reset against ONE known bootloader port (step 9). The reset reply
+ * usually never comes — the device reboots mid-reply — so the bounded wait
+ * resolving either way IS success. */
+async function resetPort(port: PortWithInfo, resetMs: number): Promise<void> {
+  let link: SmpLink | null = null;
+  try {
+    link = await SmpLink.open(tappedPort(port, { text: '' }));
+    const device = new SmpDevice(
+      link,
+      { chunkMs: resetMs } as unknown as Partial<typeof SMP_DEFAULT_TIMEOUTS>,
+    );
+    await device.osReset();
+  } finally {
+    if (link !== null) await link.close();
+  }
+}
+
+/* mcuboot.exit: os reset on the SMP-answering bootloader port of the side —
+ * the swap-verify answerer when we have it (a silent twin never sees an SMP
+ * write), else a fresh probe across the side's bootloader ports. Answers
+ * false when no bootloader port responds: the half already rebooted. */
+async function exitBootloader(
+  world: SerialWorld,
+  side: Side,
+  answerPort: PortWithInfo | null,
+  probeMs: number,
+  resetMs: number,
+): Promise<boolean> {
+  if (answerPort !== null) {
+    await resetPort(answerPort, resetMs);
+    return true;
+  }
+  const boots = [...new Set((await world.getPorts()).filter((p) => portMatches(p, side, 'mcuboot')))];
+  for (const c of boots) {
+    const r = await probeOnce(c, probeMs, resetMs);
+    if (r.winner === null) continue;
+    await r.winner.device.osReset();
+    await r.winner.link.close();
+    return true;
+  }
+  return false;
+}
+
+/* Open a procedure-owned app-mode session with the SAME connect+identify
+ * discipline as useSessions.connectPort: NayaSession.connect (2.5 s settle
+ * + drain + wake), fa/1001 wire identify (payload ≥27 B = left — the PID
+ * said the side, the wire must agree), dst + left-only handshake. Null on
+ * any failure — the port may be mid-enumeration; callers keep polling. */
+async function openOwnedSession(port: PortWithInfo, side: Side): Promise<NayaSession | null> {
+  let ses: NayaSession | null = null;
+  try {
+    ses = await NayaSession.connect(port as unknown as SerialPort, side === 'left' ? DST_LEFT : DST_RIGHT);
+    const dev = await ses.cmd(0xfa, 0x10, 0x01, new Uint8Array([0]));
+    const idSide: Side = dev.payload.length >= 27 ? 'left' : 'right';
+    if (idSide !== side) {
+      await ses.close();
+      return null;
+    }
+    ses.dst = side === 'left' ? DST_LEFT : DST_RIGHT;
+    if (side === 'left') await ses.handshake();
+    return ses;
+  } catch {
+    if (ses !== null) {
+      try {
+        await ses.close();
+      } catch {
+        /* ignore */
+      }
+    }
+    return null;
+  }
+}
+
+/** The keyboard flash procedure (spec §5 steps 1-11): preflight → per target
  * side, left first — mcuboot enter → bootloader port discovery (poll +
  * optional user grant) → probe/identify (arm token = slot-0 hash, running
  * image classified by catalog plaintextSha256) → live gate → upload (erase
- * ok on first chunk ack) → swap.verify observation. Rescue/mcuboot.exit and
- * the app-mode steps (version.confirm, halves.settle, restores) belong to
- * the later tasks; a failure here fails the run and ends it honestly.
+ * ok on first chunk ack) → swap.verify observation → mcuboot.exit (os reset
+ * on the answering port only) → version.confirm (procedure-owned app
+ * session on the re-enumerated port; mismatch refuses — the write is
+ * hash-verified and the half re-flashable; a non-versioned target is
+ * advisory-only) — then globally halves.settle (BOTH known halves answering
+ * again; timeout fails the verdict but never aborts) and the run-end
+ * handover: owned sessions closed, dead pre-flash sessions disconnected,
+ * freeze flag cleared, rescan() handed the ports back.
  *
  * Returns the finished run log, or null when the run could not begin
  * (another run active / busyRef held). */
@@ -525,11 +653,51 @@ export async function startKeyboardRun(
 
   const failures: string[] = [];
   const advisories: string[] = [];
-  const abort = (step: string, side: Side | undefined, detail: string): FirmwareRunLog => {
+  /* Procedure-owned app sessions (version.confirm → settle) — NEVER stored
+   * in sesRef; they live and die with the run. */
+  const owned = new Map<Side, NayaSession>();
+  /* Sides whose app session is dead (the half rebooted and its port
+   * re-enumerated): at handover those sesRef entries get closed + removed;
+   * a pre-run session of a half we never touched stays untouched. */
+  const entered = new Set<Side>();
+  /* The run-end handover: close owned sessions, disconnect the dead
+   * pre-flash sessions, clear the freeze flag, then hand the ports back to
+   * rescan() — it rebuilds the live sessions on the re-enumerated app
+   * ports. */
+  const finishRun = async (ok: boolean, summary: string): Promise<FirmwareRunLog> => {
+    for (const s of owned.values()) {
+      try {
+        await s.close();
+      } catch {
+        /* ignore */
+      }
+    }
+    owned.clear();
+    for (const side of entered) {
+      const ses = deps.sesRef.current.get(side);
+      if (ses !== undefined) {
+        try {
+          await ses.close();
+        } catch {
+          /* ignore */
+        }
+        deps.sesRef.current.delete(side);
+      }
+    }
+    endFirmwareRun(ok, summary, failures, advisories);
+    if (deps.rescan !== undefined) {
+      try {
+        await deps.rescan();
+      } catch {
+        /* best-effort handover — the user can always reconnect manually */
+      }
+    }
+    return log;
+  };
+  const abort = (step: string, side: Side | undefined, detail: string): Promise<FirmwareRunLog> => {
     failures.push(`${step}: ${detail}`);
     log.fail(step, side, detail);
-    endFirmwareRun(false, `keyboard flash failed — ${detail}`, failures, advisories);
-    return log;
+    return finishRun(false, `keyboard flash failed — ${detail}`);
   };
 
   /* Per-side console bookkeeping: probed-port text accumulates across the
@@ -610,6 +778,7 @@ export async function startKeyboardRun(
       log.start('mcuboot.enter', side);
       const ses = deps.sesRef.current.get(side)!;
       await ses.enterMcuboot();
+      entered.add(side); // the half is rebooting — its app session is dead now
 
       /* Step 4 (port discovery): poll getPorts for the re-enumerated
        * MCUboot PID of this side. */
@@ -681,7 +850,7 @@ export async function startKeyboardRun(
       let win: Awaited<ReturnType<typeof probeOnce>>['winner'] = null;
       let probeConsole = '';
       for (const c of allBoot) {
-        const r = await probeOnce(c, T.probeMs);
+        const r = await probeOnce(c, T.probeMs, T.resetMs);
         probeConsole += r.consoleText;
         if (r.winner !== null) {
           win = r.winner;
@@ -830,22 +999,23 @@ export async function startKeyboardRun(
         await link.close();
         dumpConsole(side, probeConsole, liveConsole);
         failures.push(`upload: ${m}`);
-        endFirmwareRun(false, `keyboard flash failed — ${m}`, failures, advisories);
-        return log;
+        return finishRun(false, `keyboard flash failed — ${m}`);
       }
       log.ok('upload', side);
       /* The winning link's job is done — the port may vanish the moment the
        * swap runs; swap.verify opens fresh probes. */
       await link.close();
 
-      /* Step 8: swap.verify — observation only (os reset / mcuboot.exit is
-       * the later task's step): re-read image state on ANY mcuboot port of
-       * the side until slot-0 is the uploaded hash; early success when the
-       * side's app PID reappears. */
+      /* Step 8: swap.verify — observation only: re-read image state on ANY
+       * mcuboot port of the side until slot-0 is the uploaded hash; early
+       * success when the side's app PID reappears. The answering port that
+       * proves the swap is kept for mcuboot.exit — the reset must go to IT
+       * only (a silent twin never sees an SMP write). */
       log.start('swap.verify', side);
       const swapDeadline = Date.now() + T.swapMs;
       let swapped = false;
       let swapDetail = '';
+      let swapAnswerPort: PortWithInfo | null = null;
       while (!swapped && Date.now() < swapDeadline) {
         const ports = await world.getPorts();
         if (ports.some((p) => portMatches(p, side, 'app'))) {
@@ -855,7 +1025,7 @@ export async function startKeyboardRun(
         }
         const boots = [...new Set(ports.filter((p) => portMatches(p, side, 'mcuboot')))];
         if (boots.length > 0) {
-          const results = await Promise.all(boots.map((c) => probeOnce(c, T.probeMs)));
+          const results = await Promise.all(boots.map((c) => probeOnce(c, T.probeMs, T.resetMs)));
           for (const r of results) {
             probeConsole += r.consoleText;
             if (r.winner === null) continue;
@@ -863,6 +1033,7 @@ export async function startKeyboardRun(
             if (s0 !== undefined && hexCompact(s0.hash).toLowerCase() === shaHex) {
               swapped = true;
               swapDetail = `slot-0 is the uploaded image (${shaHex.slice(0, 16)}…)`;
+              swapAnswerPort = r.winner.port;
             }
             await r.winner.link.close();
           }
@@ -872,27 +1043,192 @@ export async function startKeyboardRun(
         if (remain <= 0) break;
         await sleep(Math.min(T.rePollMs, remain));
       }
-      dumpConsole(side, probeConsole, null);
+      dumpConsole(side, probeConsole, liveConsole);
       if (!swapped) {
         return abort('swap.verify', side, `the swap did not appear within ${Math.round(T.swapMs / 1000)} s`);
       }
       log.ok('swap.verify', side, { detail: swapDetail, sha256: shaHex });
+
+      /* ---- step 9: mcuboot.exit — os reset on the answering port ---------- */
+      log.start('mcuboot.exit', side);
+      try {
+        const exited = await exitBootloader(world, side, swapAnswerPort, T.probeMs, T.resetMs);
+        if (exited) {
+          log.ok('mcuboot.exit', side);
+        } else {
+          log.note('mcuboot.exit', side, 'no bootloader port answers — the half already rebooted');
+          log.ok('mcuboot.exit', side);
+        }
+      } catch (e) {
+        return abort('mcuboot.exit', side, msgOf(e));
+      }
+
+      /* ---- step 10: version.confirm — the half must come back running the
+       * flashed image: poll for the app PID (re-sending the reset every
+       * reResetMs to the answering bootloader port), open a procedure-owned
+       * session with the connectPort discipline and read fe/1002. A proven
+       * mismatch REFUSES — the write itself is hash-verified, so the half
+       * can simply be re-flashed. A non-versioned target (or a device
+       * string that is not a version) cannot be confirmed on-device:
+       * advisory note only, never a false refusal. */
+      log.start('version.confirm', side);
+      const confirmDeadline = Date.now() + T.confirmMs;
+      let lastReset = Date.now();
+      let versionSes = owned.get(side) ?? null;
+      let confirmedDetail: string | null = null;
+      let versionAdvisory: string | null = null;
+      for (;;) {
+        const appPort = (await world.getPorts()).find((p) => portMatches(p, side, 'app')) ?? null;
+        if (appPort !== null && versionSes === null) {
+          versionSes = await openOwnedSession(appPort, side);
+          if (versionSes !== null) owned.set(side, versionSes);
+        }
+        if (versionSes !== null) {
+          try {
+            const f = await versionSes.cmd(0xfe, 0x10, 0x02, new Uint8Array([0]));
+            const got = fwTextOf(f.payload);
+            if (versionsMatch(got, t.label)) {
+              confirmedDetail = `the ${side} half is back on app mode running ${got} — matches ${t.label}`;
+            } else if (dotTupleOf(t.label) === null) {
+              versionAdvisory = `target ${t.label} carries no device version — cannot confirm on-device (the half reports ${got})`;
+              confirmedDetail = versionAdvisory;
+            } else if (dotTupleOf(got) === null) {
+              versionAdvisory = `the ${side} half reports "${got}" — not a comparable device version (target was ${t.label})`;
+              confirmedDetail = versionAdvisory;
+            } else {
+              return abort(
+                'version.confirm',
+                side,
+                `the ${side} half reports ${got} but ${t.label} was flashed — ` +
+                  'the write itself is hash-verified, so this half can be re-flashed',
+              );
+            }
+            break;
+          } catch {
+            /* connect/read died mid-exchange (the half may still be coming
+             * up): drop the session and keep polling for the port. */
+            if (owned.get(side) === versionSes) owned.delete(side);
+            try {
+              await versionSes.close();
+            } catch {
+              /* ignore */
+            }
+            versionSes = null;
+          }
+        }
+        if (confirmedDetail !== null) break;
+        const now = Date.now();
+        if (now >= confirmDeadline) break;
+        if (now - lastReset >= T.reResetMs) {
+          /* The swap ran but the half is not back: re-send the reset to the
+           * answering bootloader port (it may have missed the first one). */
+          try {
+            await exitBootloader(world, side, swapAnswerPort, T.probeMs, T.resetMs);
+          } catch {
+            /* best-effort — keep polling */
+          }
+          lastReset = Date.now();
+        }
+        await sleep(Math.min(T.pollMs, Math.max(0, confirmDeadline - Date.now())));
+      }
+      if (confirmedDetail === null) {
+        return abort(
+          'version.confirm',
+          side,
+          `the ${side} half never returned to app mode within ${Math.round(T.confirmMs / 1000)} s`,
+        );
+      }
+      if (versionAdvisory !== null) log.note('version.confirm', side, versionAdvisory);
+      else log.note('version.confirm', side, confirmedDetail);
+      log.ok('version.confirm', side);
     }
 
-    endFirmwareRun(
-      true,
-      `keyboard flash finished — ${targets.length} half${targets.length === 1 ? '' : 's'} updated`,
-      failures,
-      advisories,
+    /* ---- step 11: halves.settle — BOTH known halves answering again ------ */
+    /* The central drops off USB during the halves' re-link (known hardware
+     * behavior): re-probe the sessions we hold — owned first, then any
+     * pre-run session of a half we never rebooted — and poll the world for
+     * a re-appeared app port otherwise. Timeout fails the verdict but the
+     * run CONTINUES (the restores compare re-check later). The identity
+     * probe is fr.readFrame with an INJECTED deadline — never cmd(), whose
+     * 6-try ladder would stall ~30 s on a dead port. */
+    log.start('halves.settle');
+    const settleSides = new Set<Side>(targets.map((t2) => t2.side));
+    for (const s of ['left', 'right'] as const) {
+      if (deps.sesRef.current.has(s)) settleSides.add(s);
+    }
+    const probeIdentity = async (ses: NayaSession): Promise<boolean> => {
+      try {
+        ses.fr.clear();
+        await ses.writeFn(buildFrame(ses.dst, 0xfa, 0x10, 0x01, new Uint8Array([0])));
+        const f = await ses.fr.readFrame(T.probeMs);
+        return f.type === 0xfa;
+      } catch {
+        return false;
+      }
+    };
+    const settled = new Set<Side>();
+    const settleDeadline = Date.now() + T.settleMs;
+    while (settled.size < settleSides.size && Date.now() < settleDeadline) {
+      for (const side of settleSides) {
+        if (settled.has(side)) continue;
+        let ses = owned.get(side) ?? null;
+        if (ses !== null && (await probeIdentity(ses))) {
+          settled.add(side);
+          continue;
+        }
+        if (ses !== null) {
+          try {
+            await ses.close();
+          } catch {
+            /* ignore */
+          }
+          owned.delete(side);
+        }
+        ses = deps.sesRef.current.get(side) ?? null;
+        if (ses !== null && (await probeIdentity(ses))) {
+          settled.add(side);
+          continue;
+        }
+        const appPort = (await world.getPorts()).find((p) => portMatches(p, side, 'app')) ?? null;
+        if (appPort !== null) {
+          const fresh = await openOwnedSession(appPort, side);
+          if (fresh !== null) {
+            owned.set(side, fresh);
+            settled.add(side);
+            continue;
+          }
+        }
+      }
+      if (settled.size < settleSides.size) {
+        const remain = settleDeadline - Date.now();
+        if (remain <= 0) break;
+        await sleep(Math.min(T.pollMs, remain));
+      }
+    }
+    for (const side of settleSides) {
+      if (settled.has(side)) continue;
+      const detail = `the ${side} half never answered identity again within ${Math.round(T.settleMs / 1000)} s — power-cycle it if it stays dark`;
+      log.fail('halves.settle', side, detail);
+      failures.push(`halves.settle: ${detail}`);
+    }
+    if (settled.size === settleSides.size) {
+      log.ok('halves.settle', undefined, { detail: `${settled.size} half${settled.size === 1 ? '' : 'ves'} answered identity again` });
+    }
+
+    /* ---- run end: hand the ports back ------------------------------------- */
+    const ok = failures.length === 0;
+    return finishRun(
+      ok,
+      ok
+        ? `keyboard flash finished — ${targets.length} half${targets.length === 1 ? '' : 's'} updated`
+        : `keyboard flash finished with failures — ${targets.length} half${targets.length === 1 ? '' : 's'} updated`,
     );
-    return log;
   } catch (e) {
     /* Belt+braces: an unexpected throw (world rejection, dead port) fails
      * the run honestly instead of leaking the lock. */
     const m = msgOf(e);
     failures.push(`unexpected: ${m}`);
-    endFirmwareRun(false, `keyboard flash failed — ${m}`, failures, advisories);
-    return log;
+    return finishRun(false, `keyboard flash failed — ${m}`);
   }
 }
 

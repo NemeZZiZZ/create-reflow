@@ -57,6 +57,7 @@ export const STEP_LABELS: Record<string, string> = {
   'mcuboot.exit': 'Exit bootloader',
   'version.confirm': 'Confirm version',
   'halves.settle': 'Settle halves',
+  'bootloader.console': 'Bootloader console',
   'brightness.restore': 'Restore brightness',
   'lighting.restore': 'Restore lighting',
   'verify.compare': 'Compare against preflight',
