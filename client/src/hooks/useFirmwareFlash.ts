@@ -539,7 +539,12 @@ export const FLASH_TIMEOUT_DEFAULTS = {
   enterMs: 60_000,
   swapMs: 300_000,
   rePollMs: 2_000,
-  probeMs: 5_000,
+  /* First SMP image-state answer after a fresh latch is SLOW: KB measures
+   * 4–69 s (create-collective KB, flashing page); our own live board
+   * answered os-echo in 1.6 s but image-state stayed silent >30 s. A 5 s
+   * probe would abort a healthy booting half at identify. Smoke injects
+   * its own per-case probeMs, so this default is production-only. */
+  probeMs: 70_000,
   resetMs: 20_000,
   confirmMs: 300_000,
   reResetMs: 30_000,
