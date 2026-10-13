@@ -6940,8 +6940,8 @@ void (async () => {
     eq(wireShaL72 !== null && toHex(wireShaL72) === toHex(shaL72), false,
       '72(a) the wire sha is NOT the plaintext verify-sha the caller passes (two-hash rule)');
     const sm72 = log.events.find((e) => e.step === 'slot.map' && e.phase === 'ok');
-    eq(sm72 !== undefined && /assumed/.test(sm72.detail ?? ''), true,
-      '72(a) slot map: rc 8 → no map, ASSUMED image id noted');
+    eq(sm72 !== undefined && /image id 2 \(KB-measured; slot-info not queried\)/.test(sm72.detail ?? ''), true,
+      '72(a) slot map: KB-measured image id 2, slot-info never queried (live wedge 2026-10-13)');
     const note72 = log.events.find((e) => e.step === 'identify' && e.phase === 'note' && e.side === 'left');
     eq(note72 !== undefined && note72.sha256 === hex32(pre072), true,
       '72(a) identify note carries the slot-0 hash as arm token');

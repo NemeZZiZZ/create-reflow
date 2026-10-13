@@ -65,7 +65,7 @@ import type { RefObject } from 'react';
 import {
   bleGetAddress, bleGetAllPairs, bleGetPairAddress, buildFrame, DST_LEFT, DST_RIGHT,
   encodeRestorePayload, fwVersionText, hexToBytes, maxBrtOp, modFwText, modPresence, NayaSession,
-  parseCmdPath, parseInventory, parseLayer, resolveUploadImageId, sleep, SmpDevice,
+  parseCmdPath, parseInventory, parseLayer, sleep, SmpDevice,
   SmpLink, SMP_DEFAULT_TIMEOUTS, toHex,
 } from '@create-reflow/sdk';
 import type { ImageSlot, Side } from '@create-reflow/sdk';
@@ -1261,26 +1261,17 @@ export async function startKeyboardRun(
       );
       log.ok('identify', side);
 
-      /* Upload-target numbering: a device map confirms "0,1" → 2; rc 8 (no
-       * map) takes the ASSUMED-2 rule. A map read that fails otherwise is
-       * treated as no-map (the numbering is a confirmation, not a safety
-       * input); a map that DISAGREES (≠2) throws and fails the run. */
+      /* Upload-target numbering: KB-measured — keyboard images upload to
+       * direct slot id 2 (slot 1) on this firmware family; the vendor
+       * procedure never queries slot-info. Live 2026-10-13: a slot-info
+       * READ on fw 3.41.0 answered once (alien shape, no "0,1" key) and
+       * the bootloader's SMP service then went fully silent — identify had
+       * answered seconds earlier, rescue never got another reply. The
+       * numbering is a routing choice, not a safety input: never sending
+       * slot-info removes the wedge trigger and matches the KB path. */
       log.start('slot.map', side);
-      let map: Map<string, number> | null = null;
-      try {
-        map = await device.slotInfoMap();
-      } catch {
-        log.note('slot.map', side, 'slot-info read failed — continuing with the assumed numbering');
-      }
-      let imageId: number;
-      try {
-        imageId = resolveUploadImageId(map, 'keyboard');
-      } catch (e) {
-        await link.close();
-        dumpConsole(side, probeConsole, liveConsole);
-        return abort('slot.map', side, msgOf(e));
-      }
-      log.ok('slot.map', side, { detail: map !== null ? `map "0,1" → ${imageId}` : `no map — assumed image id ${imageId}` });
+      const imageId = 2;
+      log.ok('slot.map', side, { detail: 'image id 2 (KB-measured; slot-info not queried)' });
 
       /* Step 5: the interlock gate on live values. */
       log.start('gate.check', side);
@@ -2079,33 +2070,15 @@ export async function startModuleRun(
       log.note('identify', 'left', `bundle slot-0 ${slot0Hex.slice(0, 16)}… (arm token)`, { sha256: slot0Hex });
       log.ok('identify', 'left');
 
-      /* Slot map: 3 tries, else the unmapped rule (an exactly-1 MiB bundle
-       * may ride image id 4 unconfirmed; a disagreeing map throws). */
+      /* Upload-target numbering: KB-measured — the module bundle (exactly
+       * 1 MiB LittleFS) uploads to direct slot id 4 (slot3_partition),
+       * which the KB notes is NOT listed in slot-info at all. Live
+       * 2026-10-13 (keyboard run): a slot-info READ preceded total SMP
+       * silence on fw 3.41.0, so the procedures never query it; the
+       * exact-1-MiB gate rule already pins the bundle shape. */
       log.start('slot.map', 'left');
-      let map: Map<string, number> | null = null;
-      let mapped = false;
-      for (let i = 0; i < 3; i++) {
-        try {
-          map = await device.slotInfoMap();
-          mapped = true;
-          break;
-        } catch {
-          /* retry */
-        }
-      }
-      if (!mapped) {
-        log.note('slot.map', 'left', 'slot-info read failed 3× — continuing unmapped (the exact-1 MiB rule decides)');
-      }
-      let imageId: number;
-      try {
-        imageId = resolveUploadImageId(map, 'modules', bytes.length);
-      } catch (e) {
-        await link.close();
-        return abort('slot.map', msgOf(e));
-      }
-      log.ok('slot.map', 'left', {
-        detail: mapped ? `map confirmed → image id ${imageId}` : `no map — exact-1 MiB bundle → image id ${imageId}`,
-      });
+      const imageId = 4;
+      log.ok('slot.map', 'left', { detail: 'image id 4 (KB-measured; slot-info not queried)' });
 
       /* The interlock gate on live values (forceType lifts ONLY the type
        * rule — inside the gate; bay/right/arm/flashable always hold). */
