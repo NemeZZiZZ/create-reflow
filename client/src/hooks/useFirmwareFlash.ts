@@ -1141,24 +1141,20 @@ export async function startKeyboardRun(
       await ses.enterMcuboot();
       entered.add(side); // the half is rebooting — its app session is dead now
 
-      /* Step 4 (port discovery): poll getPorts for the re-enumerated
-       * MCUboot PID of this side. */
+      /* Step 4 (port discovery): find the re-enumerated MCUboot port of this
+       * side. With a grant mechanism the action fires IMMEDIATELY — a half
+       * the browser never granted is INVISIBLE to getPorts, so polling
+       * first would burn the whole ~30s MCUboot latch window dead (live
+       * 2026-10-13: the window opens at enter, a valid SMP frame inside
+       * it latches parking; the owner's picker click IS that frame's ride).
+       * The scan keeps racing the grant so an already-granted port (a
+       * second run) still wins on its own. */
       const scan = async (): Promise<PortWithInfo | null> => {
         const ports = await world.getPorts();
         return ports.find((p) => portMatches(p, side, 'mcuboot')) ?? null;
       };
       let bootPort: PortWithInfo | null = null;
-      const enterDeadline = Date.now() + T.enterMs;
-      while (bootPort === null && Date.now() < enterDeadline) {
-        bootPort = await scan();
-        if (bootPort !== null) break;
-        const remain = enterDeadline - Date.now();
-        if (remain <= 0) break;
-        await sleep(Math.min(T.pollMs, remain));
-      }
-      /* Grant path: no port appeared and the UI gave us a gesture callback —
-       * surface the action and race the grant against continued polling. */
-      if (bootPort === null && deps.grantPort !== undefined) {
+      if (deps.grantPort !== undefined) {
         log.action('mcuboot.enter', side, 'grant the bootloader port — pick the Naya device in the browser prompt');
         let granted: PortWithInfo | null | undefined; // undefined = pending, null = cancelled
         const grantP: Promise<PortWithInfo | null> = deps.grantPort().then(
@@ -1191,6 +1187,15 @@ export async function startKeyboardRun(
         }
         if (bootPort === null && granted === null) {
           return abort('mcuboot.enter', side, 'the port grant was cancelled — replug the half and retry');
+        }
+      } else {
+        const enterDeadline = Date.now() + T.enterMs;
+        while (bootPort === null && Date.now() < enterDeadline) {
+          bootPort = await scan();
+          if (bootPort !== null) break;
+          const remain = enterDeadline - Date.now();
+          if (remain <= 0) break;
+          await sleep(Math.min(T.pollMs, remain));
         }
       }
       if (bootPort === null) {
