@@ -80,9 +80,9 @@ import { checkFlashGate } from '../lib/firmware-interlocks';
 import type { KeyboardGateInput, ModuleGateInput } from '../lib/firmware-interlocks';
 import { newVault } from '../lib/firmware-fetch';
 import type { Vault } from '../lib/firmware-fetch';
-import { NAYA_VID, pidInfo } from '../lib/firmware-plat';
+import { NAYA_VID, RECOVERY_PIDS, pidInfo } from '../lib/firmware-plat';
 import { defaultSerialWorld } from '../lib/serial-world';
-import type { PortWithInfo, SerialWorld } from '../lib/serial-world';
+import type { GrantFilter, PortWithInfo, SerialWorld } from '../lib/serial-world';
 
 export type FlashRunStatus = 'idle' | 'running' | 'done' | 'failed';
 
@@ -100,9 +100,12 @@ export interface FlashDeps {
   timeouts?: FlashTimeouts; // defaults = FLASH_TIMEOUT_DEFAULTS (spec values)
   /* The user-gesture grant path: the core emits an `action` event and awaits
    * this; the UI resolves it by calling world.requestPort(...) and handing
-   * back the picked port. Absent → no grant is possible and a missing port
+   * back the picked port. The core passes side-specific bootloader PID
+   * filters (grantFiltersForSide) — absent filters mean vendor-only.
+   * The injector itself stays optional-arg, so existing zero-arg injectors
+   * keep compiling. Absent → no grant is possible and a missing port
    * fails with replug copy. */
-  grantPort?: () => Promise<PortWithInfo>;
+  grantPort?: (filters?: GrantFilter[]) => Promise<PortWithInfo>;
   /* The run-end handover (useSessions.rescan): called after the freeze flag
    * cleared — the sweep re-lists the granted ports and reconnects the
    * unclaimed app-mode halves. Absent (raw smoke runs) → no handover sweep. */
@@ -653,6 +656,16 @@ function portMatches(p: PortWithInfo, side: Side, mode: 'app' | 'mcuboot'): bool
   return info !== null && info.side === side && info.mode === mode;
 }
 
+/* Side-specific bootloader grant filters: the enter step passes these to
+ * the grant mechanism so the browser picker offers only this side's
+ * MCUboot PIDs (gen A + gen B from RECOVERY_PIDS) — a stale grant of the
+ * other half must never satisfy the pick. App PIDs never appear:
+ * RECOVERY_PIDS holds mcuboot PIDs only, and the side comes from pidInfo. */
+export function grantFiltersForSide(side: Side): GrantFilter[] {
+  return RECOVERY_PIDS.filter((pid) => pidInfo(pid)?.side === side)
+    .map((pid) => ({ usbVendorId: NAYA_VID, usbProductId: pid }));
+}
+
 interface SideConsole {
   text: string;
 }
@@ -1162,7 +1175,9 @@ export async function startKeyboardRun(
       if (deps.grantPort !== undefined) {
         log.action('mcuboot.enter', side, 'grant the bootloader port — pick the Naya device in the browser prompt');
         let granted: PortWithInfo | null | undefined; // undefined = pending, null = cancelled
-        const grantP: Promise<PortWithInfo | null> = deps.grantPort().then(
+        /* PID-scoped picker: only this side's bootloader PIDs are offered —
+         * a stale grant of the other half cannot satisfy the pick. */
+        const grantP: Promise<PortWithInfo | null> = deps.grantPort(grantFiltersForSide(side)).then(
           (p) => {
             granted = p;
             return p;
@@ -1187,6 +1202,14 @@ export async function startKeyboardRun(
             break;
           }
         }
+        /* Late-grant cleanup: the scan may have won while the picker was
+         * still open (or the deadline passed first) — the late pick is then
+         * unused and must not linger as a held grant shadowing the next
+         * run's picker. Best-effort: fakes may lack forget entirely. */
+        void grantP.then((p) => {
+          if (p === null || p === bootPort) return;
+          if (typeof p.forget === 'function') void p.forget();
+        });
         if (bootPort !== null && !portMatches(bootPort, side, 'mcuboot')) {
           return abort('mcuboot.enter', side, 'the granted port is not the expected bootloader — replug the half and retry');
         }

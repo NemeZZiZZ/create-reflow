@@ -20,13 +20,26 @@ import type { SmpSerialPortLike } from '@create-reflow/sdk';
 
 export interface PortWithInfo extends SmpSerialPortLike {
   getInfo?: () => { usbVendorId?: number; usbProductId?: number };
+  /* Release a held grant (WebSerial SerialPort.forget). Optional: node
+   * smoke fakes are plain objects without it — callers guard typeof. */
+  forget?: () => Promise<void>;
+}
+
+/* WebSerial requestPort filter: vendor-only narrows the picker to Naya
+ * devices; adding usbProductId values scopes it to one side's bootloader
+ * PIDs (the enter step builds them per side — the picker must not offer a
+ * stale grant of the other half). */
+export interface GrantFilter {
+  usbVendorId: number;
+  usbProductId?: number;
 }
 
 export interface SerialWorld {
   getPorts(): Promise<PortWithInfo[]>;
   /* The user-gesture path: the browser picker. Filters narrow the picker to
-   * Naya devices (usbVendorId). Rejects when the user cancels. */
-  requestPort(filters?: Array<{ usbVendorId?: number }>): Promise<PortWithInfo>;
+   * Naya devices (usbVendorId), optionally to one side's bootloader PIDs.
+   * Rejects when the user cancels. */
+  requestPort(filters?: GrantFilter[]): Promise<PortWithInfo>;
 }
 
 const NO_WEBSERIAL = 'no WebSerial — navigator.serial is unavailable in this context';

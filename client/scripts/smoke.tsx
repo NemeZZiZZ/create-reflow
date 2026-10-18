@@ -30,10 +30,11 @@ import type { RunEvent } from '../src/lib/firmware-run-log';
 import {
   beginFirmwareRun, capturePreflight, endFirmwareRun, firmwareRunActive, startKeyboardRun,
   startModuleRun, verifyPreflight, moduleFwSnapshot, MODULE_REPLUG_TEXT, FWUP_TYPES,
+  grantFiltersForSide,
 } from '../src/hooks/useFirmwareFlash';
 import { rescanSweep } from '../src/hooks/useSessions';
 import { defaultSerialWorld } from '../src/lib/serial-world';
-import type { PortWithInfo, SerialWorld } from '../src/lib/serial-world';
+import type { GrantFilter, PortWithInfo, SerialWorld } from '../src/lib/serial-world';
 import type { Vault } from '../src/lib/firmware-fetch';
 import * as fs from 'fs';
 import * as path from 'path';
@@ -6475,6 +6476,22 @@ void (async () => {
     eq(/WebSerial/.test(rpErr), true, '72 world: requestPort rejects lazily with the same reason');
   }
 
+  // ---- Task 1(a): side-specific bootloader grant filters ------------------
+  {
+    eq(grantFiltersForSide('left').length === 2 && grantFiltersForSide('right').length === 2, true,
+      '72 Task1(a) two filters per side (gen A + gen B)');
+    eq(JSON.stringify(grantFiltersForSide('left')),
+      JSON.stringify([{ usbVendorId: NAYA_VID, usbProductId: 0x6f }, { usbVendorId: NAYA_VID, usbProductId: 0x106f }]),
+      '72 Task1(a) left grant filters = VID + left mcuboot PIDs (gen A+B)');
+    eq(JSON.stringify(grantFiltersForSide('right')),
+      JSON.stringify([{ usbVendorId: NAYA_VID, usbProductId: 0xd3 }, { usbVendorId: NAYA_VID, usbProductId: 0x10d3 }]),
+      '72 Task1(a) right grant filters = VID + right mcuboot PIDs (gen A+B)');
+    const pids: Array<number | undefined> = [...grantFiltersForSide('left'), ...grantFiltersForSide('right')]
+      .map((f) => f.usbProductId);
+    eq(pids.includes(0x64) || pids.includes(0xc8), false,
+      '72 Task1(a) grant filters never carry app PIDs 0x64/0xC8');
+  }
+
   // ---- fixtures --------------------------------------------------------------
   const portInfo72 = (pid: number): { usbVendorId: number; usbProductId: number } =>
     ({ usbVendorId: NAYA_VID, usbProductId: pid });
@@ -6799,7 +6816,7 @@ void (async () => {
     swapAfterMs?: number | null;
     boots?: { left?: Array<'smp' | 'log'>; right?: Array<'smp'> };
     docked?: 'left' | 'right' | null;
-    grant?: 'reject' | null;
+    grant?: 'reject' | { port: PortWithInfo; afterMs: number; seen: Array<GrantFilter[] | undefined> } | null;
     enterMs?: number;
     returnToApp?: boolean; // T7: os reset re-enumerates the app port for version.confirm
   }) => {
@@ -6872,20 +6889,32 @@ void (async () => {
     sesRef.current.set('left', leftDev.session());
     sesRef.current.set('right', rightDev.session());
     let grantCalls = 0;
+    const grantOpt = o.grant;
     const deps = {
       sesRef,
       busyRef: { current: false },
       world: w.world,
       vault: mkVault72(),
       timeouts: { ...T72, ...(o.enterMs !== undefined ? { enterMs: o.enterMs } : {}) },
-      ...(o.grant === 'reject'
+      ...(grantOpt === 'reject'
         ? {
             grantPort: async (): Promise<PortWithInfo> => {
               grantCalls++;
               throw new Error('user cancelled the port picker');
             },
           }
-        : {}),
+        : grantOpt !== null && grantOpt !== undefined
+          ? {
+              /* Task 1 late-grant injector: resolves afterMs late with a
+               * caller-owned port, recording the filters the core passed. */
+              grantPort: async (filters?: GrantFilter[]): Promise<PortWithInfo> => {
+                grantCalls++;
+                grantOpt.seen.push(filters);
+                await sleep(grantOpt.afterMs);
+                return grantOpt.port;
+              },
+            }
+          : {}),
     };
     return {
       deps, bootL, bootR, logL, leftDev, rightDev,
@@ -7041,6 +7070,33 @@ void (async () => {
       '72(i) swap.verify refusal: the swap did not appear within the window');
   };
 
+  // ---- (j) Task 1: scan wins while the grant is still pending → the late
+  //      grant is released via forget(), the scan winner runs the flash ----
+  const caseJ72 = async (): Promise<void> => {
+    // A caller-owned stray port: NOT in the world list (a second picked
+    // device the run must never touch). It resolves 60 ms after the grant
+    // opens — after the re-enumerated boot port (~30 ms) already won the
+    // scan — and records whether it was released.
+    let forgot = 0;
+    const stray = { forget: async () => { forgot++; } } as unknown as PortWithInfo;
+    const seen: Array<GrantFilter[] | undefined> = [];
+    const c = mkCase72({
+      boots: { left: ['smp'] }, swapAfterMs: 40, returnToApp: true,
+      grant: { port: stray, afterMs: 60, seen },
+    });
+    const log = await begin72('72(j)', c, { targets: leftOnly72, ...kbOpts72 });
+    if (log === null) return;
+    await sleep(50); // the late grant settles mid-run; let forget() land
+    eq(last72(log).step === 'run.end' && last72(log).ok === true, true,
+      '72(j) scan winner runs the flash to ok while the grant is still pending');
+    eq(c.bootL.uploadCount(), 2, '72(j) the upload went to the scan winner (700 B = 512 + 188)');
+    eq(c.grantCalls(), 1, '72(j) the grant mechanism was awaited once');
+    eq(JSON.stringify(seen[0]),
+      JSON.stringify([{ usbVendorId: NAYA_VID, usbProductId: 0x6f }, { usbVendorId: NAYA_VID, usbProductId: 0x106f }]),
+      '72(j) the core passed side-specific PID filters to the grant');
+    eq(forgot, 1, '72(j) the unused late grant was released via forget()');
+  };
+
   // ---- (f) no port appears, injected grant mechanism rejects → clear copy ---
   const caseF72 = async (): Promise<void> => {
     const c = mkCase72({ boots: { left: [] }, grant: 'reject' });
@@ -7092,6 +7148,7 @@ void (async () => {
   await caseG72();
   await caseH72();
   await caseI72();
+  await caseJ72();
   signal72done?.();
 })();
 

@@ -35,7 +35,7 @@ import { useDraft } from "./hooks/useDraft";
 import { useFlash } from "./hooks/useFlash";
 import { useFirmwareFlash, firmwareVault } from "./hooks/useFirmwareFlash";
 import { defaultSerialWorld } from "./lib/serial-world";
-import type { PortWithInfo } from "./lib/serial-world";
+import type { GrantFilter, PortWithInfo } from "./lib/serial-world";
 import { NAYA_VID } from "./lib/firmware-plat";
 import { useCustomColors } from "./hooks/useCustomColors";
 import { useModuleProfiles } from "./hooks/useModuleProfiles";
@@ -243,18 +243,19 @@ export default function App() {
   const { customColors, saveCustomColors } = useCustomColors();
   // Firmware run hook (Phase 9, App-level per the wiring-only rule) — closes
   // the T7 review debt: rescan hands the ports back at run end; grantPort is
-  // a parked-promise bridge (the core's grantPort() call resolves only when
-  // the dialog's button click supplies the user gesture WebSerial's
+  // a parked-promise bridge (the core's grantPort(filters) call resolves only
+  // when the dialog's button click supplies the user gesture WebSerial's
   // requestPort() requires; the picked port flows back through the
   // deferred). world/vault ride the module-level instances above.
   const [fwGrantOpen, setFwGrantOpen] = useState(false);
   const fwGrantSettle = useRef<{
     resolve: (p: PortWithInfo) => void;
     reject: (e: unknown) => void;
+    filters?: GrantFilter[];
   } | null>(null);
-  const fwGrant = useCallback((): Promise<PortWithInfo> => {
+  const fwGrant = useCallback((filters?: GrantFilter[]): Promise<PortWithInfo> => {
     return new Promise<PortWithInfo>((resolve, reject) => {
-      fwGrantSettle.current = { resolve, reject };
+      fwGrantSettle.current = { resolve, reject, filters };
       setFwGrantOpen(true);
     });
   }, []);
@@ -262,7 +263,9 @@ export default function App() {
     const settle = fwGrantSettle.current;
     if (settle === null) return;
     try {
-      const p = await fwWorld.requestPort([{ usbVendorId: NAYA_VID }]);
+      // PID-scoped when the core supplied filters; vendor-only otherwise
+      // (the pre-Task-1 shape — filter-less callers keep working).
+      const p = await fwWorld.requestPort(settle.filters ?? [{ usbVendorId: NAYA_VID }]);
       settle.resolve(p);
     } catch (e) {
       settle.reject(e); // picker cancelled — the procedure reads it as such
