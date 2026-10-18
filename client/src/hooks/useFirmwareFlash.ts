@@ -777,6 +777,29 @@ async function probeOnce(port: PortWithInfo, probeMs: number, resetMs: number): 
   }
 }
 
+/* Race EVERY candidate port in parallel — the sequential first-answer loop
+ * starved the answering port of SMP traffic while a silent twin burned the
+ * whole per-silent-port probe budget against the ~30s MCUboot latch window.
+ * Here all probes START at once (every parked half sees an SMP frame
+ * immediately, so its latch holds), the first winner in candidate order is
+ * kept, every extra answerer's link is closed (never leaked), and the
+ * console text of ALL settled results is concatenated (a silent port's
+ * babble is evidence — never dropped). Same-side ports only; callers pass
+ * an already-filtered candidate list. */
+async function probeFirst(ports: PortWithInfo[], probeMs: number, resetMs: number): Promise<ProbeOutcome> {
+  const uniq = [...new Set(ports)];
+  const results = await Promise.all(uniq.map((p) => probeOnce(p, probeMs, resetMs)));
+  let winner: ProbeOutcome['winner'] = null;
+  let consoleText = '';
+  for (const r of results) {
+    consoleText += r.consoleText;
+    if (r.winner === null) continue;
+    if (winner === null) winner = r.winner;
+    else await r.winner.link.close(); // a second answerer — its link must not leak
+  }
+  return { winner, consoleText };
+}
+
 /* ---- return-to-app helpers (spec §5 steps 9-11) --------------------------- */
 
 /* fe/1002 payload → the declared version string the catalog labels use:
@@ -841,14 +864,11 @@ async function exitBootloader(
     return true;
   }
   const boots = [...new Set((await world.getPorts()).filter((p) => portMatches(p, side, 'mcuboot')))];
-  for (const c of boots) {
-    const r = await probeOnce(c, probeMs, resetMs);
-    if (r.winner === null) continue;
-    await r.winner.device.osReset();
-    await r.winner.link.close();
-    return true;
-  }
-  return false;
+  const first = await probeFirst(boots, probeMs, resetMs);
+  if (first.winner === null) return false;
+  await first.winner.device.osReset();
+  await first.winner.link.close();
+  return true;
 }
 
 /* Open a procedure-owned app-mode session with the SAME connect+identify
@@ -983,15 +1003,13 @@ export async function startKeyboardRun(
       return;
     }
     // Find the ANSWERING bootloader port (the silent twin never sees an SMP
-    // write), and os-reset it.
+    // write), and os-reset it — raced in parallel so a silent-first listing
+    // cannot burn the probe budget before the answerer is tried.
     let answer: PortWithInfo | null = null;
-    for (const c of boots) {
-      const r = await probeOnce(c, T.probeMs, T.resetMs);
-      if (r.winner !== null) {
-        answer = r.winner.port;
-        await r.winner.link.close();
-        break;
-      }
+    const first = await probeFirst(boots, T.probeMs, T.resetMs);
+    if (first.winner !== null) {
+      answer = first.winner.port;
+      await first.winner.link.close();
     }
     if (answer !== null) {
       try {
@@ -1237,20 +1255,15 @@ export async function startKeyboardRun(
       }
       log.ok('mcuboot.enter', side);
 
-      /* Identify: probe EVERY mcuboot candidate of the side — first
-       * imageState answer wins, silent ports close and ride the console. */
+      /* Identify: race EVERY mcuboot candidate of the side in parallel —
+       * first imageState answer wins, silent ports close and ride the
+       * console. Sequential order here burned the latch window when the
+       * silent twin listed first. */
       log.start('identify', side);
       const allBoot = [...new Set((await world.getPorts()).filter((p) => portMatches(p, side, 'mcuboot')))];
-      let win: Awaited<ReturnType<typeof probeOnce>>['winner'] = null;
-      let probeConsole = '';
-      for (const c of allBoot) {
-        const r = await probeOnce(c, T.probeMs, T.resetMs);
-        probeConsole += r.consoleText;
-        if (r.winner !== null) {
-          win = r.winner;
-          break;
-        }
-      }
+      const first = await probeFirst(allBoot, T.probeMs, T.resetMs);
+      const win = first.winner;
+      let probeConsole = first.consoleText;
       if (win === null) {
         dumpConsole(side, probeConsole, null);
         return abort('identify', side, 'no bootloader port answered SMP image-state — replug the half and retry');
@@ -2065,19 +2078,15 @@ export async function startModuleRun(
       }
       log.ok('mcuboot.enter', 'left');
 
-      /* ---- ONE link conversation: identify → slot map → chunks ------------ */
+      /* ---- ONE link conversation: identify → slot map → chunks ------------
+       * Candidates raced in parallel (probeFirst) — same latch-window reason
+       * as the keyboard identify: a silent-first listing must not burn the
+       * probe budget before the answerer is tried. */
       log.start('identify', 'left');
       const candidates = [...new Set((await world.getPorts()).filter((p) => portMatches(p, 'left', 'mcuboot')))];
-      let winner: Awaited<ReturnType<typeof probeOnce>>['winner'] = null;
-      let probeConsole = '';
-      for (const c of candidates) {
-        const r = await probeOnce(c, T.probeMs, T.resetMs);
-        probeConsole += r.consoleText;
-        if (r.winner !== null) {
-          winner = r.winner;
-          break;
-        }
-      }
+      const first = await probeFirst(candidates, T.probeMs, T.resetMs);
+      const winner = first.winner;
+      const probeConsole = first.consoleText;
       if (winner === null) {
         const text = probeConsole.trim();
         if (text !== '') log.note('bootloader.console', 'left', text.length > 2000 ? `${text.slice(0, 2000)}…` : text);

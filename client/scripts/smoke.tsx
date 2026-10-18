@@ -6516,6 +6516,8 @@ void (async () => {
   }) => {
     const linesWritten: string[] = [];
     let reads = 0;
+    let opens = 0; // Task 2(k): open/close counts — the race opens every candidate, closes every loser
+    let closes = 0;
     let stage: 'fresh' | 'uploaded' | 'swapped' = 'fresh';
     let total = -1;
     let controller: ReadableStreamDefaultController<Uint8Array> | null = null;
@@ -6602,9 +6604,9 @@ void (async () => {
     const port = {
       get readable() { return streams?.readable ?? null; },
       get writable() { return streams?.writable ?? null; },
-      async open() { build(); },
+      async open() { opens++; build(); },
       async setSignals() {},
-      async close() { streams = null; },
+      async close() { closes++; streams = null; },
       getInfo: () => portInfo72(o.pid),
     };
     const isWrite = (l: string, group: number, cmdId: number): boolean => {
@@ -6615,6 +6617,8 @@ void (async () => {
       port: port as unknown as PortWithInfo,
       linesWritten,
       reads: (): number => reads,
+      opens: (): number => opens,
+      closes: (): number => closes,
       uploadCount: (): number => linesWritten.filter((l) => isWrite(l, SMP.GROUP_IMAGE, SMP.ID_IMAGE_UPLOAD)).length,
       osResetCount: (): number => linesWritten.filter((l) => isWrite(l, SMP.GROUP_OS, SMP.ID_OS_RESET)).length,
     };
@@ -6624,6 +6628,8 @@ void (async () => {
   // answers) and babbles console text. Same rebuildable-stream contract.
   const mkLogPort72 = (pid: number, banner: string) => {
     const linesWritten: string[] = [];
+    let opens = 0; // Task 2(k): same open/close counts as the answering fake
+    let closes = 0;
     let streams: {
       readable: ReadableStream<Uint8Array>;
       writable: WritableStream<Uint8Array>;
@@ -6642,12 +6648,15 @@ void (async () => {
     const port = {
       get readable() { return streams?.readable ?? null; },
       get writable() { return streams?.writable ?? null; },
-      async open() { build(); },
+      async open() { opens++; build(); },
       async setSignals() {},
-      async close() { streams = null; },
+      async close() { closes++; streams = null; },
       getInfo: () => portInfo72(pid),
     };
-    return { port: port as unknown as PortWithInfo, linesWritten };
+    return {
+      port: port as unknown as PortWithInfo, linesWritten,
+      opens: (): number => opens, closes: (): number => closes,
+    };
   };
 
   // Injected SerialWorld: mutable port list behind getPorts.
@@ -7097,6 +7106,37 @@ void (async () => {
     eq(forgot, 1, '72(j) the unused late grant was released via forget()');
   };
 
+  // ---- (k) Task 2: parallel identify — [silent, answering] (in that order)
+  //      resolves via the answering port WITHOUT waiting out the silent one.
+  //      The solo baseline self-calibrates the 2× bound on this machine's
+  //      fixture clock (identify start→ok event brackets the probe window).
+  const identDt72 = (log: FirmwareRunLog): number => {
+    const s = log.events.find((e) => e.step === 'identify' && e.phase === 'start' && e.side === 'left');
+    const o = log.events.find((e) => e.step === 'identify' && e.phase === 'ok' && e.side === 'left');
+    return (typeof o?.ts === 'number' ? o.ts : 0) - (typeof s?.ts === 'number' ? s.ts : 0);
+  };
+  const caseK72 = async (): Promise<void> => {
+    const solo = mkCase72({ boots: { left: ['smp'] }, swapAfterMs: 40, returnToApp: true });
+    const soloLog = await begin72('72(k-solo)', solo, { targets: leftOnly72, ...kbOpts72 });
+    if (soloLog === null) return;
+    const soloDt = identDt72(soloLog);
+    const c = mkCase72({ boots: { left: ['log', 'smp'] }, swapAfterMs: 40, returnToApp: true });
+    const log = await begin72('72(k)', c, { targets: leftOnly72, ...kbOpts72 });
+    if (log === null) return;
+    const raceDt = identDt72(log);
+    eq(last72(log).step === 'run.end' && last72(log).ok === true, true,
+      '72(k) race [silent, answering] completes — the answering port wins');
+    eq(c.bootL.uploadCount(), 2, '72(k) upload went to the ANSWERING port (700 B = 512 + 188)');
+    eq(soloDt > 0 && raceDt > 0, true,
+      `72(k) identify start→ok brackets a real probe window (solo ${soloDt} ms, race ${raceDt} ms)`);
+    eq(raceDt < 2 * soloDt, true,
+      `72(k) parallel identify: race identify ${raceDt} ms < 2x solo answering-probe ${soloDt} ms (answering tried without waiting out the silent one)`);
+    eq(c.bootL.opens() >= 1 && c.logL.opens() >= 1, true,
+      '72(k) both candidates opened (silent + answering probed)');
+    eq(c.logL.opens() >= 1 && c.logL.closes() >= c.logL.opens(), true,
+      '72(k) the silent loser closed afterward (no leaked probe port)');
+  };
+
   // ---- (f) no port appears, injected grant mechanism rejects → clear copy ---
   const caseF72 = async (): Promise<void> => {
     const c = mkCase72({ boots: { left: [] }, grant: 'reject' });
@@ -7149,6 +7189,7 @@ void (async () => {
   await caseH72();
   await caseI72();
   await caseJ72();
+  await caseK72();
   signal72done?.();
 })();
 
