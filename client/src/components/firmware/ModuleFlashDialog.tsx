@@ -31,8 +31,9 @@ import type { FwCatalog, FwEntry } from '../../lib/firmware-catalog';
 import { moduleBundles, stripNayaLeadingZero } from '../../lib/firmware-plan';
 import type { Vault } from '../../lib/firmware-fetch';
 import type { HalfSnapshot } from '@create-reflow/sdk';
-import type { FlashRunStatus, ModuleForceType, StartModuleOpts } from '../../hooks/useFirmwareFlash';
-import { FWUP_TYPES } from '../../hooks/useFirmwareFlash';
+import type { FlashRunStatus, FirmwareRunRefusal, ModuleForceType, StartModuleOpts } from '../../hooks/useFirmwareFlash';
+import { FWUP_TYPES, firmwareRunRefusalText } from '../../hooks/useFirmwareFlash';
+import { toast } from 'sonner';
 import type { FirmwareRunLog, RunEvent } from '../../lib/firmware-run-log';
 import { cn } from '../../lib/utils';
 
@@ -42,7 +43,7 @@ export interface ModuleFlash {
   status: FlashRunStatus;
   events: readonly RunEvent[];
   log: FirmwareRunLog | null;
-  startModule: (opts: StartModuleOpts) => Promise<void>;
+  startModule: (opts: StartModuleOpts) => Promise<FirmwareRunRefusal | null>;
   exportLog: () => void;
 }
 
@@ -156,11 +157,14 @@ export default function ModuleFlashDialog({
 
   async function start(): Promise<void> {
     if (!canStart || target === null) return;
-    await flash.startModule({
+    const refusal = await flash.startModule({
       label: target,
       ...(forceType !== null ? { forceType } : {}),
       allowOlder,
     });
+    // A refused start says why instead of going silent (run-active when a
+    // run owns the halves, device-busy when a keymap op holds busyRef).
+    if (refusal !== null) toast.error(firmwareRunRefusalText(refusal));
   }
 
   const rows = stepRows(flash.events);

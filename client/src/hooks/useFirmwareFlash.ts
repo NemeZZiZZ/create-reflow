@@ -159,17 +159,37 @@ function unloadHandler(ev: unknown): void {
   e.returnValue = true; // beforeunload contract: truthy → the tab asks first
 }
 
-/** Open a firmware run. Refuses (null) when one is already active — one run
- * at a time, never two procedures racing for the halves — or when the app is
- * otherwise busy (busyRef held by a keymap flash/dump). Otherwise: freeze
- * flag on, busyRef held, unload guards registered, fresh log returned with
- * its run.start meta already written. */
+/* Refusal reasons: beginFirmwareRun never returns a silent null — a
+ * refused open names its cause so the procedures (resolve, never throw)
+ * and the dialogs (toast) can say why instead of going silent. */
+export type FirmwareRunRefusal = 'run-active' | 'device-busy';
+
+/** The open-run outcome: ok carries the fresh run log, refused carries
+ * the reason. startKeyboardRun/startModuleRun propagate it unchanged. */
+export type FirmwareRunOutcome =
+  | { ok: true; log: FirmwareRunLog }
+  | { ok: false; reason: FirmwareRunRefusal };
+
+/** Refusal reason → the exact user-facing line the dialogs toast.
+ * Exported (not DOM) so the smoke pins the copy verbatim. */
+export function firmwareRunRefusalText(reason: FirmwareRunRefusal): string {
+  return reason === 'run-active'
+    ? 'A firmware run is already active'
+    : 'Device busy — wait for the current operation to finish';
+}
+
+/** Open a firmware run. Refuses ({ ok: false } + reason) when one is
+ * already active — one run at a time, never two procedures racing for
+ * the halves — or when the app is otherwise busy (busyRef held by a
+ * keymap flash/dump). Otherwise: freeze flag on, busyRef held, unload
+ * guards registered, { ok: true } with the fresh log whose run.start
+ * meta is already written. */
 export function beginFirmwareRun(
   deps: FlashDeps,
   kind: 'keyboard' | 'module',
-): FirmwareRunLog | null {
-  if (activeRun !== null) return null;
-  if (deps.busyRef.current) return null;
+): FirmwareRunOutcome {
+  if (activeRun !== null) return { ok: false, reason: 'run-active' };
+  if (deps.busyRef.current) return { ok: false, reason: 'device-busy' };
   deps.busyRef.current = true;
   const win = guardTarget(deps);
   if (win) {
@@ -187,7 +207,7 @@ export function beginFirmwareRun(
       }
     },
   };
-  return log;
+  return { ok: true, log };
 }
 
 /** Close the active run: guards removed, flag + busyRef released, run.end
@@ -914,17 +934,19 @@ async function openOwnedSession(port: PortWithInfo, side: Side): Promise<NayaSes
  * handover: owned sessions closed, dead pre-flash sessions disconnected,
  * freeze flag cleared, rescan() handed the ports back.
  *
- * Returns the finished run log, or null when the run could not begin
- * (another run active / busyRef held). */
+ * Returns { ok: true } with the finished run log, or { ok: false } with
+ * the refusal reason when the run could not begin (another run active /
+ * busyRef held) — resolved, never thrown. */
 export async function startKeyboardRun(
   deps: FlashDeps,
   opts: StartKeyboardOpts,
-): Promise<FirmwareRunLog | null> {
+): Promise<FirmwareRunOutcome> {
   const world = deps.world ?? defaultSerialWorld();
   const vault = deps.vault ?? sharedVault;
   const T = { ...FLASH_TIMEOUT_DEFAULTS, ...deps.timeouts };
-  const log = beginFirmwareRun(deps, 'keyboard');
-  if (log === null) return null;
+  const begun = beginFirmwareRun(deps, 'keyboard');
+  if (!begun.ok) return begun;
+  const log = begun.log;
   deps.onBegin?.(log);
 
   const failures: string[] = [];
@@ -947,7 +969,7 @@ export async function startKeyboardRun(
    * pre-flash sessions, clear the freeze flag, then hand the ports back to
    * rescan() — it rebuilds the live sessions on the re-enumerated app
    * ports. */
-  const finishRun = async (ok: boolean, summary: string): Promise<FirmwareRunLog> => {
+  const finishRun = async (ok: boolean, summary: string): Promise<FirmwareRunOutcome> => {
     for (const s of owned.values()) {
       try {
         await s.close();
@@ -975,7 +997,7 @@ export async function startKeyboardRun(
         /* best-effort handover — the user can always reconnect manually */
       }
     }
-    return log;
+    return { ok: true, log };
   };
 
   /* ---- stranded-half rescue (spec §5 failure path) ------------------------
@@ -1083,7 +1105,7 @@ export async function startKeyboardRun(
   /* Failure tail: rescue any stranded half, then the failing verdict. EVERY
    * failure exit funnels through here — a half left in its bootloader is
    * put back into the application before the run reports failure. */
-  const failTail = async (detail: string): Promise<FirmwareRunLog> => {
+  const failTail = async (detail: string): Promise<FirmwareRunOutcome> => {
     try {
       await rescueStranded();
     } catch (e) {
@@ -1091,7 +1113,7 @@ export async function startKeyboardRun(
     }
     return finishRun(false, `keyboard flash failed — ${detail}`);
   };
-  const abort = (step: string, side: Side | undefined, detail: string): Promise<FirmwareRunLog> => {
+  const abort = (step: string, side: Side | undefined, detail: string): Promise<FirmwareRunOutcome> => {
     failures.push(`${step}: ${detail}`);
     log.fail(step, side, detail);
     return failTail(detail);
@@ -1792,16 +1814,19 @@ async function readDockType(ses: NayaSession): Promise<string | null> {
  * (left identity + keymap vs preflight) → verdict. The failure tail
  * recovers a parked left half; run teardown invalidates the module-fw
  * client cache and hands the ports back (both verdicts — finally
- * semantics). Every wait is an injected `timeouts` value. */
+ * semantics). Every wait is an injected `timeouts` value. Resolves
+ * { ok: true } with the finished run log, or { ok: false } with the
+ * refusal reason when the run could not begin — never thrown. */
 export async function startModuleRun(
   deps: FlashDeps,
   opts: StartModuleOpts,
-): Promise<FirmwareRunLog | null> {
+): Promise<FirmwareRunOutcome> {
   const world = deps.world ?? defaultSerialWorld();
   const vault = deps.vault ?? sharedVault;
   const T = { ...FLASH_TIMEOUT_DEFAULTS, ...deps.timeouts };
-  const log = beginFirmwareRun(deps, 'module');
-  if (log === null) return null;
+  const begun = beginFirmwareRun(deps, 'module');
+  if (!begun.ok) return begun;
+  const log = begun.log;
   deps.onBegin?.(log);
 
   const failures: string[] = [];
@@ -1824,7 +1849,7 @@ export async function startModuleRun(
     }
   };
 
-  const finishRun = async (ok: boolean, summary: string): Promise<FirmwareRunLog> => {
+  const finishRun = async (ok: boolean, summary: string): Promise<FirmwareRunOutcome> => {
     for (const s of owned.values()) {
       try {
         await s.close();
@@ -1853,14 +1878,14 @@ export async function startModuleRun(
         /* best-effort handover — the user can always reconnect manually */
       }
     }
-    return log;
+    return { ok: true, log };
   };
 
   /* Failure tail: a parked left half is put back into the application
    * before the run reports failure (os reset to the answering bootloader
    * port, then the app PID awaited within rescueMs, re-resets on the
    * cadence). */
-  const failTail = async (detail: string): Promise<FirmwareRunLog> => {
+  const failTail = async (detail: string): Promise<FirmwareRunOutcome> => {
     if (leftRebooted) {
       try {
         const ports0 = await world.getPorts();
@@ -1901,7 +1926,7 @@ export async function startModuleRun(
     }
     return finishRun(false, `module flash failed — ${detail}`);
   };
-  const abort = (step: string, detail: string): Promise<FirmwareRunLog> => {
+  const abort = (step: string, detail: string): Promise<FirmwareRunOutcome> => {
     failures.push(`${step}: ${detail}`);
     log.fail(step, 'left', detail);
     return failTail(detail);
@@ -2339,19 +2364,20 @@ export async function startModuleRun(
 /* ---- React mirror --------------------------------------------------------- */
 
 /** Thin reactive shell over the core: status/log/events state for the UI
- * timeline + exportLog (JSONL download). startKeyboard runs the whole
- * keyboard procedure (preflight → per-side flash → verdict) through
- * startKeyboardRun and mirrors the finished verdict into status; the run's
- * own log/events land in state when it completes. */
+ * timeline + exportLog (JSONL download). startKeyboard/startModule run the
+ * whole procedure through startKeyboardRun/startModuleRun and mirror the
+ * finished verdict into status; the run's own log/events land in state
+ * when it completes. A refused start resolves with the reason (the dialog
+ * toasts it) and leaves status idle. */
 export function useFirmwareFlash(deps: FlashDeps): {
   status: FlashRunStatus;
   log: FirmwareRunLog | null;
   events: readonly RunEvent[];
   exportLog: () => void;
-  beginRun: (kind: 'keyboard' | 'module') => FirmwareRunLog | null;
+  beginRun: (kind: 'keyboard' | 'module') => FirmwareRunOutcome;
   endRun: (ok: boolean, summary?: string, failures?: string[], advisories?: string[]) => void;
-  startKeyboard: (opts: StartKeyboardOpts) => Promise<void>;
-  startModule: (opts: StartModuleOpts) => Promise<void>;
+  startKeyboard: (opts: StartKeyboardOpts) => Promise<FirmwareRunRefusal | null>;
+  startModule: (opts: StartModuleOpts) => Promise<FirmwareRunRefusal | null>;
 } {
   const { sesRef, busyRef, win } = deps;
   const [status, setStatus] = useState<FlashRunStatus>('idle');
@@ -2359,9 +2385,10 @@ export function useFirmwareFlash(deps: FlashDeps): {
   const [events, setEvents] = useState<readonly RunEvent[]>([]);
 
   const beginRun = useCallback(
-    (kind: 'keyboard' | 'module'): FirmwareRunLog | null => {
-      const l = beginFirmwareRun({ sesRef, busyRef, win }, kind);
-      if (l !== null) {
+    (kind: 'keyboard' | 'module'): FirmwareRunOutcome => {
+      const begun = beginFirmwareRun({ sesRef, busyRef, win }, kind);
+      if (begun.ok) {
+        const l = begun.log;
         setLog(l);
         setEvents(l.events);
         l.subscribe(() => {
@@ -2369,7 +2396,7 @@ export function useFirmwareFlash(deps: FlashDeps): {
         });
         setStatus('running');
       }
-      return l;
+      return begun;
     },
     [sesRef, busyRef, win],
   );
@@ -2383,13 +2410,14 @@ export function useFirmwareFlash(deps: FlashDeps): {
   );
 
   const startKeyboard = useCallback(
-    async (opts: StartKeyboardOpts): Promise<void> => {
+    async (opts: StartKeyboardOpts): Promise<FirmwareRunRefusal | null> => {
       setStatus('running');
       /* The mirror subscribes through onBegin (the log opens synchronously
        * inside startKeyboardRun, before its first await) so the UI timeline
        * streams live — the same subscription beginRun makes; the final
-       * setLog/setEvents below re-syncs to the finished log. */
-      const l = await startKeyboardRun(
+       * setLog/setEvents below re-syncs to the finished log. A refused
+       * start resolves with the reason (the dialog toasts it) — never throws. */
+      const started = await startKeyboardRun(
         {
           ...deps,
           onBegin: (run) => {
@@ -2402,14 +2430,16 @@ export function useFirmwareFlash(deps: FlashDeps): {
         },
         opts,
       );
-      if (l === null) {
-        setStatus('idle'); // refused — a run is already active
-        return;
+      if (!started.ok) {
+        setStatus('idle'); // refused — the reason goes back for the dialog toast
+        return started.reason;
       }
+      const l = started.log;
       setLog(l);
       setEvents([...l.events]);
       const last = l.events[l.events.length - 1];
       setStatus(last !== undefined && last.step === 'run.end' && last.ok === false ? 'failed' : 'done');
+      return null;
     },
     [deps],
   );
@@ -2419,9 +2449,9 @@ export function useFirmwareFlash(deps: FlashDeps): {
   }, [log]);
 
   const startModule = useCallback(
-    async (opts: StartModuleOpts): Promise<void> => {
+    async (opts: StartModuleOpts): Promise<FirmwareRunRefusal | null> => {
       setStatus('running');
-      const l = await startModuleRun(
+      const started = await startModuleRun(
         {
           ...deps,
           onBegin: (run) => {
@@ -2434,14 +2464,16 @@ export function useFirmwareFlash(deps: FlashDeps): {
         },
         opts,
       );
-      if (l === null) {
-        setStatus('idle'); // refused — a run is already active
-        return;
+      if (!started.ok) {
+        setStatus('idle'); // refused — the reason goes back for the dialog toast
+        return started.reason;
       }
+      const l = started.log;
       setLog(l);
       setEvents([...l.events]);
       const last = l.events[l.events.length - 1];
       setStatus(last !== undefined && last.step === 'run.end' && last.ok === false ? 'failed' : 'done');
+      return null;
     },
     [deps],
   );

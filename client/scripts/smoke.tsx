@@ -28,9 +28,9 @@ import type { KeyboardGateInput, ModuleGateInput } from '../src/lib/firmware-int
 import { FirmwareRunLog, STEP_LABELS, stableStringify } from '../src/lib/firmware-run-log';
 import type { RunEvent } from '../src/lib/firmware-run-log';
 import {
-  beginFirmwareRun, capturePreflight, endFirmwareRun, firmwareRunActive, startKeyboardRun,
-  startModuleRun, verifyPreflight, moduleFwSnapshot, MODULE_REPLUG_TEXT, FWUP_TYPES,
-  grantFiltersForSide,
+  beginFirmwareRun, capturePreflight, endFirmwareRun, firmwareRunActive, firmwareRunRefusalText,
+  startKeyboardRun, startModuleRun, verifyPreflight, moduleFwSnapshot, MODULE_REPLUG_TEXT,
+  FWUP_TYPES, grantFiltersForSide,
 } from '../src/hooks/useFirmwareFlash';
 import { rescanSweep } from '../src/hooks/useSessions';
 import { defaultSerialWorld } from '../src/lib/serial-world';
@@ -6237,17 +6237,21 @@ void (async () => {
       if (winFns71.get(t) !== l) winRefs71 = false;
     },
   };
-  const log71b = beginFirmwareRun(
+  const begun71 = beginFirmwareRun(
     { sesRef: { current: map71 }, busyRef: busy71, win: win71 }, 'keyboard',
   );
-  eq(log71b !== null, true, '71 life: beginRun returns the run log');
+  eq(begun71.ok === true, true, '71 life: beginRun opens with ok');
+  eq(begun71.ok === true && begun71.log.events.length === 1, true,
+    '71 life: the ok case carries the fresh run log (run.start only)');
   eq(firmwareRunActive() === true && busy71.current === true, true,
     '71 life: flag true + busyRef held during the run');
   eq(JSON.stringify(winCalls71), JSON.stringify(['add:beforeunload', 'add:pagehide']),
     '71 life: begin registers both unload guards');
-  eq(beginFirmwareRun(
+  const refused71a = beginFirmwareRun(
     { sesRef: { current: map71 }, busyRef: busy71, win: win71 }, 'module',
-  ), null, '71 life: second beginRun while active refuses');
+  );
+  eq(refused71a !== null && refused71a.ok === false && refused71a.reason === 'run-active', true,
+    '71 life: second beginRun while active refuses with run-active');
   eq(firmwareRunActive() === true && busy71.current === true, true,
     '71 life: refusal leaves the first run intact');
   const handler71 = winFns71.get('beforeunload') as
@@ -6269,17 +6273,24 @@ void (async () => {
     '71 life: guards registered exactly while active (same handler refs)');
   eq(winRefs71, true, '71 life: removeEventListener receives the registered handler refs');
 
-  const log71c = beginFirmwareRun({ sesRef: { current: map71 }, busyRef: busy71 }, 'module');
-  eq(log71c !== null && log71c.id.startsWith('module-') && firmwareRunActive(), true,
-    '71 life: default win (globalThis, guarded) — module run begins');
+  const begun71c = beginFirmwareRun({ sesRef: { current: map71 }, busyRef: busy71 }, 'module');
+  eq(begun71c.ok === true && begun71c.log.id.startsWith('module-') && firmwareRunActive(), true,
+    '71 life: default win (globalThis, guarded) — module run begins with ok');
   endFirmwareRun(true, 'ok');
   eq(firmwareRunActive() === false && busy71.current === false, true,
     '71 life: clean end of the module run');
   eq(endFirmwareRun(true, 'noop'), null, '71 life: endRun without an active run is a no-op');
   const busyFake71 = { current: true };
-  eq(beginFirmwareRun(
+  const refused71b = beginFirmwareRun(
     { sesRef: { current: map71 }, busyRef: busyFake71 }, 'module',
-  ), null, '71 life: begin refuses while busyRef is held by another op');
+  );
+  eq(refused71b !== null && refused71b.ok === false && refused71b.reason === 'device-busy', true,
+    '71 life: begin refuses with device-busy while busyRef is held by another op');
+  eq(firmwareRunRefusalText('run-active'), 'A firmware run is already active',
+    '71 life: run-active refusal copy pinned verbatim (what the dialogs toast)');
+  eq(firmwareRunRefusalText('device-busy'),
+    'Device busy — wait for the current operation to finish',
+    '71 life: device-busy refusal copy pinned verbatim (what the dialogs toast)');
 
   /* ---- (c) preflight capture + verify on scripted fakes -------------------- */
   const macL71 = [0x11, 0x22, 0x33, 0x44, 0x55, 0x66];
@@ -6369,7 +6380,7 @@ void (async () => {
   const lf71 = beginFirmwareRun(
     { sesRef: { current: sessions71 }, busyRef: { current: false } }, 'keyboard',
   );
-  eq(lf71 !== null, true, '71 preflight: run begun for the capture');
+  eq(lf71.ok === true, true, '71 preflight: run begun for the capture');
   const cap71 = await capturePreflight(sessions71, ['left', 'right']);
   eq(cap71.kind, 'preflight', '71 preflight: capture tagged kind preflight');
   const hl71 = cap71.data.halves.left!;
@@ -6416,7 +6427,9 @@ void (async () => {
   eq(/^[0-9a-f]{64}$/.test(cap71.sha256), true, '71 preflight: sha256 is 64-hex');
   eq(cap71.serialized, stableStringify(cap71.data),
     '71 preflight: serialized = stable-key-order serialization of the doc');
-  const note71 = lf71!.events.find((e) => e.phase === 'note' && e.step === 'preflight.capture');
+  const note71 = lf71.ok
+    ? lf71.log.events.find((e) => e.phase === 'note' && e.step === 'preflight.capture')
+    : undefined;
   eq(note71 !== undefined && note71!.artifact === 'preflight' && note71!.sha256 === cap71.sha256,
     true, '71 preflight: artifact note in the run log carries the sha256');
   eq((await verifyPreflight(cap71)).ok, true, '71 preflight: re-serialize verify passes');
@@ -6935,12 +6948,15 @@ void (async () => {
 
   /* Cases run SEQUENTIALLY (each owns the module-level one-run lock for its
    * duration) and only after §71 has released it. Each case is its own
-   * function so a refused run (null) fails its assert instead of crashing
-   * the remaining sections. */
+   * function so a refused run fails its assert (with its reason) instead of
+   * crashing the remaining sections. */
   const begin72 = async (name: string, c: ReturnType<typeof mkCase72>, opts: Parameters<typeof startKeyboardRun>[1]): Promise<FirmwareRunLog | null> => {
-    const log = await startKeyboardRun(c.deps, opts);
-    if (log === null) eq(false, true, `${name}: run began (null = refused — the one-run lock was held)`);
-    return log;
+    const begun = await startKeyboardRun(c.deps, opts);
+    if (!begun.ok) {
+      eq(false, true, `${name}: run began (refused: ${begun.reason} — the one-run lock was held)`);
+      return null;
+    }
+    return begun.log;
   };
 
   // ---- (a) happy path, targets listed [right, left], run goes LEFT first ----
@@ -7618,10 +7634,11 @@ void (async () => {
   // ---- (a) reset discipline + (b-ok) version.confirm on the new port ------
   {
     const c = mkCase73A(fwBytes73(label73!));
-    const log = await startKeyboardRun(c.deps, { targets: leftOnly73, ...kbOpts73 });
-    if (log === null) {
+    const begun = await startKeyboardRun(c.deps, { targets: leftOnly73, ...kbOpts73 });
+    if (!begun.ok) {
       eq(false, true, '73(a): run began (null = refused — the one-run lock was held)');
     } else {
+      const log = begun.log;
       const le = lastEv73(log);
       eq(le.step === 'run.end' && le.ok === true, true, '73(a) run.end ok');
       const exitOk = log.events.findIndex((e) => e.step === 'mcuboot.exit' && e.phase === 'ok' && e.side === 'left');
@@ -7649,10 +7666,11 @@ void (async () => {
   // ---- (b) version mismatch → refusal with the hash-verified-write note ---
   {
     const c = mkCase73A(fwBytes73('3.40.0'));
-    const log = await startKeyboardRun(c.deps, { targets: leftOnly73, ...kbOpts73 });
-    if (log === null) {
+    const begun = await startKeyboardRun(c.deps, { targets: leftOnly73, ...kbOpts73 });
+    if (!begun.ok) {
       eq(false, true, '73(b): run began');
     } else {
+      const log = begun.log;
       const le = lastEv73(log);
       eq(le.step === 'run.end' && le.ok === false, true, '73(b) mismatch refuses the run');
       const vf = log.events.find((e) => e.step === 'version.confirm' && e.phase === 'fail' && e.side === 'left');
@@ -7680,12 +7698,13 @@ void (async () => {
     sesRef.current.set('left', leftDev.session());
     const vaultB2 = newVault();
     vaultB2.set(nf73!, bytes73(7));
-    const log = await startKeyboardRun({
+    const begun = await startKeyboardRun({
       sesRef, busyRef: { current: false }, world: w.world, vault: vaultB2, timeouts: T73,
     }, { targets: [{ side: 'left', label: 'NayaFlow 1.14.3' }], ...kbOpts73 });
-    if (log === null) {
+    if (!begun.ok) {
       eq(false, true, '73(b2): run began');
     } else {
+      const log = begun.log;
       const le = lastEv73(log);
       eq(le.step === 'run.end' && le.ok === true, true,
         '73(b2) non-versioned target → advisory only, run still ok');
@@ -7717,12 +7736,13 @@ void (async () => {
     const leftDev = scripted73(replyApp73, () => { drop73(w.list, appLstub); w.list.push(bootL.port); });
     const sesRef = { current: new Map<'left' | 'right', NayaSession>() };
     sesRef.current.set('left', leftDev.session());
-    const log = await startKeyboardRun({
+    const begun = await startKeyboardRun({
       sesRef, busyRef: { current: false }, world: w.world, vault: mkVault73(), timeouts: T73,
     }, { targets: leftOnly73, ...kbOpts73 });
-    if (log === null) {
+    if (!begun.ok) {
       eq(false, true, '73(b3): run began');
     } else {
+      const log = begun.log;
       eq(lastEv73(log).step === 'run.end' && lastEv73(log).ok === true, true,
         '73(b3) the re-reset cadence brings the half back — run ok');
       eq(resets, 2, '73(b3) exactly two resets were sent (re-reset every reResetMs while the app port was missing)');
@@ -7771,12 +7791,13 @@ void (async () => {
   };
   {
     const c = mkCase73C(false);
-    const log = await startKeyboardRun(c.deps, {
+    const begun = await startKeyboardRun(c.deps, {
       targets: [{ side: 'left', label: label73! }, { side: 'right', label: label73! }], ...kbOpts73,
     });
-    if (log === null) {
+    if (!begun.ok) {
       eq(false, true, '73(c-late): run began');
     } else {
+      const log = begun.log;
       const le = lastEv73(log);
       eq(le.step === 'run.end' && le.ok === true, true, '73(c-late) second half answers late (in window) → run ok');
       eq(log.events.some((e) => e.step === 'halves.settle' && e.phase === 'ok'), true,
@@ -7790,12 +7811,13 @@ void (async () => {
   }
   {
     const c = mkCase73C(true);
-    const log = await startKeyboardRun(c.deps, {
+    const begun = await startKeyboardRun(c.deps, {
       targets: [{ side: 'left', label: label73! }, { side: 'right', label: label73! }], ...kbOpts73,
     });
-    if (log === null) {
+    if (!begun.ok) {
       eq(false, true, '73(c-never): run began');
     } else {
+      const log = begun.log;
       const le = lastEv73(log);
       eq(le.step === 'run.end', true, '73(c-never) the run continues to run.end after the settle timeout');
       eq(le.ok === false, true, '73(c-never) the settle timeout fails the verdict');
@@ -7811,8 +7833,8 @@ void (async () => {
   // ---- (d) rescan sweep: freeze while a run owns the ports; app PIDs only --
   {
     const mapD = new Map<'left' | 'right', NayaSession>();
-    const beginD = beginFirmwareRun({ sesRef: { current: mapD }, busyRef: { current: false } }, 'keyboard');
-    eq(beginD !== null, true, '73(d) freeze: run begun');
+    const begunD = beginFirmwareRun({ sesRef: { current: mapD }, busyRef: { current: false } }, 'keyboard');
+    eq(begunD.ok === true, true, '73(d) freeze: run begun');
     let gpCalls = 0;
     await rescanSweep({
       getPorts: async () => { gpCalls += 1; return []; },
@@ -8306,10 +8328,11 @@ void (async () => {
   // outcome lands ("back running …"), the verdict still fails on the upload.
   {
     const c = mkCase74({ failUpload: true });
-    const log = await startKeyboardRun(c.deps, { targets: leftOnly74, ...kbOpts74 });
-    if (log === null) {
+    const begun = await startKeyboardRun(c.deps, { targets: leftOnly74, ...kbOpts74 });
+    if (!begun.ok) {
       eq(false, true, '74(a): run began');
     } else {
+      const log = begun.log;
       const le = lastEv74(log);
       eq(le.step === 'run.end' && le.ok === false, true, '74(a) run.end fails on the upload throw');
       eq((le.failures as string[]).some((f) => f.startsWith('upload:')), true,
@@ -8327,10 +8350,11 @@ void (async () => {
   // ---- (a2) the half never comes back → still-parked power-cycle outcome ---
   {
     const c = mkCase74({ failUpload: true, reenumerate: false });
-    const log = await startKeyboardRun(c.deps, { targets: leftOnly74, ...kbOpts74 });
-    if (log === null) {
+    const begun = await startKeyboardRun(c.deps, { targets: leftOnly74, ...kbOpts74 });
+    if (!begun.ok) {
       eq(false, true, '74(a2): run began');
     } else {
+      const log = begun.log;
       const le = lastEv74(log);
       eq(le.step === 'run.end' && le.ok === false, true, '74(a2) run.end fails');
       const rf = log.events.find((e) => e.step === 'rescue' && e.phase === 'fail' && e.side === 'left');
@@ -8347,11 +8371,12 @@ void (async () => {
   {
     const c = mkCase74({ noBootPort: true, enterMs: 90 });
     const t0 = Date.now();
-    const log = await startKeyboardRun(c.deps, { targets: leftOnly74, ...kbOpts74 });
+    const begun = await startKeyboardRun(c.deps, { targets: leftOnly74, ...kbOpts74 });
     const dt = Date.now() - t0;
-    if (log === null) {
+    if (!begun.ok) {
       eq(false, true, '74(a3): run began');
     } else {
+      const log = begun.log;
       const le = lastEv74(log);
       eq(le.step === 'run.end' && le.ok === false, true, '74(a3) run.end fails');
       const rf = log.events.find((e) => e.step === 'rescue' && e.phase === 'fail' && e.side === 'left');
@@ -8366,10 +8391,11 @@ void (async () => {
     const c = mkCase74({
       postApp: { be8: Uint8Array.from([0x99, 0x88, 0x77, 0x66, 0x55, 0x44]) },
     });
-    const log = await startKeyboardRun(c.deps, { targets: leftOnly74, ...kbOpts74 });
-    if (log === null) {
+    const begun = await startKeyboardRun(c.deps, { targets: leftOnly74, ...kbOpts74 });
+    if (!begun.ok) {
       eq(false, true, '74(b1): run began');
     } else {
+      const log = begun.log;
       const le = lastEv74(log);
       eq(le.step === 'run.end' && le.ok === false, true, '74(b1) a BLE address change fails the run');
       const cf = log.events.find((e) => e.step === 'verify.compare' && e.phase === 'fail');
@@ -8389,10 +8415,11 @@ void (async () => {
           : Uint8Array.from([part === 0 ? 0x00 : 0x00, layer, part === 0 ? 0xc8 : 0x00, 0x00, 0x64, 0x11])),
       },
     });
-    const log = await startKeyboardRun(c.deps, { targets: leftOnly74, ...kbOpts74 });
-    if (log === null) {
+    const begun = await startKeyboardRun(c.deps, { targets: leftOnly74, ...kbOpts74 });
+    if (!begun.ok) {
       eq(false, true, '74(b2): run began');
     } else {
+      const log = begun.log;
       const le = lastEv74(log);
       eq(le.step === 'run.end' && le.ok === true, true, '74(b2) an LED map difference never fails the run');
       eq((le.advisories as string[]).some((a) => /LED map/.test(a)), true,
@@ -8428,10 +8455,11 @@ void (async () => {
       preBanks: { keymap: { 0: blob74pre } },
       postApp: { keyBank: keyBankParts74(blob74post) },
     });
-    const log = await startKeyboardRun(c.deps, { targets: leftOnly74, ...kbOpts74 });
-    if (log === null) {
+    const begun = await startKeyboardRun(c.deps, { targets: leftOnly74, ...kbOpts74 });
+    if (!begun.ok) {
       eq(false, true, '74(b3): run began');
     } else {
+      const log = begun.log;
       const le = lastEv74(log);
       eq(le.step === 'run.end' && le.ok === true, true, '74(b3) the NONE-equivalent keymap compares clean — run ok');
       const cok = log.events.find((e) => e.step === 'verify.compare' && e.phase === 'ok');
@@ -8453,10 +8481,11 @@ void (async () => {
     const invReply = encodeLayerListAdd(inv74); // 00 00 prefix — parses as an inventory reply too
     const echoExpected = encodeRestorePayload(inv74);
     const c = mkCase74({ postApp: { inventory: invReply } });
-    const log = await startKeyboardRun(c.deps, { targets: leftOnly74, ...kbOpts74 });
-    if (log === null) {
+    const begun = await startKeyboardRun(c.deps, { targets: leftOnly74, ...kbOpts74 });
+    if (!begun.ok) {
       eq(false, true, '74(c): run began');
     } else {
+      const log = begun.log;
       const le = lastEv74(log);
       eq(le.step === 'run.end' && le.ok === true, true, '74(c) the restored run ends ok');
       const brts = c.appAfterL.writesOf('ed/13');
@@ -8482,10 +8511,11 @@ void (async () => {
     // there would leave version.confirm polling a session that can never
     // open. The lighting failure rides '30/2' (the echo write) instead.
     const c = mkCase74({ postApp: { throwKeys: ['ed/13', '30/2'] } });
-    const log = await startKeyboardRun(c.deps, { targets: leftOnly74, ...kbOpts74 });
-    if (log === null) {
+    const begun = await startKeyboardRun(c.deps, { targets: leftOnly74, ...kbOpts74 });
+    if (!begun.ok) {
       eq(false, true, '74(c2): run began');
     } else {
+      const log = begun.log;
       const le = lastEv74(log);
       eq(le.step === 'run.end' && le.ok === true, true, '74(c2) a throwing restore never fails the run');
       const bn = log.events.find((e) => e.step === 'brightness.restore' && e.phase === 'note' && e.side === 'left');
@@ -8940,9 +8970,12 @@ void (async () => {
     c: ReturnType<typeof mkCase75>,
     opts: Parameters<typeof startModuleRun>[1],
   ): Promise<FirmwareRunLog | null> => {
-    const log = await startModuleRun(c.deps, opts);
-    if (log === null) eq(false, true, `${name}: run began (null = refused — the one-run lock was held)`);
-    return log;
+    const begun = await startModuleRun(c.deps, opts);
+    if (!begun.ok) {
+      eq(false, true, `${name}: run began (refused: ${begun.reason} — the one-run lock was held)`);
+      return null;
+    }
+    return begun.log;
   };
 
   // ---- (a) precondition refusals — no bootloader entry, ever ---------------

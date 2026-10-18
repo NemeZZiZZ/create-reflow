@@ -37,7 +37,9 @@ import type { HalfPlan } from '../../lib/firmware-plan';
 import type { SerialWorld } from '../../lib/serial-world';
 import { NAYA_VID, pidInfo } from '../../lib/firmware-plat';
 import type { HalfSnapshot, Side } from '@create-reflow/sdk';
-import type { FlashRunStatus, StartKeyboardOpts, StartModuleOpts } from '../../hooks/useFirmwareFlash';
+import type { FlashRunStatus, FirmwareRunRefusal, StartKeyboardOpts, StartModuleOpts } from '../../hooks/useFirmwareFlash';
+import { firmwareRunRefusalText } from '../../hooks/useFirmwareFlash';
+import { toast } from 'sonner';
 import type { FirmwareRunLog, RunEvent } from '../../lib/firmware-run-log';
 import { cn } from '../../lib/utils';
 
@@ -47,8 +49,8 @@ export interface KeyboardFlash {
   status: FlashRunStatus;
   events: readonly RunEvent[];
   log: FirmwareRunLog | null;
-  startKeyboard: (opts: StartKeyboardOpts) => Promise<void>;
-  startModule: (opts: StartModuleOpts) => Promise<void>;
+  startKeyboard: (opts: StartKeyboardOpts) => Promise<FirmwareRunRefusal | null>;
+  startModule: (opts: StartModuleOpts) => Promise<FirmwareRunRefusal | null>;
   exportLog: () => void;
 }
 
@@ -272,12 +274,15 @@ export default function KeyboardFlashDialog({
 
   async function start(): Promise<void> {
     if (!canStart || label === null) return;
-    await flash.startKeyboard({
+    const refusal = await flash.startKeyboard({
       targets: selected.map((h) => ({ side: h.side, label })),
       allowOlder,
       acceptUnknown: true,
       consentedUnknown: consent,
     });
+    // A refused start says why instead of going silent (run-active when a
+    // run owns the halves, device-busy when a keymap op holds busyRef).
+    if (refusal !== null) toast.error(firmwareRunRefusalText(refusal));
   }
 
   const rows = stepRows(flash.events);
