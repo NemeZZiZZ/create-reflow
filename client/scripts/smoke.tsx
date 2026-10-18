@@ -106,7 +106,7 @@ import {
 import {
   parseModuleList, recordsFromModuleBlob, matchSlots, captureFromSlots, repointBays,
 } from '@create-reflow/sdk';
-import type { LayerDump } from '../src/hooks/useLayers';
+import { DUMP_WATCHDOG_MS, runDumpAll, type LayerDump } from '../src/hooks/useLayers';
 
 let n = 0;
 function eq(a: unknown, b: unknown, name: string) {
@@ -9133,6 +9133,41 @@ void (async () => {
   }
 
   signal75done?.();
+})();
+
+void (async () => {
+  // §76 dumpAll watchdog: a wedged transport (first write never resolves)
+  // must not hold busyRef — the dump reports the timeout and returns null.
+  const stalled76 = {
+    handshake(): Promise<never> { return new Promise(() => {}); },
+    readLayer(): Promise<never> { return new Promise(() => {}); },
+    readLedmap(): Promise<never> { return new Promise(() => {}); },
+  } as unknown as NayaSession;
+  const busy76 = { current: false };
+  const errs76: string[] = [];
+  const log76 = (cls: string, msg: string): void => {
+    if (cls === 'err') errs76.push(msg);
+  };
+  let dumpStat76 = '';
+  let ledDumpStat76 = '';
+  const got76 = await Promise.race([
+    runDumpAll(stalled76, busy76, log76, {
+      setLayerList: (): void => {},
+      setKeysByLayer: (): void => {},
+      setLedsByLayer: (): void => {},
+      setBlobTotals: (): void => {},
+      setHasRead: (): void => {},
+      setDumpStat: (s: string): void => { dumpStat76 = s; },
+      setLedDumpStat: (s: string): void => { ledDumpStat76 = s; },
+    }, 50),
+    sleep(2000).then((): string => 'TIMEOUT'),
+  ]);
+  eq(got76, null, '76 watchdog: stalled dump resolves null (never hangs)');
+  eq(busy76.current, false, '76 watchdog: busyRef released');
+  eq(dumpStat76, 'FAILED: dump timed out — replug the half and retry', '76 watchdog: dump stat exact');
+  eq(ledDumpStat76, 'FAILED: dump timed out — replug the half and retry', '76 watchdog: led stat exact');
+  eq(errs76.includes('dump: dump timed out — replug the half and retry'), true, '76 watchdog: err log copy exact');
+  eq(DUMP_WATCHDOG_MS, 120_000, '76 watchdog: 120s wall clock');
 })();
 
 void main();
