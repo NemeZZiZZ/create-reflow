@@ -98,6 +98,35 @@ function tupleCompare(a: number[], b: number[]): number {
   return 0;
 }
 
+/* HalfSnapshot.fw ('v0.3.41.0') → the catalog label that matches it
+ * ('3.41.0'). Device strings are Naya's 0.MAJOR.MINOR.PATCH form — one
+ * LEADING zero component ahead of the catalog labels — so exact string
+ * equality never matches: normalize through the shared strip-ONE helper
+ * (stripNayaLeadingZero above — same semantics as the plan and the module
+ * dialog), then trailing-zero-insensitive tuple compare against the
+ * catalog's declared keyboard labels; no hit → the raw string back (the
+ * plan reads it as unknown-current — which it honestly is). A genuine
+ * '0.0.x' current is never stripped into a match with a nonzero label.
+ * '—'/unparseable → null. Live-verified 2026-10-13: stock halves report
+ * 'v0.3.41.0' for catalog '3.41.0'. */
+export function fwLabelOf(fw: string, declared: string[]): string | null {
+  const t = (fw.split('  [')[0] ?? '').trim();
+  if (t === '' || t === '—') return null;
+  const raw = t.startsWith('v') ? t.slice(1) : t;
+  const tuple = (s: string): number[] | null =>
+    /^\d+(\.\d+)*$/.test(s) ? s.split('.').map((p) => Number.parseInt(p, 10)) : null;
+  const cur = tuple(stripNayaLeadingZero(raw));
+  if (cur === null) return null;
+  for (const d of declared) {
+    const dt = tuple(d);
+    if (dt === null) continue;
+    const len = Math.max(cur.length, dt.length);
+    const eq = Array.from({ length: len }, (_, i) => (cur[i] ?? 0) === (dt[i] ?? 0)).every(Boolean);
+    if (eq) return d;
+  }
+  return raw;
+}
+
 /* Newest same-side/same-gen catalog row for the label, ignoring flashable —
  * only used to explain WHY nothing flashable matched. */
 function anyCandidate(cat: FwCatalog, side: 'left' | 'right', gen: 'A' | 'B', label: string): FwEntry | null {

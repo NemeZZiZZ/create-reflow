@@ -32,7 +32,7 @@ import type { FwCatalog } from '../../lib/firmware-catalog';
 import { keyboardVersions } from '../../lib/firmware-catalog';
 import { fetchVersion } from '../../lib/firmware-fetch';
 import type { Vault } from '../../lib/firmware-fetch';
-import { resolveKeyboardPlan } from '../../lib/firmware-plan';
+import { resolveKeyboardPlan, fwLabelOf } from '../../lib/firmware-plan';
 import type { HalfPlan } from '../../lib/firmware-plan';
 import type { SerialWorld } from '../../lib/serial-world';
 import { NAYA_VID, pidInfo } from '../../lib/firmware-plat';
@@ -54,32 +54,9 @@ export interface KeyboardFlash {
   exportLog: () => void;
 }
 
-/* HalfSnapshot.fw ('v0.3.41.0') → the catalog label that matches it
- * ('3.41.0'). Device strings are Naya's 0.MAJOR.MINOR.PATCH form — one
- * LEADING zero component ahead of the catalog labels — so exact string
- * equality never matches: align by leading-zero-stripped, trailing-zero-
- * insensitive tuple compare against the catalog's declared keyboard labels;
- * no hit → the raw string back (the plan reads it as unknown-current —
- * which it honestly is). '—'/unparseable → null. Live-verified 2026-10-13:
- * stock halves report 'v0.3.41.0' for catalog '3.41.0'. */
-function fwLabelOf(fw: string, declared: string[]): string | null {
-  const t = (fw.split('  [')[0] ?? '').trim();
-  if (t === '' || t === '—') return null;
-  const raw = t.startsWith('v') ? t.slice(1) : t;
-  const tuple = (s: string): number[] | null =>
-    /^\d+(\.\d+)*$/.test(s) ? s.split('.').map((p) => Number.parseInt(p, 10)) : null;
-  const cur = tuple(raw);
-  if (cur === null) return null;
-  while (cur.length > 1 && cur[0] === 0) cur.shift();
-  for (const d of declared) {
-    const dt = tuple(d);
-    if (dt === null) continue;
-    const len = Math.max(cur.length, dt.length);
-    const eq = Array.from({ length: len }, (_, i) => (cur[i] ?? 0) === (dt[i] ?? 0)).every(Boolean);
-    if (eq) return d;
-  }
-  return raw;
-}
+/* HalfSnapshot.fw ('v0.3.41.0') is aligned to the catalog label by
+ * lib/firmware-plan's fwLabelOf (shared strip-ONE semantics) at the
+ * single call site below — display-side only, as the file header notes. */
 
 const SIDES: readonly Side[] = ['left', 'right'];
 

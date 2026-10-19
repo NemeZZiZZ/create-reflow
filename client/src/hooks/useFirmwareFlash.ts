@@ -1326,7 +1326,10 @@ export async function startKeyboardRun(
        * the bootloader's SMP service then went fully silent — identify had
        * answered seconds earlier, rescue never got another reply. The
        * numbering is a routing choice, not a safety input: never sending
-       * slot-info removes the wedge trigger and matches the KB path. */
+       * slot-info removes the wedge trigger and matches the KB path. The
+       * gate's uploadImageId === 2 check is therefore a standing
+       * tautology — INTENTIONAL defense-in-depth (SDK resolveUploadImageId
+       * stays the numbering-rule reference; fixtures cover both). */
       log.start('slot.map', side);
       const imageId = 2;
       log.ok('slot.map', side, { detail: 'image id 2 (KB-measured; slot-info not queried)' });
@@ -2132,7 +2135,9 @@ export async function startModuleRun(
        * which the KB notes is NOT listed in slot-info at all. Live
        * 2026-10-13 (keyboard run): a slot-info READ preceded total SMP
        * silence on fw 3.41.0, so the procedures never query it; the
-       * exact-1-MiB gate rule already pins the bundle shape. */
+       * exact-1-MiB gate rule already pins the bundle shape. As on the
+       * keyboard path, the gate's uploadImageId === 4 check is a standing
+       * tautology — INTENTIONAL defense-in-depth, same rationale. */
       log.start('slot.map', 'left');
       const imageId = 4;
       log.ok('slot.map', 'left', { detail: 'image id 4 (KB-measured; slot-info not queried)' });

@@ -22,7 +22,7 @@ import {
   FIRMWARE_SOURCE_BASE, newVault, fetchImage, fetchVersion,
 } from '../src/lib/firmware-fetch';
 import { NAYA_VID, RECOVERY_PIDS, pidInfo } from '../src/lib/firmware-plat';
-import { resolveKeyboardPlan, resolveModulePlan, moduleBundles } from '../src/lib/firmware-plan';
+import { resolveKeyboardPlan, resolveModulePlan, moduleBundles, fwLabelOf } from '../src/lib/firmware-plan';
 import { checkFlashGate } from '../src/lib/firmware-interlocks';
 import type { KeyboardGateInput, ModuleGateInput } from '../src/lib/firmware-interlocks';
 import { FirmwareRunLog, STEP_LABELS, stableStringify } from '../src/lib/firmware-run-log';
@@ -5976,6 +5976,23 @@ void (async () => {
   eq(nayaPlan69.downgrade, false, '69 module plan: equal versions are not a downgrade');
   const nayaDown69 = resolveModulePlan(cat69, '0.3.41.0', '0.2.3.3', '2.3.2');
   eq(nayaDown69.downgrade, true, '69 module plan: 2.3.3 → 2.3.2 is a downgrade in Naya form too');
+
+  // fwLabelOf (firmware-plan, display-side alignment for the keyboard
+  // dialog) must agree with the plan-side strip-ONE semantics: a genuine
+  // '0.0.x' current is NOT a Naya-prefixed label, so it must never match
+  // a nonzero catalog label — strip-ALL semantics used to align 'v0.0.5'
+  // onto declared '5'.
+  eq(fwLabelOf('v0.3.41.0', ['2.3.3', '3.41.0']), '3.41.0',
+    '69 fwLabelOf: Naya form aligns to the declared catalog label');
+  eq(fwLabelOf('v3.41.0.0  [deadbeef]', ['3.41.0']), '3.41.0',
+    '69 fwLabelOf: v-prefix, aux-text suffix, trailing-zero compare');
+  eq(fwLabelOf('v0.0.5', ['3.41.0']), '0.0.5',
+    '69 fwLabelOf: genuine 0.0.5 unknown to the catalog returns the raw string');
+  eq(fwLabelOf('v0.0.5', ['5']), '0.0.5',
+    '69 fwLabelOf: genuine 0.0.5 NEVER matches nonzero catalog label 5');
+  eq(fwLabelOf('—', ['3.41.0']), null, '69 fwLabelOf: em-dash current is null');
+  eq(fwLabelOf('NayaFlow 1.14.3', ['3.41.0']), null,
+    '69 fwLabelOf: non-versioned label is null');
 })();
 
 // §70 firmware interlock gate: the full refusal matrix — every rule alone

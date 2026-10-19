@@ -837,6 +837,12 @@ export class SmpDevice {
 // anything else throws. With no map at all: keyboard falls back to the
 // ASSUMED rule 2*image + slot + 1 (= 2 here, allowed by the spec decision);
 // modules may go unmapped only for an exactly-1 MiB bundle.
+//
+// Fixture-covered only (smoke §68g numbering matrix): NO production callers
+// since the client pinned static ids (useFirmwareFlash: keyboard 2, modules
+// 4 — KB-measured; a live slot-info READ wedged the bootloader SMP service
+// on fw 3.41.0, 2026-10-13, so the procedures never query a map). Kept as
+// the executable statement of the numbering rule the static ids encode.
 export function resolveUploadImageId(
   map: Map<string, number> | null,
   kind: 'keyboard' | 'modules',
