@@ -21,6 +21,8 @@ import type { FwCatalog, FwEntry } from '../src/lib/firmware-catalog';
 import {
   FIRMWARE_SOURCE_BASE, newVault, fetchImage, fetchVersion,
 } from '../src/lib/firmware-fetch';
+import { hydrateVault, vaultStore } from '../src/lib/firmware-vault-store';
+import type { VaultStore, VaultRow } from '../src/lib/firmware-vault-store';
 import { NAYA_VID, RECOVERY_PIDS, pidInfo } from '../src/lib/firmware-plat';
 import { resolveKeyboardPlan, resolveModulePlan, moduleBundles, fwLabelOf } from '../src/lib/firmware-plan';
 import { checkFlashGate } from '../src/lib/firmware-interlocks';
@@ -5965,6 +5967,120 @@ void (async () => {
   eq(rReal69.failed.every((f) => f.reason.includes('nothing was written')), true,
     '69 fetchVersion real: every attempt stopped at the sha256 gate');
   eq(vReal69.count(), 0, '69 fetchVersion real: nothing written on total mismatch');
+
+  // §6v persistent vault (IndexedDB backing store): node smoke has no
+  // indexedDB, so the store is injected — these pin (a) the no-idb guard,
+  // (b) hydrate semantics incl. corrupt-row skipping + idempotence, and
+  // (c) fetchVersion's digest-gated write-through through the sink.
+  eq(typeof indexedDB, 'undefined', '6v guard: node smoke has no indexedDB (no-op precondition)');
+  const memStore6v = (): { store: VaultStore; rows: VaultRow[] } => {
+    const rows: VaultRow[] = [];
+    return {
+      rows,
+      store: {
+        // snapshot, rows verbatim — corrupt rows (null, wrong types) must
+        // reach hydrate itself, exactly like a real IDB getAll() would hand
+        // them back, not crash the fake en route.
+        loadAll: async () => rows.slice(),
+        put: (sha, bytes) => { rows.push({ sha, bytes: new Uint8Array(bytes) }); },
+      },
+    };
+  };
+
+  // (a) default path in node: no store, no indexedDB → resolve, change nothing
+  const v6a = newVault();
+  v6a.set(goodEntry69, bytes69);
+  await hydrateVault(v6a);
+  eq(v6a.count(), 1, '6v hydrate: node default (no idb) resolves and changes nothing');
+
+  // (b) empty store → vault unchanged
+  const v6b = newVault();
+  await hydrateVault(v6b, { loadAll: async () => [], put: () => {} });
+  eq(v6b.count(), 0, '6v hydrate: empty store hydrates nothing');
+
+  // (c) pre-seeded valid row → lands under its sha, bytes round-trip
+  const seed6v = memStore6v();
+  seed6v.rows.push({ sha: digest69, bytes: new Uint8Array(bytes69) });
+  const v6c = newVault();
+  await hydrateVault(v6c, seed6v.store);
+  eq(v6c.has(digest69) && v6c.count() === 1, true, '6v hydrate: seeded row lands under its sha');
+  eq(toHex(v6c.get(digest69) ?? new Uint8Array(0)), toHex(bytes69), '6v hydrate: seeded bytes round-trip');
+
+  // (d) corrupt rows skipped: digest lie, non-Uint8Array bytes, bad sha
+  // shape, null row — only the digest-true row lands
+  const bad6v = memStore6v();
+  bad6v.rows.push(
+    { sha: digest69, bytes: new Uint8Array(bytes69) },
+    { sha: 'ab'.repeat(32), bytes: new Uint8Array(bytes69) }, // valid hex, wrong digest
+    { sha: 'cd'.repeat(32), bytes: 'garbage' as unknown as Uint8Array },
+    { sha: 'not-hex!', bytes: new Uint8Array(bytes69) },
+    null as unknown as VaultRow,
+  );
+  const v6d = newVault();
+  await hydrateVault(v6d, bad6v.store);
+  eq(v6d.count() === 1 && v6d.has(digest69), true, '6v hydrate: corrupt rows skipped, digest-true row lands');
+  const v6d2 = newVault();
+  await hydrateVault(v6d2, { loadAll: async () => 'nope' as unknown as VaultRow[], put: () => {} });
+  eq(v6d2.count(), 0, '6v hydrate: non-array loadAll hydrates nothing');
+
+  // (e) idempotence: double hydrate keeps count and bytes
+  await hydrateVault(v6d, bad6v.store);
+  await hydrateVault(v6c, seed6v.store);
+  eq(v6d.count(), 1, '6v hydrate: re-hydrate is idempotent (no dup, no loss)');
+  eq(toHex(v6c.get(digest69) ?? new Uint8Array(0)), toHex(bytes69), '6v hydrate: bytes identical after re-hydrate');
+  const v6e = newVault();
+  v6e.set(goodEntry69, bytes69);
+  await hydrateVault(v6e, seed6v.store);
+  eq(v6e.count(), 1, '6v hydrate: hydrating an already-holding vault adds nothing');
+
+  // (f) a rejecting loadAll never rejects hydrate
+  let hydrErr6v = '';
+  try {
+    await hydrateVault(newVault(), { loadAll: () => Promise.reject(new Error('idb gone')), put: () => {} });
+  } catch (e) { hydrErr6v = msg69(e); }
+  eq(hydrErr6v, '', '6v hydrate: rejecting loadAll never rejects');
+
+  // (g) write-through: fetchVersion puts ONLY the digest-gated entry
+  const puts6v: { sha: string; bytes: string }[] = [];
+  const v6g = newVault();
+  const r6g = await fetchVersion(catFetch69, '9.9.9', v6g, {
+    fetchFn: fakeSplit69,
+    store: { loadAll: async () => [], put: (sha, bytes) => { puts6v.push({ sha, bytes: toHex(bytes) }); } },
+  });
+  eq(r6g.fetched === 1 && v6g.count() === 1, true, '6v write-through: run outcome unchanged with a store');
+  eq(puts6v.length === 1 && puts6v[0]?.sha === digest69, true, '6v write-through: exactly the verified entry is put');
+  eq(puts6v[0]?.bytes ?? '', toHex(bytes69), '6v write-through: put carries the digest-gated bytes');
+
+  // (h) write failure never blocks the run: sync throw + rejected promise
+  const v6h1 = newVault();
+  const r6h1 = await fetchVersion(catFetch69, '9.9.9', v6h1, {
+    fetchFn: fakeSplit69,
+    store: { loadAll: async () => [], put: (): never => { throw new Error('quota'); } },
+  });
+  eq(r6h1.fetched === 1 && v6h1.count() === 1, true, '6v write-through: throwing put never fails the run');
+  const v6h2 = newVault();
+  const r6h2 = await fetchVersion(catFetch69, '9.9.9', v6h2, {
+    fetchFn: fakeSplit69,
+    store: { loadAll: async () => [], put: () => Promise.reject(new Error('idb closed')) },
+  });
+  eq(r6h2.fetched === 1 && v6h2.count() === 1, true, '6v write-through: rejected put promise never fails the run');
+
+  // (i) the headline round-trip: download → store → fresh vault hydrate
+  const rt6v = memStore6v();
+  await fetchVersion(catFetch69, '9.9.9', newVault(), { fetchFn: fakeSplit69, store: rt6v.store });
+  const v6i = newVault(); // "the reloaded tab"
+  await hydrateVault(v6i, rt6v.store);
+  eq(v6i.has(digest69) && toHex(v6i.get(digest69) ?? new Uint8Array(0)) === toHex(bytes69), true,
+    '6v round-trip: a hydrated fresh vault equals the downloaded one');
+
+  // (j) the node store singleton: put resolves, loadAll is [] — guarded
+  const node6v = vaultStore();
+  let nodePutErr6v = '';
+  const nodeRows6v = await node6v.loadAll();
+  try { await node6v.put(digest69, bytes69); } catch (e) { nodePutErr6v = msg69(e); }
+  eq(Array.isArray(nodeRows6v) && nodeRows6v.length, 0, '6v node: vaultStore().loadAll → [] without indexedDB');
+  eq(nodePutErr6v, '', '6v node: vaultStore().put resolves without indexedDB');
+
 
   // Naya leading-zero device form (live-proven 2026-10-13: fe/1002 reports
   // 'v0.3.41.0', de/1008 'v0.2.3.3', catalog labels '3.41.0'/'2.3.3') —

@@ -15,6 +15,7 @@ import { loadFirmwareCatalog } from '../../lib/firmware-catalog';
 import type { FwCatalog } from '../../lib/firmware-catalog';
 import { fetchVersion } from '../../lib/firmware-fetch';
 import type { Vault } from '../../lib/firmware-fetch';
+import { hydrateVault, vaultStore } from '../../lib/firmware-vault-store';
 import type { SerialWorld } from '../../lib/serial-world';
 import type { HalfSnapshot, Side } from '@create-reflow/sdk';
 
@@ -36,6 +37,11 @@ export default function FirmwareTab({
   const [modDlgOpen, setModDlgOpen] = useState(false);
   const [downloading, setDownloading] = useState<string | null>(null);
   const [notices, setNotices] = useState<Record<string, LibraryNotice>>({});
+  // Vault hydration completion tick: the vault is read synchronously, so
+  // until hydrate resolves persisted downloads just look "not downloaded";
+  // the tick re-renders the library with the restored truth. The value
+  // itself is only a counter — the render is the payload.
+  const [, setVaultHydratedTick] = useState(0);
 
   // The loader memoizes its promise — remounts never re-parse the JSON.
   useEffect(() => {
@@ -48,6 +54,12 @@ export default function FirmwareTab({
     };
   }, []);
 
+  // One hydrate per mount (idempotent by contract, never rejects): IndexedDB
+  // rows land in the in-memory vault; node degrades to a no-op.
+  useEffect(() => {
+    void hydrateVault(vault).then(() => setVaultHydratedTick((t) => t + 1));
+  }, [vault]);
+
   // Library download: one version at a time; the fetch lib reports per
   // entry and never stores an unverified byte, so the notice is honest.
   const download = useCallback(
@@ -56,6 +68,7 @@ export default function FirmwareTab({
       setDownloading(label);
       setNotices((p) => ({ ...p, [label]: { fetched: 0, failed: [] } }));
       const r = await fetchVersion(catalog, label, vault, {
+        store: vaultStore(), // write-through mirror — best-effort, never blocks
         onOne: (one) => {
           if (one.ok) {
             setNotices((p) => ({ ...p, [label]: { ...(p[label] ?? { fetched: 0, failed: [] }), fetched: (p[label]?.fetched ?? 0) + 1 } }));

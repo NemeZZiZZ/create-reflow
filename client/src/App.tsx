@@ -62,10 +62,11 @@ import type { BleIdentityRead, KeyRec, LedRec, Side } from '@create-reflow/sdk';
 import { timeoutsMs } from '@create-reflow/sdk';
 import type { EditorView } from "./components/ViewLayerTabs";
 
-// Firmware flashing seam (Phase 9): one SerialWorld + the shared in-memory
-// blob vault, instantiated once for the app. The world resolves navigator
-// serial at call time (node-safe by construction); the vault lives for the
-// browser session only — images re-fetch per session, nothing persists.
+// Firmware flashing seam (Phase 9): one SerialWorld + the shared blob
+// vault, instantiated once for the app. The world resolves navigator
+// serial at call time (node-safe by construction); the vault itself is
+// in-memory but mirrored to IndexedDB (lib/firmware-vault-store) — verified
+// downloads survive a reload; hydrate happens at FirmwareTab mount.
 const fwWorld = defaultSerialWorld();
 const fwVault = firmwareVault();
 

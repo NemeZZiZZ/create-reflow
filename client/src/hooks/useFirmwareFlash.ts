@@ -643,7 +643,8 @@ export function moduleFwSnapshot(): ModuleFwSnapshot | null {
 /* Module-shared blob vault: fetchVersion primes it, the flash consumes it.
  * The vault contract (lib/firmware-fetch) guarantees bytes are stored only
  * under a VERIFIED digest, so the gate's heldSha256 = the vault key is
- * honest without re-digesting. */
+ * honest without re-digesting. Persisted across reloads via
+ * lib/firmware-vault-store (write-through + FirmwareTab-mount hydrate). */
 const sharedVault: Vault = newVault();
 
 export function firmwareVault(): Vault {

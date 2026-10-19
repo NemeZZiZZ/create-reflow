@@ -9,7 +9,9 @@
  * Nothing is stored on any failure: fetchImage validates historyPath,
  * blobSha256, HTTP status, the 8 MiB cap and the sha256 BEFORE returning,
  * and only fetchVersion (or the later flash caller) writes the vault —
- * after fetchImage has resolved. */
+ * after fetchImage has resolved. fetchVersion may additionally mirror the
+ * verified bytes into a persistence sink (opts.store, see
+ * lib/firmware-vault-store) — best-effort, never load-bearing. */
 
 import type { FwCatalog, FwEntry } from './firmware-catalog';
 
@@ -19,14 +21,24 @@ export const FIRMWARE_SOURCE_BASE =
 const MAX_IMAGE_BYTES = 8 * 1024 * 1024; // 8 MiB — largest catalog resource is 663,552 B
 const DEFAULT_TIMEOUT_MS = 30_000;
 
-/* In-memory blob store keyed by blobSha256. Nothing persists — the vault
- * lives for the flash session only. set() with a sha-less entry is a no-op
- * (unkeyable). */
+/* In-memory blob store keyed by blobSha256. The vault itself is the
+ * session's synchronous source of truth; optional persistence (hydrate +
+ * write-through) lives in lib/firmware-vault-store. set() with a sha-less
+ * entry is a no-op (unkeyable). */
 export interface Vault {
   has(sha: string): boolean;
   set(e: FwEntry, bytes: Uint8Array): void;
   get(sha: string): Uint8Array | undefined;
   count(): number;
+}
+
+/* Optional write-through persistence for verified blobs (the IndexedDB
+ * store lives in lib/firmware-vault-store; this seam stays DOM-free so
+ * node smoke can inject a fake). fetchVersion calls put(sha, bytes) only
+ * AFTER the digest gate has passed — fire-and-forget: a failed or
+ * throwing write never blocks or fails the run. */
+export interface VaultWriter {
+  put(sha: string, bytes: Uint8Array): void | Promise<void>;
 }
 
 export function newVault(): Vault {
@@ -120,13 +132,16 @@ export async function fetchImage(
 
 /* Fetch every historyPath-bearing catalog entry under a version label.
  * One failure never stops the rest; each attempt is reported through onOne.
- * Returns the split so callers can surface partial success. */
+ * Returns the split so callers can surface partial success. A store in
+ * opts mirrors each VERIFIED blob through (fire-and-forget) — the vault
+ * write and the run outcome are identical with or without one. */
 export async function fetchVersion(
   cat: FwCatalog,
   label: string,
   vault: Vault,
   opts?: {
     fetchFn?: typeof fetch;
+    store?: VaultWriter | null;
     onOne?(r: { entry: FwEntry; ok: boolean; reason?: string }): void;
   },
 ): Promise<{ fetched: number; failed: { path: string; reason: string }[] }> {
@@ -142,6 +157,7 @@ export async function fetchVersion(
     try {
       const bytes = await fetchImage(entry, opts?.fetchFn ? { fetchFn: opts.fetchFn } : undefined);
       vault.set(entry, bytes);
+      writeThrough(opts?.store, entry, bytes);
       fetched++;
       opts?.onOne?.({ entry, ok: true });
     } catch (err) {
@@ -151,4 +167,18 @@ export async function fetchVersion(
     }
   }
   return { fetched, failed };
+}
+
+/* Mirror one verified blob into the persistence sink. Same unkeyable rule
+ * as vault.set; never throws, never delays the caller — a failed write
+ * costs persistence, nothing else. */
+function writeThrough(store: VaultWriter | null | undefined, entry: FwEntry, bytes: Uint8Array): void {
+  if (store === null || store === undefined) return;
+  const sha = entry.blobSha256;
+  if (typeof sha !== 'string' || sha === '') return;
+  try {
+    Promise.resolve(store.put(sha, bytes)).catch(() => {});
+  } catch {
+    /* a synchronously-throwing put is swallowed too */
+  }
 }

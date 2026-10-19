@@ -32,6 +32,7 @@ import type { FwCatalog } from '../../lib/firmware-catalog';
 import { keyboardVersions } from '../../lib/firmware-catalog';
 import { fetchVersion } from '../../lib/firmware-fetch';
 import type { Vault } from '../../lib/firmware-fetch';
+import { vaultStore } from '../../lib/firmware-vault-store';
 import { resolveKeyboardPlan, fwLabelOf } from '../../lib/firmware-plan';
 import type { HalfPlan } from '../../lib/firmware-plan';
 import type { SerialWorld } from '../../lib/serial-world';
@@ -239,6 +240,7 @@ export default function KeyboardFlashDialog({
     setDl('fetching');
     setDlNote(null);
     const r = await fetchVersion(catalog, want, vault, {
+      store: vaultStore(), // write-through mirror — best-effort, never blocks
       onOne: (one) => {
         if (one.ok) return;
         setDlNote(one.reason ?? 'fetch failed');
