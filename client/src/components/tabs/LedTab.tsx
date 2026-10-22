@@ -2,14 +2,14 @@
 // and per-layer animations (plain actions — the device has no GET, so the
 // active animation is unknown).
 import { useState } from 'react';
-import { Brush, PaintBucket, Pipette, Plus, type LucideIcon } from 'lucide-react';
+import { Brush, CircleOff, PaintBucket, Pipette, Plus, type LucideIcon } from 'lucide-react';
 import Keyboard, { type LedVal } from '../Keyboard';
 import ColorDialog from '../ColorDialog';
 import { Button } from '../ui/button';
 import { Card, CardContent, CardHeader } from '../ui/card';
 import type { Draft } from '@create-reflow/sdk';
 import type { LedRec } from '@create-reflow/sdk';
-import { hsToHex, ledCss } from '@create-reflow/sdk';import { ANIM_NAMES, animOp } from '@create-reflow/sdk';
+import { hsToHex, isLedNoColor, ledCss, LED_NO_COLOR } from '@create-reflow/sdk';import { ANIM_NAMES, animOp } from '@create-reflow/sdk';
 import {
   BAY_LED_RANGES,
   queueBayColor,
@@ -30,9 +30,18 @@ const TOOLS: { id: LedTool; label: string; Icon: LucideIcon; hint: string }[] = 
 
 // Device hue is 9-bit (0..511, shared with the custom palette + ColorDialog);
 // saturation 0..100. No Value channel — brightness is keyboard-wide.
+// Outside that scale sits the NayaFlow "No colour" marker (h 0, s 150 wire
+// bytes — LED off): armed as its own state, queued as the literal so the
+// slider scale can never distort it (OF 571e126 / SCRUM-118 parity).
 const HUE_MAX = 511;
 
 const NO_SEL = new Set<number>();
+
+/** Log/readout label for a queued colour: the marker names itself, real
+ * colours read H/S. */
+function colorLabel(c: { h: number; s: number }): string {
+  return isLedNoColor(c.h, c.s) ? 'No colour (LED off)' : `H${c.h}/S${c.s}`;
+}
 
 export default function LedTab({
   layer,
@@ -69,6 +78,10 @@ export default function LedTab({
 }) {
   const [tool, setTool] = useState<LedTool>('brush');
   const [color, setColor] = useState<HsColor>({ h: 180, s: 100 });
+  // "No colour" armed: brush/fill/bay queue the unset marker instead of
+  // `color`. Separate state — the marker's s=150 lives on the wire's 0..255
+  // scale and must never round-trip through the 0..100 S-slider.
+  const [noColor, setNoColor] = useState(false);
   const [dlgOpen, setDlgOpen] = useState(false);
   const [dlgColor, setDlgColor] = useState<HsColor>({ h: 180, s: 100 });
 
@@ -86,23 +99,33 @@ export default function LedTab({
     if (tool === 'pipette') {
       const cur = ledmap.get(kk);
       if (cur) {
-        setColor({ h: cur.h, s: cur.s });
-        log('inf', `pipette KK ${kk} (0x${kk.toString(16)}) → H${cur.h} S${cur.s}`);
+        if (isLedNoColor(cur.h, cur.s)) {
+          setNoColor(true);
+          log('inf', `pipette KK ${kk} (0x${kk.toString(16)}) → No colour (LED off)`);
+        } else {
+          setNoColor(false);
+          setColor({ h: cur.h, s: cur.s });
+          log('inf', `pipette KK ${kk} (0x${kk.toString(16)}) → H${cur.h} S${cur.s}`);
+        }
       } else {
         log('inf', `pipette KK ${kk} (0x${kk.toString(16)}): no LED there`);
       }
       return;
     }
+    // Armed "No colour" queues the literal unset marker — an absent colour
+    // must reach the keyboard as a real op (the LED turns off), it can't
+    // ride "just don't write" (the LED would keep its old colour).
+    const c = noColor ? LED_NO_COLOR : color;
     if (tool === 'fill') {
-      const n = queueFillLayer(draftRef.current, layer, leds, color);
+      const n = queueFillLayer(draftRef.current, layer, leds, c);
       bumpDraft();
-      log('inf', `queued fill: ${n} LEDs L${layer} → H${color.h}/S${color.s}`);
+      log('inf', `queued fill: ${n} LEDs L${layer} → ${colorLabel(c)}`);
       return;
     }
-    const { queued } = queueColor(draftRef.current, [{ layer, kk }], color);
+    const { queued } = queueColor(draftRef.current, [{ layer, kk }], c);
     bumpDraft();
     if (queued)
-      log('inf', `queued color L${layer} KK ${kk} → H${color.h}/S${color.s}`);
+      log('inf', `queued color L${layer} KK ${kk} → ${colorLabel(c)}`);
     else log('err', `KK ${kk} (0x${kk.toString(16)}) has no LED — skipped`);
   }
 
@@ -114,18 +137,25 @@ export default function LedTab({
     if (tool === 'pipette') {
       const cur = ledmap.get(BAY_LED_RANGES[side].first);
       if (cur) {
-        setColor({ h: cur.h, s: cur.s });
-        log('inf', `pipette ${side} module bay → H${cur.h} S${cur.s}`);
+        if (isLedNoColor(cur.h, cur.s)) {
+          setNoColor(true);
+          log('inf', `pipette ${side} module bay → No colour (LED off)`);
+        } else {
+          setNoColor(false);
+          setColor({ h: cur.h, s: cur.s });
+          log('inf', `pipette ${side} module bay → H${cur.h} S${cur.s}`);
+        }
       } else {
         log('inf', `pipette ${side} module bay: no LED there`);
       }
       return;
     }
-    queueBayColor(draftRef.current, layer, side, color.h, color.s);
+    const c = noColor ? LED_NO_COLOR : color;
+    queueBayColor(draftRef.current, layer, side, c.h, c.s);
     bumpDraft();
     log(
       'inf',
-      `queued bay color L${layer} ${side} (24 LEDs) → H${color.h}/S${color.s}`,
+      `queued bay color L${layer} ${side} (24 LEDs) → ${colorLabel(c)}`,
     );
   }
 
@@ -141,6 +171,7 @@ export default function LedTab({
     if (!customColors.some((x) => x.h === c.h && x.s === c.s))
       onSaveCustomColors([...customColors, c]);
     setColor(c);
+    setNoColor(false);
     setDlgOpen(false);
   }
 
@@ -207,15 +238,42 @@ export default function LedTab({
                 </Button>
               ))}
             </div>
+            <Button
+              variant={noColor ? 'default' : 'outline'}
+              size="sm"
+              title={
+                noColor
+                  ? 'No colour armed — Brush/Fill queue the unset marker; pick any colour to disarm'
+                  : 'Queue the NayaFlow unset marker (hue 0, saturation 150) so the LED turns off'
+              }
+              aria-pressed={noColor}
+              onClick={() => setNoColor((v) => !v)}
+            >
+              <CircleOff /> No colour — LED off
+            </Button>
             <div className="flex items-center gap-2">
-              <span
-                className="inline-block h-6 w-6 shrink-0 rounded border border-border"
-                style={{ background: ledCss(color.h, color.s) }}
-                title="current tool color"
-              />
-              <span className="font-mono text-xs">
-                H{color.h} S{color.s} {hsToHex(color.h, color.s)}
-              </span>
+              {noColor ? (
+                // Armed marker readout: an empty dashed swatch — never the
+                // red hue-0 colour the raw h/s would suggest.
+                <>
+                  <span
+                    className="inline-block h-6 w-6 shrink-0 rounded border border-dashed border-border"
+                    title="No colour — LED off"
+                  />
+                  <span className="font-mono text-xs">No colour — LED off</span>
+                </>
+              ) : (
+                <>
+                  <span
+                    className="inline-block h-6 w-6 shrink-0 rounded border border-border"
+                    style={{ background: ledCss(color.h, color.s) }}
+                    title="current tool color"
+                  />
+                  <span className="font-mono text-xs">
+                    H{color.h} S{color.s} {hsToHex(color.h, color.s)}
+                  </span>
+                </>
+              )}
             </div>
             <div className="flex items-center gap-2">
               <span className="w-4 font-mono text-xs">H</span>
@@ -225,7 +283,10 @@ export default function LedTab({
                 max={HUE_MAX}
                 step={1}
                 value={color.h}
-                onChange={(e) => setColor({ ...color, h: Number(e.target.value) })}
+                onChange={(e) => {
+                  setNoColor(false);
+                  setColor({ ...color, h: Number(e.target.value) });
+                }}
                 className="flex-1"
                 style={{ accentColor: 'var(--primary)' }}
                 aria-label="Hue (device 0–511)"
@@ -239,7 +300,10 @@ export default function LedTab({
                 max={100}
                 step={1}
                 value={color.s}
-                onChange={(e) => setColor({ ...color, s: Number(e.target.value) })}
+                onChange={(e) => {
+                  setNoColor(false);
+                  setColor({ ...color, s: Number(e.target.value) });
+                }}
                 className="flex-1"
                 style={{ accentColor: 'var(--primary)' }}
                 aria-label="Saturation"
@@ -252,7 +316,10 @@ export default function LedTab({
                     key={`${c.h}-${c.s}-${i}`}
                     type="button"
                     title={`H${c.h} S${c.s}`}
-                    onClick={() => setColor(c)}
+                    onClick={() => {
+                      setNoColor(false);
+                      setColor(c);
+                    }}
                     className={cn(
                       'h-6 w-6 rounded border border-border',
                       c.h === color.h && c.s === color.s && 'outline-2 outline-primary',

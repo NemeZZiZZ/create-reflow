@@ -6,7 +6,7 @@
 // selection lives in the parent.
 import type { SVGProps } from "react";
 import { useRef } from "react";
-import { contrastStroke, describeRecord, hsToHex, ledCss, readableInk, toHex } from '@create-reflow/sdk';
+import { contrastStroke, describeRecord, hsToHex, isLedNoColor, ledCss, readableInk, toHex } from '@create-reflow/sdk';
 import { keyIconName, shortLabel } from "../lib/key-icon-map";
 import { KEY_ICONS } from "../lib/key-icons";
 import { POS_KEY, POS_SHAPE, SHAPES } from "../lib/kb-data";
@@ -22,6 +22,27 @@ import {
 export interface LedVal {
   h: number;
   s: number;
+}
+
+/** Tooltip colour row shared by keys, strip dots and bay swatches: a real
+ * colour shows swatch + hex + H/S; the NayaFlow unset marker (h 0, s 150 —
+ * OF "No colour") shows "No colour" instead — it is NOT the red hue-0
+ * colour a naïve ledCss would render. */
+function LedColorRow({ led }: { led: LedVal }) {
+  if (isLedNoColor(led.h, led.s))
+    return <div className="text-muted-foreground">No colour (LED off)</div>;
+  return (
+    <div className="flex items-center gap-1.5">
+      <span
+        className="inline-block size-3 rounded-sm border border-border"
+        style={{ background: ledCss(led.h, led.s) }}
+      />
+      <span className="font-mono">{hsToHex(led.h, led.s)}</span>
+      <span className="text-muted-foreground">
+        H {led.h} · S {led.s}
+      </span>
+    </div>
+  );
 }
 
 function attrName(k: string): string {
@@ -105,7 +126,10 @@ function Key({ pos, rec, led, ledMode, selected, dirty, pressed, onSelect, onPai
   const icon = iconName ? KEY_ICONS[iconName] : undefined;
   // LED fills get readability-driven ink + (when selected) a max-delta ring
   // instead of the hardcoded white-fill selection (UHK a11y pattern).
-  const ledFill = ledMode && led ? ledCss(led.h, led.s) : null;
+  // The unset marker (h 0, s 150) renders as NO fill — an absent colour
+  // must not masquerade as the red hue-0 colour ledCss would show.
+  const ledFill =
+    ledMode && led && !isLedNoColor(led.h, led.s) ? ledCss(led.h, led.s) : null;
   // Test-mode press overlay (KK-keyed; stays EMPTY until a verified
   // row/col→KK mapping exists — Phase-10 probe): translucent green fill +
   // ring, winning over LED paint and selection so a live press stays
@@ -129,18 +153,7 @@ function Key({ pos, rec, led, ledMode, selected, dirty, pressed, onSelect, onPai
           pos {pos} · KK 0x{kk.toString(16)}
         </span>
       </div>
-      {ledMode && led && (
-        <div className="flex items-center gap-1.5">
-          <span
-            className="inline-block size-3 rounded-sm border border-border"
-            style={{ background: ledCss(led.h, led.s) }}
-          />
-          <span className="font-mono">{hsToHex(led.h, led.s)}</span>
-          <span className="text-muted-foreground">
-            H {led.h} · S {led.s}
-          </span>
-        </div>
-      )}
+      {ledMode && led && <LedColorRow led={led} />}
       {desc ? (
         desc
           .split(" / ")
@@ -273,7 +286,8 @@ function StripDot({
   onPaintEnter,
   onPaintClick,
 }: StripDotProps) {
-  const fill = led ? ledCss(led.h, led.s) : null;
+  // Marker (h 0, s 150) → no fill, same as a dot with no LED.
+  const fill = led && !isLedNoColor(led.h, led.s) ? ledCss(led.h, led.s) : null;
   return (
     <Tooltip>
       <TooltipTrigger asChild>
@@ -323,18 +337,7 @@ function StripDot({
               KK 0x{kk.toString(16)}
             </span>
           </div>
-          {led && (
-            <div className="flex items-center gap-1.5">
-              <span
-                className="inline-block size-3 rounded-sm border border-border"
-                style={{ background: ledCss(led.h, led.s) }}
-              />
-              <span className="font-mono">{hsToHex(led.h, led.s)}</span>
-              <span className="text-muted-foreground">
-                H {led.h} · S {led.s}
-              </span>
-            </div>
-          )}
+          {led && <LedColorRow led={led} />}
         </div>
       </TooltipContent>
     </Tooltip>
@@ -474,7 +477,8 @@ export default function Keyboard({
   const baySwatch = (side: "left" | "right") => {
     const kk = side === "left" ? 88 : 112;
     const led = ledmap.get(kk);
-    const fill = led ? ledCss(led.h, led.s) : null;
+    // Marker (h 0, s 150) → no fill, same as a bay with no LED.
+    const fill = led && !isLedNoColor(led.h, led.s) ? ledCss(led.h, led.s) : null;
     return (
       <Tooltip>
         <TooltipTrigger asChild>
@@ -503,18 +507,7 @@ export default function Keyboard({
         <TooltipContent>
           <div className="grid gap-0.5">
             <div className="font-medium">Module bay LED ({side})</div>
-            {led && (
-              <div className="flex items-center gap-1.5">
-                <span
-                  className="inline-block size-3 rounded-sm border border-border"
-                  style={{ background: ledCss(led.h, led.s) }}
-                />
-                <span className="font-mono">{hsToHex(led.h, led.s)}</span>
-                <span className="text-muted-foreground">
-                  H {led.h} · S {led.s}
-                </span>
-              </div>
-            )}
+            {led && <LedColorRow led={led} />}
             <div className="text-muted-foreground">
               KK 0x{kk.toString(16)} · 24 LEDs
             </div>

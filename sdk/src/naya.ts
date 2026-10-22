@@ -1352,6 +1352,23 @@ export function chunkStatus(body: Uint8Array): ChunkStatus {
   return `unknown:0x${b.toString(16).padStart(2, '0')}`;
 }
 
+/** NayaFlow "No colour" marker (OF 571e126 / SCRUM-118): the device stores
+ * an ABSENT LED colour as hue 0 + saturation 150 — the LED op 30/100e
+ * record [00, layer, KK, H_lo, H_hi, S] carries it as bytes
+ * 00 .. .. 00 00 96 (S is one byte 0..255 on the wire; the LedTab S-slider
+ * is a 0..100 scale, so the marker must be queued as this LITERAL, never
+ * derived from slider math). Queue it via queueColor(draft, sel,
+ * LED_NO_COLOR); writeLed passes s through to the wire byte verbatim. */
+export const LED_NO_COLOR: { h: number; s: number } = Object.freeze({ h: 0, s: 150 });
+
+/** True when a stored/draft h/s pair IS the unset marker. Display maps a
+ * marker record ([KK, 00, 00, 96] readback) to the unset state — no
+ * swatch — while the near-identical REAL colour (0, 0) (hue 0, saturation
+ * 0 — a white LED) keeps rendering as a colour. */
+export function isLedNoColor(h: number, s: number): boolean {
+  return h === LED_NO_COLOR.h && s === LED_NO_COLOR.s;
+}
+
 export function ledCss(h: number, s: number): string {
   return `hsl(${h % 360} ${Math.min(100, s)}% 50%)`;
 }

@@ -3,7 +3,7 @@
  * explicit batch ("Flash"). Pure logic — no device access, no React — so it
  * is fully smoke-testable. */
 
-import { toHex } from './naya';
+import { isLedNoColor, toHex } from './naya';
 import type { KeyRec, LedRec } from './naya';
 import { CHUNK_PAYLOAD_CAP, chunkBudget } from './module-wire';
 
@@ -304,7 +304,12 @@ export function opSummary(o: Op): string {
     case 'key':
     case 'led': {
       const pos = `KK ${o.kk} (0x${o.kk.toString(16)})`;
-      if (o.kind === 'led') return `L${o.layer} ${pos} → H${o.h} S${o.s}`;
+      if (o.kind === 'led')
+        // The unset marker names itself in the flash plan — "H0 S150" would
+        // read as a colour and invite "fixing" it to a real hue-0 red.
+        return isLedNoColor(o.h, o.s)
+          ? `L${o.layer} ${pos} → No colour (LED off)`
+          : `L${o.layer} ${pos} → H${o.h} S${o.s}`;
       return `L${o.layer} ${pos} → ${o.label}`;
     }
     case 'keyset':

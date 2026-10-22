@@ -43,7 +43,7 @@ import * as path from 'path';
 import { keyIconName, shortLabel } from '../src/lib/key-icon-map';
 import { ACTIONS, buildRecord, findAction, matchAction } from '@create-reflow/sdk';
 import { Draft, opKey, opSection, opSummary, SECTIONS, SECTION_LABELS } from '@create-reflow/sdk';
-import type { KeySetOp, LayerListOp } from '@create-reflow/sdk';
+import type { KeySetOp, LayerListOp, LedOp } from '@create-reflow/sdk';
 import type { KeyRec, LedRec } from '@create-reflow/sdk';
 import { parseSnapshotFile, diffSnapshotToDraft, hexToBytes } from '@create-reflow/sdk';
 import type { SnapMaps } from '@create-reflow/sdk';
@@ -56,6 +56,7 @@ import {
 } from '@create-reflow/sdk';
 import type { SmpFrame, SmpSerialPortLike } from '@create-reflow/sdk';
 import Keyboard from '../src/components/Keyboard';
+import LedTab from '../src/components/tabs/LedTab';
 import {
   saveAutoBackup,
   listAutoBackups,
@@ -75,7 +76,7 @@ import {
 } from '@create-reflow/sdk';
 import type { LayerEntry } from '@create-reflow/sdk';
 import { queueLayerAdd, queueLayerDelete, pendingLayerAddIdxs } from '@create-reflow/sdk';
-import { BAY_LED_RANGES, queueBayColor, queueFillLayer } from '@create-reflow/sdk';
+import { BAY_LED_RANGES, isLedNoColor, LED_NO_COLOR, queueBayColor, queueColor, queueFillLayer } from '@create-reflow/sdk';
 import { chunkStatus, probeDraft } from '@create-reflow/sdk';
 import {
   decodeBleStatus, pairingVerdict, splitLinkVerdict, probeReached, parseBlePairs,
@@ -9334,6 +9335,118 @@ void (async () => {
   eq(ledDumpStat76, 'FAILED: dump timed out — replug the half and retry', '76 watchdog: led stat exact');
   eq(errs76.includes('dump: dump timed out — replug the half and retry'), true, '76 watchdog: err log copy exact');
   eq(DUMP_WATCHDOG_MS, 120_000, '76 watchdog: 120s wall clock');
+})();
+
+void (async () => {
+  // §77 LED "No colour" (OF 571e126 / SCRUM-118 parity): an absent colour
+  // must REACH the keyboard as the NayaFlow unset marker — hue 0,
+  // saturation 150, the literal wire byte 0x96 (the LED op 30/100e record
+  // is [00, layer, KK, H_lo, H_hi, S] with S one byte 0..255; the LedTab
+  // S-slider is a 0..100 scale, so the marker is queued as a LITERAL,
+  // never derived from slider math) — and a stored marker must DISPLAY as
+  // unset (no swatch), not as the red hue-0 colour a naïve ledCss shows.
+  // (a) queue side: the literal marker rides queueColor VERBATIM into the
+  // draft op, and the op's h/s ride writeLed VERBATIM onto the wire.
+  const draft77 = new Draft();
+  const q77 = queueColor(draft77, [{ layer: 1, kk: 0x13 }], { h: 0, s: 150 });
+  const op77 = draft77.ops.find((o): o is LedOp => o.kind === 'led');
+  eq(`${q77.queued}/${q77.skipped}`, '1/0', '77 queue: no-colour queues exactly one op');
+  eq(op77 !== undefined && op77.layer === 1 && op77.kk === 0x13, true,
+    '77 queue: op targets L1 KK 0x13');
+  eq(op77 !== undefined && op77.h === 0 && op77.s === 150, true,
+    '77 queue: op carries the literal marker h0 s150 (not slider-scale)');
+  // flash side: wire-record pin. Scripted writeFn echoes the 30/100e
+  // layer ACK; the request frame is byte-pinned.
+  const writes77: Uint8Array[] = [];
+  let wait77: (() => void) | null = null;
+  const inbox77: Uint8Array[] = [];
+  const rdr77 = {
+    async read(): Promise<{ value?: Uint8Array; done?: boolean }> {
+      if (inbox77.length > 0) return { value: inbox77.shift(), done: false };
+      await new Promise<void>((r) => { wait77 = r; });
+      return { value: inbox77.shift(), done: false };
+    },
+    cancel() { const w = wait77; wait77 = null; w?.(); },
+    releaseLock() {},
+  };
+  const ses77 = new NayaSession(
+    { readable: null, writable: null, async open() {}, async setSignals() {}, async close() {} } as unknown as SerialPort,
+    0x50,
+    new FrameReader(rdr77 as unknown as ReadableStreamDefaultReader<Uint8Array>),
+    { releaseLock() {} } as unknown as WritableStreamDefaultWriter<Uint8Array>,
+    rdr77 as unknown as ReadableStreamDefaultReader<Uint8Array>,
+    async (b) => {
+      writes77.push(Uint8Array.from(b));
+      const rq = verifyFrame(Uint8Array.from(b));
+      // device echoes [00, layer] for a 30/100e write ACK
+      const resp = buildFrame(0x50, rq.type, rq.c0, rq.c1,
+        Uint8Array.from([0x00, rq.payload[1] ?? 0]));
+      setTimeout(() => {
+        inbox77.push(resp);
+        const w = wait77; wait77 = null; w?.();
+      }, 5);
+    },
+    null,
+  );
+  const ack77 = await ses77.writeLed(op77?.kk ?? 0x13, op77?.h ?? 0, op77?.s ?? 150, op77?.layer ?? 1);
+  eq(writes77.length, 1, '77 wire: exactly one 30/100e frame written');
+  eq(toHex(verifyFrame(writes77[0]!).payload), '00 01 13 00 00 96',
+    '77 wire: record bytes [00, layer, KK, H_lo=00, H_hi=00, S=96]');
+  eq(toHex(writes77[0]!),
+    'aa 00 50 00 30 08 10 0e 00 01 13 00 00 96 9a 04',
+    '77 wire: full frame byte-pinned (CRC 9a)');
+  eq(isWriteAck(ack77, 1), true, '77 wire: layer-echo ACK accepted (isWriteAck L1)');
+  await ses77.close();
+
+  // (b) readback/display: parseLedmap yields the stored record verbatim;
+  // the LED view maps [KK, 00, 00, 96] to the UNSET state (no swatch)
+  // while [KK, 00, 00, 00] stays a real colour (hue 0 fully
+  // desaturated — a white LED).
+  const lm77 = parseLedmap(Uint8Array.from([0x13, 0x00, 0x00, 0x96, 0x34, 0x00, 0x00, 0x00]));
+  eq(lm77.recs.length === 2, true, '77 parse: two records');
+  eq(lm77.recs[0] !== undefined && lm77.recs[0].h === 0 && lm77.recs[0].s === 150, true,
+    '77 parse: stored [13,00,00,96] reads back h0 s150 (the marker)');
+  eq(lm77.recs[1] !== undefined && lm77.recs[1].h === 0 && lm77.recs[1].s === 0, true,
+    '77 parse: stored [34,00,00,00] reads back h0 s0 (a real colour)');
+  const ledmap77 = new Map<number, { h: number; s: number }>([
+    [0, { h: lm77.recs[0]!.h, s: lm77.recs[0]!.s }],  // marker → unset
+    [1, { h: lm77.recs[1]!.h, s: lm77.recs[1]!.s }],  // real colour → swatch
+  ]);
+  const html77 = renderToStaticMarkup(createElement(Keyboard, {
+    keymap: new Map(), ledmap: ledmap77, ledMode: true, sel: new Set(), onSelect: () => {},
+  }));
+  const fills77 = html77.match(/hsl\([^)]*\)/g) ?? [];
+  eq(fills77.length, 1, '77 display: exactly ONE led swatch fill (marker renders none)');
+  eq(fills77[0] === 'hsl(0 0% 50%)', true,
+    '77 display: the real (0,0) colour fills; the (0,150) marker does not');
+  eq(html77.includes('hsl(0 100% 50%'), false,
+    '77 display: the marker never shows the red hue-0 swatch a naïve ledCss would render');
+
+  // the affordance: LedTab carries a user-visible "No colour" action
+  const lt77 = renderToStaticMarkup(createElement(LedTab, {
+    layer: 0, onLayer: () => {}, layers: [0, 1, 2],
+    keymap: new Map(), ledsByLayer: [[], [], []], ledmap: new Map(),
+    dirtyKks: new Set(), draftRef: { current: new Draft() }, bumpDraft: () => {},
+    log: () => {}, leftOn: true, customColors: [], onSaveCustomColors: () => {},
+  }));
+  eq(lt77.includes('No colour — LED off'), true,
+    '77 affordance: LedTab renders the "No colour — LED off" action beside the tools');
+
+  // (c) the exported marker + predicate: the constant IS the literal OF
+  // writes (h 0, s 150 = wire byte 0x96 — never slider-scale), and the
+  // predicate accepts exactly the marker, both directions pinned against
+  // near-miss real colours.
+  eq(`${LED_NO_COLOR.h}/${LED_NO_COLOR.s}`, '0/150',
+    '77 marker: exported constant pinned h0 s150 (wire byte 0x96)');
+  eq(LED_NO_COLOR.s <= 255, true, '77 marker: s fits the wire byte (0..255)');
+  eq(isLedNoColor(0, 150), true, '77 predicate: (0,150) is unset');
+  eq(isLedNoColor(0, 0), false, '77 predicate: (0,0) is a REAL colour (white)');
+  eq(isLedNoColor(1, 150), false, '77 predicate: hue 1 s150 is a real colour');
+  eq(isLedNoColor(0, 149), false, '77 predicate: s149 near-miss is real');
+  eq(isLedNoColor(0, 151), false, '77 predicate: s151 near-miss is real');
+  // flash plan names the marker op for what it is (not "H0 S150")
+  eq(opSummary(op77!), 'L1 KK 19 (0x13) → No colour (LED off)',
+    '77 plan: flash summary names the marker op');
 })();
 
 void main();
