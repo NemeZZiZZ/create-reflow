@@ -168,3 +168,71 @@
 - [ ] **Step 2: Self-check** every anchor resolves (grep each file:line cited).
 - [ ] **Step 3: Delete the probe page + full gates** (build 0, lint 0, smoke 0 FAIL — docs-only otherwise).
 - [ ] **Step 4: Commit** — `git commit -m "docs: firmware night-session addendum + remove throwaway probe page"`.
+
+### Task 9 (parity P1): LED "No colour" — unset marker reaches the keyboard
+
+OF anchor: openflow 571e126 (SCRUM-118). OF writes "No colour" as the NayaFlow unset marker record: hue 0, UNSET_SATURATION 150 (wire bytes; LED op 30/100e params [00, layer, KK, H_lo, H_hi, S], S is one byte 0..255 — 150 = 0x96 fits). Previously absent colour = no op = LED kept old colour.
+
+**Files:**
+- Modify: `client/src/components/tabs/LedTab.tsx` (add a "No colour" affordance beside the existing tools)
+- Test: `client/scripts/smoke.tsx` (new §77)
+
+**Interfaces:**
+- Consumes: existing `queueColor(draft, sel, {h, s})` (sdk draft op) — verify s passes to the wire byte VERBATIM (named risk: UI S-slider may be a 0..100 scale; the affordance must queue the literal `{h: 0, s: 150}`, NOT slider-scale values).
+- Produces: a user-visible "No colour" action that queues exactly `{h: 0, s: 150}` for the current selection; readback/display treats a stored `(h=0, s=150)` record as unset (no colour swatch, not a red-ish hue-0 colour).
+
+- [ ] **Step 1: Failing asserts (§77)** — (a) queueing "no colour" for a key yields a draft LED op whose wire params contain H_lo=0 H_hi=0 S=0x96; (b) the readback/parse path maps a stored [KK, 00, 00, 96] record to the unset display state, distinct from [KK,00,00,00].
+- [ ] **Step 2: Red run** (rolldown exit verified, FAILs observed).
+- [ ] **Step 3: Implement** — one affordance in the LED editor (button, calm English copy e.g. "No colour — LED off"), queueing the literal unset marker; display-side mapping for the marker.
+- [ ] **Step 4: Gates** — build 0, lint 0 (27 baseline), smoke 0 FAIL.
+- [ ] **Step 5: Commit** — `feat(client): LED 'No colour' queues the NayaFlow unset marker — an absent colour reaches the keyboard`.
+
+### Task 10 (parity P2): terminal unbind queues NONE instead of refusing
+
+OF anchor: 571e126 (SCRUM-117). Our exact bug class: KeyActionMenu offers clear(tap) on the last slot → `onClearSlot` → `queueBehaviorSet` with a fully-empty set → `behaviorSetOps` returns null (`set.tap == null` guard) → drop row "behavior chain: Tap is required first" → NOTHING queued → key KEEPS its stale binding. The UI offers unbind; the draft silently refuses.
+
+**Files:**
+- Modify: `client/src/lib/queue.ts:154-204` (`queueBehaviorSet` — the fully-empty-set terminal case only; the existing drop message stays for sets that are merely incomplete)
+- Test: `client/scripts/smoke.tsx` (§78)
+
+**Interfaces:**
+- Consumes: `prevRecs` (live dump records at kk) already passed to `queueBehaviorSet`; the keyset op shape used by layer blanking (`[pos][07][00]` fillerRecord + shadow-bank filler — see `queueLayerDelete` queue.ts:283-330 for the exact records).
+- Produces: fully-empty set + prevRecs has ≥1 live (non-NONE) record at kk → queue keyset op(s) writing the NONE record for kk AND clearing any second-bank (double-tap/tap-hold) records the key owns (OF `_own_second_bank` semantics). Fully-empty set + no live record → keep today's honest no-op behavior.
+
+- [ ] **Step 1: Failing asserts (§78)** — (a) empty set + live prevRec → draft gains the NONE keyset record(s) for kk (incl. second-bank clear when prevRecs show double-tap/tap-hold); (b) empty set + no live prevRec → no op queued, no drop row claiming a write; (c) incomplete set (some slots null, tap present) → existing behavior unchanged.
+- [ ] **Step 2: Red run.**
+- [ ] **Step 3: Implement** — terminal branch in `queueBehaviorSet`; reuse the existing filler-record builders, do not invent new op shapes.
+- [ ] **Step 4: Gates.**
+- [ ] **Step 5: Commit** — `fix(client): clearing the last behavior queues a NONE record — unbind reaches the keyboard`.
+
+### Task 11 (parity P3): layer-delete bulk-clear confirmation
+
+OF anchor: 571e126 bulk guard (BULK_CLEAR_MIN_KEYS=5, >half the layer's own-bound keys, explicit allowBulk tick, server refuses without flag). Our risk surface: `queueLayerDelete` (queue.ts:283-330) blanks a whole layer (156 slots + LED ops) and FlashDialog shows drop rows only — no bulk warning.
+
+**Files:**
+- Modify: the flash confirm dialog (FlashDialog.tsx) + its inputs; possibly `client/src/hooks/useFlash.ts` to expose the count.
+- Test: `client/scripts/smoke.tsx` (§79)
+
+**Interfaces:**
+- Consumes: the live dump (keysByLayer / layer records) to count a layer's bound keys (non-NONE, non-filler records).
+- Produces: when the draft contains a layer-delete op for layer L whose dump shows ≥5 bound keys → dialog renders a warn block ("this deletes every binding on layer L — N keys") + an explicit tick; Flash button stays disabled until ticked. Below the threshold → no new UI. The tick does NOT need to ride the wire (client-side gate only; OF's server flag has no analog here — the draft IS the plan).
+
+- [ ] **Step 1: Failing asserts (§79)** — derive-bound-count logic + dialog gate (threshold 5 pinned; 4 → no gate, 5 → gate; layer with <5 bound keys deleted → no gate).
+- [ ] **Step 2: Red run.**
+- [ ] **Step 3: Implement.**
+- [ ] **Step 4: Gates.**
+- [ ] **Step 5: Commit** — `feat(client): layer-delete bulk-clear confirmation when a layer loses many bound keys`.
+
+### Task 12 (parity P4): OF 0.7.1 notes — naming divergence + SPI-flash-test facts
+
+**Files:**
+- Modify: `HANDOFF.md` (notes section), `sdk/src/troubleshooting/wire-guard.ts` (comment-only)
+
+**Content (facts, no uninvented claims):**
+- Naming divergence: OF 0.7.1 added Settings > Shortcut Names (OS-based override of BOUND-chord display names, 6 mac presets). We are deliberately N/A: our phase-8 platform toggle (`reflow.appsc.mac`) bakes the platform into the queued def at pick time — no global override layer needed.
+- SPI-flash-test (OF naya-probe --spi-flash-test): op 0xfa/0x1001, per-partition verdict (status + five return codes; 32B payload = 5 partitions, 20B = 3). NOT read-only: writes+reads back a test file per partition (like NayaCore's repair-flash diagnose); never formats/erases. Our wire-guard already blocks fa/* in the trouble lane — add the op-facts sentence to the guard's comment.
+- /rpc/flash own-refusals 400-not-500 in OF: N/A for us (our refusals are client-side drops with reasons since T4).
+
+- [ ] **Step 1: Write notes** (grep-anchored facts only).
+- [ ] **Step 2: Gates** (docs+comment only — build/lint/smoke unchanged, run once to confirm).
+- [ ] **Step 3: Commit** — `docs: OF 0.7.1 parity notes — naming divergence, SPI-flash-test op facts`.
