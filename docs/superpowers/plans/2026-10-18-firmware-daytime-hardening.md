@@ -236,3 +236,34 @@ OF anchor: 571e126 bulk guard (BULK_CLEAR_MIN_KEYS=5, >half the layer's own-boun
 - [ ] **Step 1: Write notes** (grep-anchored facts only).
 - [ ] **Step 2: Gates** (docs+comment only — build/lint/smoke unchanged, run once to confirm).
 - [ ] **Step 3: Commit** — `docs: OF 0.7.1 parity notes — naming divergence, SPI-flash-test op facts`.
+
+---
+
+### Task 13: Dock bay menu — Module bays section moves onto the board docks (owner directive 2026-10-24)
+
+**Files:**
+- Modify: `client/src/components/Keyboard.tsx` (owner's uncommitted teardrop-dock diff lands as the base commit of this task; then wire dock interactivity)
+- Create: `client/src/components/modules/DockBayMenu.tsx`
+- Delete: `client/src/components/tabs/modules/BayPicker.tsx` (unused after this task)
+- Modify: `client/src/components/tabs/BindingsTab.tsx` (remove `<BayPicker>` section + import; docks menu state lives here)
+- Modify: `client/src/components/tabs/LedTab.tsx` (unchanged API — `onBayPaint={bayClick}` must work again through the new docks)
+- Modify: `client/src/components/Keyboard.tsx` middle docks: `role="button"` `tabIndex={0}` `aria-haspopup="menu"` `aria-expanded`, `data-testid="dock-left|right"` kept
+- Test: `client/scripts/smoke.tsx` §80 (T11 owns §79; if T11 already landed, take the next free §)
+
+**Interfaces:**
+- Consumes: `useModuleProfiles` API exactly as BayPicker did (`profiles, bays, live, reading, setBay`), SDK `BAY_POSITIONS`, `BayValue`, `ModuleType`; BindingsTab already receives `modules` + `layer`.
+- Produces: `DockBayMenu({ side: 'left'|'right', layer: number, modules, onManage: () => void, onClose: () => void, anchor: {x,y} })` — open menu for one side. Keyboard gains optional `onDockActivate?: (side, x, y) => void` (keymap-mode click) while `onBayPaint` keeps LED-mode click. App passes `onManage = () => setTab('modules')` (same target OF's onManage has).
+
+**OF reference (parity source):** `openflow/frontend/src/components/ModuleBayPicker.jsx` — header `{module} · {layerLabel}`; profile radios (`◉/○` + name + `live` badge when `onBoard`); note "Inherited from the base layer. Picking here overrides it for this layer only." (non-base layers, when bay inherited); "Disabled on this layer" radio; "Edit profiles…" item; close on outside mousedown + Escape; viewport-anchored position (host rect bottom+6, centered, min 8px) because the center column clips.
+
+**Our mapping (decided with owner 2026-10-24):**
+- Menu opens on CLICK in keymap mode (OF-style); per side it carries the same three slot groups BayPicker had for that side (TOUCH/TRACK/TUNE × that side's KK from `BAY_POSITIONS`), each: profile radios + live badge + Disabled. Sections collapse to the docked module's type when `modPresence` knows it (dock is physical); all three when unknown/empty.
+- LED mode: dock click = paint (existing `onBayPaint` semantics restored on the new teardrops; old `baySwatch` function deleted as dead code).
+- No per-layer feature loss: menu is per-layer exactly like BayPicker (base layer sets, others inherit/override).
+- Owner's Keyboard.tsx teardrop diff commits FIRST as this task's base commit (owner authorship preserved, message: `ui(client): dock bays as teardrops with dock-left/dock-right testids`), feature commit second.
+
+- [ ] **Step 1:** Commit owner's Keyboard.tsx diff verbatim (explicit path) with the base message above.
+- [ ] **Step 2:** Failing §80 asserts: menu renders radios for a side's profiles from a fake `modules` object; Disabled item present; pick calls `setBay(type, sideKK, id)` with exact args; inherit note renders on layer 1 with inherited bay; Edit-profiles fires `onManage`; LED click calls `onBayPaint(side)`; keymap click opens menu (dock aria-expanded true).
+- [ ] **Step 3:** Implement DockBayMenu + Keyboard wiring + BindingsTab swap + BayPicker deletion.
+- [ ] **Step 4:** Gates from client/ (build 0, lint 0 @ 27-warning baseline, rolldown exit verified, smoke 0 FAIL).
+- [ ] **Step 5:** Commit feature: `feat(client): dock bay menu — per-layer module picks move onto the board docks`
