@@ -10,7 +10,7 @@ import LayoutTable, { type MergedRow } from "../LayoutTable";
 import SelectionPanel from "../SelectionPanel";
 import { ACTIONS, buildRecord, type ActionDef } from '@create-reflow/sdk';
 import { behaviorSetOf, hidPairOf, type BehaviorSet, type Slot } from '@create-reflow/sdk';
-import type { NayaSession, Side } from '@create-reflow/sdk';
+import type { NayaSession, Side, HalfSnapshot } from '@create-reflow/sdk';
 import { POS_KEY } from "../../lib/kb-data";
 import { shortLabel } from "../../lib/key-icon-map";
 import type { KeyRec, LayerEntry } from '@create-reflow/sdk';
@@ -22,7 +22,7 @@ import { useKeyscan } from "../../hooks/useKeyscan";
 import type { SelKey } from '@create-reflow/sdk';
 import type { EditorView } from "../ViewLayerTabs";
 import type { useModuleProfiles } from "../../hooks/useModuleProfiles";
-import BayPicker from "./modules/BayPicker";
+import DockBayMenu from "../modules/DockBayMenu";
 import { Button } from "../ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "../ui/card";
 
@@ -86,6 +86,8 @@ export default function BindingsTab({
   onSetNote,
   ledCount,
   modules,
+  halves,
+  onManageModules,
   sesRef,
   busyRef,
   draftSize,
@@ -145,9 +147,14 @@ export default function BindingsTab({
   notes: Record<string, string>;
   onSetNote: (kk: number, v: string) => void;
   ledCount: number;
-  /** module-profile store: the per-layer bay picker edits it through
-   * setBay (Task 4) — the hook queues the wire ops. */
+  /** module-profile store: the docks' bay menu edits it through
+   * setBay (Task 13) — the hook queues the wire ops. */
   modules: ReturnType<typeof useModuleProfiles>;
+  /** per-half aux snapshots — which module type is docked per side, so the
+   * bay menu collapses to the physically docked module (null when unknown) */
+  halves?: Record<Side, HalfSnapshot>;
+  /** "Edit profiles…" in the bay menu: jump to the modules tab */
+  onManageModules?: () => void;
   /** live keyscan test session (left half) — the hook owns the safety
    * exits and the raw event tail */
   sesRef: React.RefObject<Map<Side, NayaSession>>;
@@ -160,7 +167,23 @@ export default function BindingsTab({
   const [ctx, setCtx] = useState<{ kk: number; x: number; y: number } | null>(
     null,
   );
+  // Open bay menu (keymap-mode dock click): one side at a time, anchored at
+  // the click point. The menu itself is per-layer — picks ride modules.setBay.
+  const [dockMenu, setDockMenu] = useState<{
+    side: "left" | "right";
+    x: number;
+    y: number;
+  } | null>(null);
   const popRef = useRef<HTMLDivElement | null>(null);
+
+  // The docked module's type for a side, when presence knows it — the bay
+  // menu collapses to it (an empty/unknown dock offers all three bays).
+  const dockedTypeOf = (side: "left" | "right"): string | null => {
+    const h = halves?.[side];
+    if (!h?.modPresent) return null;
+    const t = h.modType.toUpperCase();
+    return t === "TOUCH" || t === "TRACK" || t === "TUNE" ? t : null;
+  };
 
   const single =
     sel.length === 1 && sel[0].layer === layer ? sel[0].kk : null;
@@ -270,6 +293,8 @@ export default function BindingsTab({
           dirtyKks={dirtyKks}
           onContext={(kk, x, y) => setCtx({ kk, x, y })}
           keyNotes={layerNotes}
+          onDockActivate={(side, x, y) => setDockMenu({ side, x, y })}
+          dockOpen={dockMenu?.side ?? null}
         />
       )}
 
@@ -364,9 +389,20 @@ export default function BindingsTab({
         </Card>
       )}
 
-      {/* Per-layer bay picker (Task 4): layer context exists here in both
-          views; picks queue wire ops through the hook's setBay. */}
-      <BayPicker modules={modules} layer={layer} />
+      {/* Dock bay menu (Task 13): the per-layer module picks moved onto the
+          board's docks — opened by a keymap-mode dock click, per layer like
+          the old Module bays card; picks queue wire ops through setBay. */}
+      {dockMenu != null && (
+        <DockBayMenu
+          side={dockMenu.side}
+          layer={layer}
+          modules={modules}
+          dockedType={dockedTypeOf(dockMenu.side)}
+          anchor={{ x: dockMenu.x, y: dockMenu.y }}
+          onManage={onManageModules}
+          onClose={() => setDockMenu(null)}
+        />
+      )}
 
       {sel.length > 0 && (
         <SelectionPanel

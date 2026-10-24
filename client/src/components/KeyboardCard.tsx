@@ -37,6 +37,8 @@ export default function KeyboardCard({
   dirtyKks,
   onContext,
   keyNotes,
+  onDockActivate,
+  dockOpen,
 }: {
   view: EditorView;
   onView: (v: EditorView) => void;
@@ -70,6 +72,11 @@ export default function KeyboardCard({
   dirtyKks: Set<number>;
   onContext?: (kk: number, x: number, y: number) => void;
   keyNotes?: Map<number, string>;
+  /** keymap-mode dock click: open the per-side bay menu (BindingsTab owns
+   *  the open state) */
+  onDockActivate?: (side: "left" | "right", x: number, y: number) => void;
+  /** which dock's bay menu is open — drives the dock's aria-expanded */
+  dockOpen?: "left" | "right" | null;
 }) {
   return (
     <Card className="mb-3">
@@ -133,6 +140,8 @@ export default function KeyboardCard({
               pressed={pressedKks}
               onContext={onContext}
               keyNotes={keyNotes}
+              onDockActivate={onDockActivate}
+              dockOpen={dockOpen}
             />
           </div>
         </div>

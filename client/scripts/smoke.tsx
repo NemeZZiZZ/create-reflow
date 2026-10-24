@@ -57,6 +57,10 @@ import {
 import type { SmpFrame, SmpSerialPortLike } from '@create-reflow/sdk';
 import Keyboard from '../src/components/Keyboard';
 import LedTab from '../src/components/tabs/LedTab';
+import { dockActivate } from '../src/lib/dock-activate';
+import DockBayMenu from '../src/components/modules/DockBayMenu';
+import { bayPickHandler, bayMenuManage } from '../src/components/modules/bay-wiring';
+import type { useModuleProfiles } from '../src/hooks/useModuleProfiles';
 import {
   saveAutoBackup,
   listAutoBackups,
@@ -9543,6 +9547,146 @@ void (async () => {
       '78 incomplete: hold-without-tap refusal unchanged');
     eq(d3.drops.length, 1, '78 incomplete: one drop, exactly as today');
   }
+})();
+
+void (async () => {
+  // §80 dock bay menu (Task 13): the Module bays card moves onto the board's
+  // teardrop docks — OF ModuleBayPicker parity. One open menu per side; the
+  // picks are the SAME per-layer wire ops the old card queued (setBay), the
+  // docks keep the dock-left/dock-right testids, LED-mode click paints the
+  // side's bay block and keymap-mode click opens the menu.
+  const calls80: string[] = [];
+  const profT80 = { id: 'p-touch-1', name: 'Thumb stick', type: 'TOUCH', settings: {}, bindings: {} };
+  const profK80 = { id: 'p-track-1', name: 'Scroll wheel', type: 'TRACK', settings: {}, bindings: {} };
+  const mk80 = (bays: Record<number, Record<number, string>>, profiles = [profT80, profK80]) => ({
+    profiles,
+    bays,
+    live: {
+      3: { slot: 3, uuid: 'u3', type: 'TOUCH', matched: profT80, closest: null, differs: 0, diffRows: [], settings: {}, records: new Map() },
+    },
+    reading: false,
+    setBay: (l: number, p: number, pick: string) => { calls80.push(`${l}/${p}/${pick}`); },
+  }) as unknown as ReturnType<typeof useModuleProfiles>;
+  const menu80 = (over: Record<string, unknown> = {}, bays: Record<number, Record<number, string>> = { 1: { 74: 'p-touch-1' } }) =>
+    renderToStaticMarkup(createElement(DockBayMenu, {
+      side: 'left', layer: 1, modules: mk80(bays), dockedType: null,
+      anchor: { x: 60, y: 60 }, onManage: () => {}, onClose: () => {}, ...over,
+    }));
+  const html80 = menu80();
+  // (a) the side's slot groups render with the same controls BayPicker had
+  eq(html80.includes('Thumb stick') && html80.includes('Scroll wheel'), true,
+    '80 menu: both side profiles render as radios');
+  eq(html80.includes('KK 0x4a') && html80.includes('KK 0x4c') && html80.includes('KK 0x4e'), true,
+    '80 menu: the three LEFT bay Kks (touch/track/tune)');
+  eq(html80.includes('0x4b') || html80.includes('0x4d') || html80.includes('0x4f'), false,
+    '80 menu: the RIGHT dock Kks never leak into the left menu');
+  eq(html80.includes('Disabled on this layer'), true, '80 menu: disabled item (OF copy)');
+  eq(html80.includes('Inherit from base layer'), true, '80 menu: inherit radio on a non-base layer');
+  eq(menu80({}, { 1: { 74: 'inherit' } }).includes('Inherited from the base layer. Picking here overrides it for this layer only.'), true,
+    '80 menu: OF inherit note on an inherited bay');
+  eq((html80.match(/checked=""/g) ?? []).length, 1,
+    '80 menu: exactly the picked profile is checked');
+  eq(html80.includes('content-matched on the board at slot 3'), true,
+    '80 menu: live badge names the content-matched slot');
+  eq(html80.includes('layer 1'), true, '80 menu: header names the layer');
+  eq(menu80({ onManage: undefined }).includes('Edit profiles…'), false,
+    '80 menu: manage item absent without onManage');
+  eq(menu80().includes('Edit profiles…'), true, '80 menu: manage item with onManage');
+  // (b) section collapse: a physically docked module narrows the menu
+  const col80 = menu80({ dockedType: 'TOUCH' });
+  eq(col80.includes('Touch · layer 1') && col80.includes('KK 0x4a'), true,
+    '80 collapse: docked TOUCH keeps its section and names the module');
+  eq(col80.includes('KK 0x4c') || col80.includes('KK 0x4e'), false,
+    '80 collapse: undocked types collapse away');
+  // (c) base layer: inherit is not offered (0x78 points AT the base layer)
+  const base80 = menu80({ layer: 0 }, { 0: { 74: 'p-touch-1' } });
+  eq(base80.includes('Inherit from base layer') ||
+    base80.includes('overrides it for this layer only'), false,
+    '80 base: layer 0 offers no inherit (nothing to inherit)');
+  // (d) honest badges: a picked profile with no read verdict says so
+  eq(menu80({}, { 1: { 76: 'p-track-1' } }).includes('not on device'), true,
+    '80 badge: picked-but-unread profile shows "not on device"');
+  // (e) a type with no profiles yet still offers inherit/disabled
+  eq(menu80({}, { 1: {} }, []).includes('No profiles for this module yet.'), true,
+    '80 empty: profile-less section says so (OF copy)');
+
+  // (f) pick wiring: radio pick → setBay(layer, sideKK, pick) EXACTLY —
+  // the hook owns the byte mapping (slot/0x78/0x00) and the busy gate.
+  const picked80: string[] = [];
+  const h80 = bayPickHandler(
+    (l, p, pick) => picked80.push(`${l}/${p}/${pick}`),
+    1, 0x4a,
+  );
+  h80('p-track-1');
+  eq(picked80[0], '1/74/p-track-1', '80 pick: profile pick → setBay(1, 0x4a, id)');
+  h80('inherit');
+  eq(picked80[1], '1/74/inherit', '80 pick: inherit pick → intent verbatim');
+  h80('disabled');
+  eq(picked80[2], '1/74/disabled', '80 pick: disabled pick → intent verbatim');
+  eq(calls80.length, 0, '80 menu: rendering never picks');
+
+  // (g) manage wiring: onManage fires BEFORE the close (navigation wins)
+  const seq80: string[] = [];
+  bayMenuManage(() => seq80.push('manage'), () => seq80.push('close'))();
+  eq(seq80.join(','), 'manage,close', '80 manage: onManage fires, then the menu closes');
+  seq80.length = 0;
+  bayMenuManage(undefined, () => seq80.push('close'))();
+  eq(seq80.join(','), 'close', '80 manage: absent onManage still closes');
+
+  // (h) LED-mode docks: the teardrops paint again (old baySwatch semantics)
+  const kbLed80 = renderToStaticMarkup(createElement(Keyboard, {
+    keymap: new Map(), ledmap: new Map([[88, { h: 180, s: 100 }]]), ledMode: true,
+    sel: new Set(), onSelect: () => {}, onBayPaint: () => {},
+  }));
+  eq(kbLed80.includes('dock-left') && kbLed80.includes('dock-right'), true,
+    '80 led: teardrop testids kept');
+  eq((kbLed80.match(/role="button"/g) ?? []).length, 2,
+    '80 led: both docks are buttons (paint restored on the teardrops)');
+  eq(kbLed80.includes('Left module bay'), true, '80 led: dock aria-label restored');
+  eq(kbLed80.includes('hsl(180 100% 50%)'), true, '80 led: bay LED fill shows on the dock');
+  eq(kbLed80.includes('aria-haspopup'), false, '80 led: no menu semantics in LED mode');
+  const kbLedOff80 = renderToStaticMarkup(createElement(Keyboard, {
+    keymap: new Map(), ledmap: new Map([[88, { h: 180, s: 100 }]]), ledMode: true,
+    sel: new Set(), onSelect: () => {},
+  }));
+  eq((kbLedOff80.match(/role="button"/g) ?? []).length, 0,
+    '80 led: without onBayPaint the docks stay indicators');
+
+  // (i) keymap-mode docks: click opens the menu (aria-expanded flips)
+  const kbKm80 = renderToStaticMarkup(createElement(Keyboard, {
+    keymap: new Map(), ledmap: new Map(), sel: new Set(), onSelect: () => {},
+    onDockActivate: () => {}, dockOpen: 'left',
+  } as never));
+  eq(kbKm80.includes('aria-haspopup="menu"'), true, '80 keymap: dock advertises a menu');
+  eq(kbKm80.includes('aria-expanded="true"'), true, '80 keymap: open dock aria-expanded true');
+  eq(kbKm80.includes('aria-expanded="false"'), true, '80 keymap: other dock aria-expanded false');
+  eq(kbKm80.includes('module dock'), true, '80 keymap: docks named as docks');
+  const kbKmClosed80 = renderToStaticMarkup(createElement(Keyboard, {
+    keymap: new Map(), ledmap: new Map(), sel: new Set(), onSelect: () => {},
+    onDockActivate: () => {},
+  } as never));
+  eq(kbKmClosed80.includes('aria-expanded="true"'), false,
+    '80 keymap: closed menu → no dock claims expanded');
+
+  // (j) dispatch: LED click paints the side, keymap click opens the menu,
+  // and the two never cross (one click, one meaning).
+  const paint80: string[] = [];
+  const open80: string[] = [];
+  dockActivate({ ledMode: true, onBayPaint: (s) => paint80.push(s) }, 'left', 1, 2);
+  eq(paint80.join(','), 'left', '80 dispatch: LED click paints the clicked side');
+  dockActivate({ ledMode: false, onDockActivate: (s, x, y) => open80.push(`${s}@${x},${y}`) }, 'right', 12, 34);
+  eq(open80.join(','), 'right@12,34', '80 dispatch: keymap click opens the menu at the pointer');
+  dockActivate({ ledMode: true, onBayPaint: (s) => paint80.push(s), onDockActivate: (s) => open80.push(s) }, 'right', 0, 0);
+  eq(open80.join(','), 'right@12,34', '80 dispatch: LED mode never opens the menu');
+  dockActivate({ ledMode: false, onBayPaint: (s) => paint80.push(s), onDockActivate: (s, x, y) => open80.push(`${s}@${x},${y}`) }, 'left', 9, 9);
+  eq(paint80.join(','), 'left,right', '80 dispatch: keymap mode never paints');
+  let ok80 = true;
+  try { dockActivate({ ledMode: false }, 'left', 0, 0); } catch { ok80 = false; }
+  eq(ok80, true, '80 dispatch: no callbacks → silent no-op');
+
+  // (k) the old card is gone — picks live on the docks now
+  eq(fs.existsSync('src/components/tabs/modules/BayPicker.tsx'), false,
+    '80 refactor: BayPicker removed');
 })();
 
 void main();

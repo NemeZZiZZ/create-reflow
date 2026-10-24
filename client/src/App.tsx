@@ -908,6 +908,8 @@ export default function App() {
               }}
               ledCount={ledsByLayer[layer]?.length ?? 0}
               modules={moduleProfiles}
+              halves={halves}
+              onManageModules={() => setTab("modules")}
               sesRef={sesRef}
               busyRef={busyRef}
               draftSize={draftSize}

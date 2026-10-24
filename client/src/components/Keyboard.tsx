@@ -6,6 +6,8 @@
 // selection lives in the parent.
 import type { SVGProps } from "react";
 import { useRef } from "react";
+import { dockActivate } from "../lib/dock-activate";
+
 import {
   contrastStroke,
   describeRecord,
@@ -391,9 +393,13 @@ interface KeyboardProps {
   dirty?: Set<number>;
   /** drag-paint mode: pointer-down starts a stroke, pointer-enter paints */
   onPaint?: (kk: number) => void;
-  /** LED-mode bay swatch click (no drag — a bay is one swatch): paints the
+  /** LED-mode dock click (no drag — a bay is one swatch): paints the
    *  whole 24-LED block of that side; absent → bays render as indicators */
   onBayPaint?: (side: "left" | "right") => void;
+  /** keymap-mode dock click: open the per-side bay menu (viewport x/y) */
+  onDockActivate?: (side: "left" | "right", x: number, y: number) => void;
+  /** which dock's bay menu is open — the dock flips to aria-expanded */
+  dockOpen?: "left" | "right" | null;
   /** cursor override for paint tools (e.g. "cursor-crosshair") */
   cursorClass?: string;
   /** keymap-mode right click on a key: (kk, viewport x, viewport y) */
@@ -415,6 +421,9 @@ export default function Keyboard({
   disabled = false,
   dirty,
   onPaint,
+  onBayPaint,
+  onDockActivate,
+  dockOpen,
   cursorClass,
   onContext,
   keyNotes,
@@ -545,17 +554,87 @@ export default function Keyboard({
     </div>
   );
 
+  // Module docks (the owner's teardrops): physical bays flanking the
+  // middle column. LED mode + onBayPaint → click paints the side's 24-LED
+  // bay block (old baySwatch semantics, incl. LED fill + dirty marker);
+  // keymap mode + onDockActivate → click opens the per-side bay menu.
+  // With neither callback the dock stays a non-interactive indicator.
+  const dock = (side: "left" | "right") => {
+    const paintable = ledMode && !!onBayPaint;
+    const activatable = !ledMode && !!onDockActivate;
+    const interactive = paintable || activatable;
+    const kk = side === "left" ? 88 : 112;
+    const led = ledmap.get(kk);
+    // Marker (h 0, s 150) → no fill, same as a bay with no LED.
+    const fill =
+      paintable && led && !isLedNoColor(led.h, led.s) ? ledCss(led.h, led.s) : null;
+    const capSide = side === "left" ? "Left" : "Right";
+    const activate = (x: number, y: number) =>
+      dockActivate({ ledMode, onBayPaint, onDockActivate }, side, x, y);
+    const teardrop = (
+      <div
+        className={`relative size-26 rounded-full ${side === "left" ? "rounded-tr-[20px]" : "rounded-tl-[20px]"} border-2 border-[#555] bg-[#222]`}
+        {...(side === "left"
+          ? { "data-testid": "dock-left" }
+          : { "data-testid": "dock-right" })}
+        style={fill ? { background: fill } : undefined}
+        {...(interactive
+          ? {
+              role: "button" as const,
+              tabIndex: 0,
+              "aria-label": paintable
+                ? `${capSide} module bay`
+                : `${capSide} module dock`,
+            }
+          : {})}
+        {...(activatable
+          ? {
+              "aria-haspopup": "menu" as const,
+              "aria-expanded": dockOpen === side,
+            }
+          : {})}
+        onClick={interactive ? (e) => activate(e.clientX, e.clientY) : undefined}
+        onKeyDown={
+          interactive
+            ? (e) => {
+                if (e.key !== "Enter" && e.key !== " ") return;
+                e.preventDefault();
+                const r = e.currentTarget.getBoundingClientRect();
+                activate(r.left + r.width / 2, r.bottom);
+              }
+            : undefined
+        }
+      >
+        {paintable && dirty?.has(kk) && (
+          <span
+            className="absolute -top-0.5 -right-0.5 size-1.5 rounded-full bg-amber-400"
+            title="queued change — not flashed yet"
+          />
+        )}
+      </div>
+    );
+    if (!paintable) return teardrop;
+    return (
+      <Tooltip>
+        <TooltipTrigger asChild>{teardrop}</TooltipTrigger>
+        <TooltipContent>
+          <div className="grid gap-0.5">
+            <div className="font-medium">Module bay LED ({side})</div>
+            {led && <LedColorRow led={led} />}
+            <div className="text-muted-foreground">
+              {`KK 0x${kk.toString(16)} · 24 LEDs`}
+            </div>
+          </div>
+        </TooltipContent>
+      </Tooltip>
+    );
+  };
+
   const middle = (
     <div className="flex flex-col gap-4 justify-between pb-4 items-center h-full">
       <div className="flex justify-center gap-[3.3rem] h-full items-end pt-4">
-        <div
-          className="size-26 rounded-full rounded-tr-[20px] border-2 border-[#555] bg-[#222]"
-          data-testid="dock-left"
-        />
-        <div
-          className="size-26 rounded-full rounded-tl-[20px] border-2 border-[#555] bg-[#222]"
-          data-testid="dock-right"
-        />
+        {dock("left")}
+        {dock("right")}
       </div>
       <div className="-mx-12 flex items-center justify-between gap-8">
         <div className="flex gap-1">{[37, 53, 67].map(K)}</div>
