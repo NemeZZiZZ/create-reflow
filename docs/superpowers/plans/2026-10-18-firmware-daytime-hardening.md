@@ -267,3 +267,21 @@ OF anchor: 571e126 bulk guard (BULK_CLEAR_MIN_KEYS=5, >half the layer's own-boun
 - [ ] **Step 3:** Implement DockBayMenu + Keyboard wiring + BindingsTab swap + BayPicker deletion.
 - [ ] **Step 4:** Gates from client/ (build 0, lint 0 @ 27-warning baseline, rolldown exit verified, smoke 0 FAIL).
 - [ ] **Step 5:** Commit feature: `feat(client): dock bay menu — per-layer module picks move onto the board docks`
+
+---
+
+### Task 14: Keyboard fills the container — fit scale loses its 1.0 ceiling (owner directive 2026-10-24)
+
+**Files:**
+- Modify: `client/src/hooks/useKbFit.ts` (extract + uncap the formula; update the header comment: scale has no upper cap, the board fills the container width)
+- Test: `client/scripts/smoke.tsx` §81 (§79 = T11, §80 = T13; T14 lands after both)
+
+**Interfaces:**
+- Produces: `export function kbFitScale(containerW: number, naturalW: number): number` from useKbFit.ts — `1` when either argument is not > 0; otherwise `Math.max(0.25, containerW / naturalW)` (NO upper clamp). The hook calls `kbFitScale(box.clientWidth, kbNaturalW.current)` and keeps its own natural-width bookkeeping (divide-out zoomed scrollWidth) unchanged.
+
+**Background:** useKbFit.ts:29 clamps `Math.min(1, …)` — the board shrinks on narrow windows but never grows past its natural 1100 px. CSS `zoom` re-lays-out in Chromium (our only target), so unclamping is sufficient; a percentage-layout refactor is explicitly rejected (owner decision 2026-10-24: no cap, keep zoom).
+
+- [ ] **Step 1:** Failing §81 asserts: `kbFitScale(550,1100)===0.5`; `kbFitScale(1100,1100)===1`; **`kbFitScale(2200,1100)===2` (the red one — current clamp yields 1)**; `kbFitScale(275,1100)===0.25` (floor kept); `kbFitScale(100,0)===1` (degenerate).
+- [ ] **Step 2:** Extract `kbFitScale`, uncap, rewire the hook, update the header comment.
+- [ ] **Step 3:** Gates from client/ (build 0, lint 0 @ 27-warning baseline, rolldown exit verified, smoke 0 FAIL).
+- [ ] **Step 4:** Commit: `feat(client): keyboard fills the container width — fit scale no longer caps at natural size`
