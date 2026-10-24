@@ -9447,6 +9447,102 @@ void (async () => {
   // flash plan names the marker op for what it is (not "H0 S150")
   eq(opSummary(op77!), 'L1 KK 19 (0x13) → No colour (LED off)',
     '77 plan: flash summary names the marker op');
+
+  // §78 terminal unbind (OF 571e126 / SCRUM-117 parity): the key menu
+  // offers Clear on the LAST behavior slot (clearable('tap') allows it once
+  // hold/double/taphold are null) → cascadeClear → queueBehaviorSet with a
+  // FULLY-empty set. That is a real unbind intent, not a chain violation:
+  // when the board dump still holds a live (non-NONE) record at the key,
+  // the queue must write the NONE filler [kk,07,00] — the same resting
+  // shape queueLayerDelete blanks slots with — so the empty key reaches
+  // the keyboard, clearing the second-bank (double-tap/tap-hold) shadow
+  // the key owns (OF _own_second_bank semantics). No live record → today's
+  // honest no-op stays (the key is already empty on the board).
+  const empty78: BehaviorSet = { tap: null, hold: null, double: null, taphold: null };
+
+  // (a) live prevRec → the NONE record(s) reach the draft
+  {
+    // plain T01 owner: one filler, no second bank to clear
+    const d = new Draft();
+    const plainPrev = [{ kk: 0x22, rec: plainRecord(0x22, 0x07) }] as unknown as KeyRec[];
+    const r = queueBehaviorSet(d, 0, 0x22, empty78, 200, 'unbind', plainPrev);
+    eq(r.queued, true, '78 unbind: live plain key → unbind queues');
+    eq(r.error, undefined, '78 unbind: no error — the clear is writable');
+    eq(d.drops.length, 0, '78 unbind: no drop row (nothing refused)');
+    const ks = d.ops[0] as KeySetOp | undefined;
+    eq(ks?.kind === 'keyset' && ks.layer === 0 && ks.kk === 0x22, true,
+      '78 unbind: keyset op at L0 KK 0x22');
+    eq(ks?.records.length, 1, '78 unbind: plain owner → ONE record (no second bank)');
+    eq(ks ? toHex(ks.records[0]) : 'no op', '22 07 00',
+      '78 unbind: primary filler is [kk, 07, 00]');
+    // reconcile: the device compacts the emptied slot to absent, and the
+    // filler is absent-satisfied — the op settles after readback.
+    eq(d.reconcile([[]], []), 1, '78 unbind: absent-satisfied filler settles after readback');
+    eq(d.size, 0, '78 unbind: draft empty once the board shows the key absent');
+
+    // T10 owner: the shadow slot at kk+0x52 is cleared too
+    const d2 = new Draft();
+    const t10Prev = [
+      { kk: 0x22, rec: t10Primary(0x22, 0x09, 0x07) },
+      { kk: 0x74, rec: t10ShadowFull(0x22, 0x1a, 0x1b) },
+    ] as unknown as KeyRec[];
+    const r2 = queueBehaviorSet(d2, 1, 0x22, empty78, 200, 'unbind', t10Prev);
+    eq(r2.queued, true, '78 unbind: T10 owner → unbind queues');
+    const ks2 = d2.ops[0] as KeySetOp | undefined;
+    eq(ks2?.records.length, 2, '78 unbind: T10 owner → primary + second-bank clear');
+    eq(ks2 ? toHex(ks2.records[0]) : 'no op', '22 07 00',
+      '78 unbind: T10 primary slot → NONE');
+    eq(ks2 ? toHex(ks2.records[1]) : 'no op', '74 07 00',
+      '78 unbind: owned shadow kk+0x52 → NONE (OF _own_second_bank)');
+    eq(ks2 ? opSummary(ks2) : 'no op', 'L1 KK 34 → unbind (2 rec)',
+      '78 plan: flash summary names the unbind op');
+  }
+
+  // (b) no live record → honest no-op: nothing queued, no row claiming a write
+  {
+    const d = new Draft();
+    const r = queueBehaviorSet(d, 0, 0x22, empty78, 200, 'unbind');
+    eq(r.queued, false, '78 no-live: no prevRecs → no-op (key already empty)');
+    eq(r.error, 'behavior chain: Tap is required first',
+      '78 no-live: today\'s refusal return stays verbatim');
+    eq(d.size, 0, '78 no-live: nothing queued');
+    eq(d.drops.length === 1 &&
+      /keeps whatever the keyboard already had/i.test(d.drops[0]?.effect ?? ''), true,
+      '78 no-live: the single drop row claims NO write (effect = key keeps its binding)');
+    // a filler-shaped prevRec is NOT live — the slot is already NONE
+    const d2 = new Draft();
+    const fillerPrev = [{ kk: 0x22, rec: fillerRecord(0x22) }] as unknown as KeyRec[];
+    const r2 = queueBehaviorSet(d2, 0, 0x22, empty78, 200, 'unbind', fillerPrev);
+    eq(r2.queued === false && d2.size === 0, true,
+      '78 no-live: filler-shaped prevRec is not live — no-op stays');
+  }
+
+  // (c) merely-incomplete sets (tap present) — existing behavior unchanged
+  {
+    // tap-only still downgrades to the plain T01 pick (§22c path)
+    const d = new Draft();
+    const rt = queueBehaviorSet(d, 0, 0x22,
+      { tap: 0x07, hold: null, double: null, taphold: null }, 200, 'tap only');
+    eq(rt.queued, true, '78 incomplete: tap-only downgrade still queues');
+    eq(d.ops[0].kind, 'key', '78 incomplete: plain key op (downgrade unchanged)');
+    eq(toHex((d.ops[0] as { record: Uint8Array }).record), '22 01 04 07 00 07 00',
+      '78 incomplete: plain T01 record');
+    // chain violations with tap PRESENT still refuse verbatim (§55 path)
+    const d2 = new Draft();
+    const rb = queueBehaviorSet(d2, 0, 0x22,
+      { tap: 0x07, hold: null, double: null, taphold: 0x06 }, 200, 'bad chain');
+    eq(rb.queued, false, '78 incomplete: taphold-without-double still refused');
+    eq(rb.error, 'behavior chain: Double Tap required before Tap+Hold',
+      '78 incomplete: chain message verbatim');
+    eq(d2.size, 0, '78 incomplete: refusal queues nothing');
+    // hold-without-tap still throws → refuses (NOT the terminal-unbind path)
+    const d3 = new Draft();
+    const rh = queueBehaviorSet(d3, 0, 0x22,
+      { tap: null, hold: 0x0b, double: null, taphold: null }, 200, 'hold only');
+    eq(rh.error, 'behavior chain: Tap is required first',
+      '78 incomplete: hold-without-tap refusal unchanged');
+    eq(d3.drops.length, 1, '78 incomplete: one drop, exactly as today');
+  }
 })();
 
 void main();

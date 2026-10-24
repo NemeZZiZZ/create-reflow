@@ -150,7 +150,9 @@ export function queueSetting(draft: Draft, op: SettingsOp): void {
  * measured encoding) is written ONLY when the user explicitly picked a
  * flavor — otherwise preserved from the live record via behaviorMetaOf.
  * A tap-only result downgrades to the plain T01 record (plus shadow
- * cleanup when the old set was a T10). */
+ * cleanup when the old set was a T10); a FULLY-empty set on a key the
+ * board still holds a live record for queues the NONE fillers (unbind —
+ * OF 571e126 parity), and is an honest no-op on a key already empty. */
 export function queueBehaviorSet(
   draft: Draft,
   layer: number,
@@ -169,6 +171,33 @@ export function queueBehaviorSet(
     });
     if (!op) {
       if (set.tap == null) {
+        // Terminal unbind (OF 571e126 parity): a FULLY-empty set is a real
+        // "clear this key" intent — the UI offers Clear on the last slot.
+        // When the board still holds a live record at kk (or the T10
+        // second-bank shadow the key owns at kk+0x52), queue the NONE
+        // fillers — the same [pos][07][00] shape queueLayerDelete blanks
+        // slots with — so the empty key reaches the keyboard instead of
+        // the stale binding surviving a silent no-op. The live test uses
+        // reconcile's filler predicate ([kk,00/07,00] = absent): a key the
+        // dump shows empty is already unbound — honest no-op, no write.
+        const prim = prevRecs?.find((r) => r.kk === kk);
+        const liveAtKk =
+          prim != null &&
+          !(prim.rec.length === 3 && (prim.rec[1] === 0 || prim.rec[1] === 0x07));
+        const shadow = hasT10Shadow(prevRecs, kk);
+        if (liveAtKk || shadow) {
+          draft.add({
+            kind: 'keyset',
+            layer,
+            kk,
+            records: [
+              fillerRecord(kk),
+              ...(shadow ? [fillerRecord(kk + SHADOW_OFF)] : []),
+            ],
+            label,
+          });
+          return { queued: true };
+        }
         draft.addDrop({
           layer,
           kk,
