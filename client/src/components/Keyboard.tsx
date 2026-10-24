@@ -6,12 +6,20 @@
 // selection lives in the parent.
 import type { SVGProps } from "react";
 import { useRef } from "react";
-import { contrastStroke, describeRecord, hsToHex, isLedNoColor, ledCss, readableInk, toHex } from '@create-reflow/sdk';
+import {
+  contrastStroke,
+  describeRecord,
+  hsToHex,
+  isLedNoColor,
+  ledCss,
+  readableInk,
+  toHex,
+} from "@create-reflow/sdk";
 import { keyIconName, shortLabel } from "../lib/key-icon-map";
 import { KEY_ICONS } from "../lib/key-icons";
 import { POS_KEY, POS_SHAPE, SHAPES } from "../lib/kb-data";
 import type { KeyShape } from "../lib/kb-data";
-import { cn } from '../lib/utils';
+import { cn } from "../lib/utils";
 import {
   Tooltip,
   TooltipContent,
@@ -107,7 +115,7 @@ interface KeyProps {
   onPaintDown?: (kk: number) => void;
   onPaintEnter?: (kk: number) => void;
   /** click fallback for click-only activation (a11y/automation); the parent
-    *  skips it right after a pointer paint so real clicks queue once */
+   *  skips it right after a pointer paint so real clicks queue once */
   onPaintClick?: (kk: number) => void;
   /** keymap-mode right click: open the config popover anchored here */
   onContext?: (kk: number, x: number, y: number) => void;
@@ -117,7 +125,21 @@ interface KeyProps {
   pressed?: boolean;
 }
 
-function Key({ pos, rec, led, ledMode, selected, dirty, pressed, onSelect, onPaintDown, onPaintEnter, onPaintClick, onContext, note }: KeyProps) {
+function Key({
+  pos,
+  rec,
+  led,
+  ledMode,
+  selected,
+  dirty,
+  pressed,
+  onSelect,
+  onPaintDown,
+  onPaintEnter,
+  onPaintClick,
+  onContext,
+  note,
+}: KeyProps) {
   const kk = pos; // positionId == KK index (proven: 0=Esc/LA1, 0x30=Z/LC4 …)
   const label = rec ? shortLabel(rec) : (POS_KEY[String(pos)] ?? "");
   // action glyph for non-standard keys (currentColor => follows legend color);
@@ -154,10 +176,8 @@ function Key({ pos, rec, led, ledMode, selected, dirty, pressed, onSelect, onPai
         </span>
       </div>
       {ledMode && led && <LedColorRow led={led} />}
-      {desc ? (
-        desc
-          .split(" / ")
-          .map((line, i) =>
+      {desc
+        ? desc.split(" / ").map((line, i) =>
             i === 0 && !ledMode ? (
               <div key={i}>{line}</div>
             ) : (
@@ -166,11 +186,9 @@ function Key({ pos, rec, led, ledMode, selected, dirty, pressed, onSelect, onPai
               </div>
             ),
           )
-      ) : (
-        !ledMode && (
-          <div className="text-muted-foreground">no record — transparent</div>
-        )
-      )}
+        : !ledMode && (
+            <div className="text-muted-foreground">no record — transparent</div>
+          )}
       {rec && (
         <div className="font-mono text-[10px] text-muted-foreground">
           {toHex(rec)}
@@ -193,12 +211,17 @@ function Key({ pos, rec, led, ledMode, selected, dirty, pressed, onSelect, onPai
             pressed
               ? { outline: "2px solid #4ade80", outlineOffset: 1 }
               : selected && ledFill
-                ? { outline: `2px solid ${contrastStroke(ledFill)}`, outlineOffset: 1 }
+                ? {
+                    outline: `2px solid ${contrastStroke(ledFill)}`,
+                    outlineOffset: 1,
+                  }
                 : undefined
           }
           onClick={
             onPaintDown
-              ? (onPaintClick ? () => onPaintClick(kk) : undefined)
+              ? onPaintClick
+                ? () => onPaintClick(kk)
+                : undefined
               : (e) => onSelect(pos, kk, e.shiftKey, e.altKey)
           }
           onPointerDown={
@@ -219,33 +242,33 @@ function Key({ pos, rec, led, ledMode, selected, dirty, pressed, onSelect, onPai
               : undefined
           }
         >
-      <div className="relative">
-        <ShapeSvg name={POS_SHAPE[pos]} fill={fill} stroke={stroke} />
-        <span
-          className={cn(
-            "absolute text-sm left-1/2 top-1/2 -translate-1/2 font-medium whitespace-nowrap [&_svg]:block [&_svg]:size-8",
-            !ink && {
-              "text-gray-900": selected,
-              "text-gray-100 text-shadow-[-1px_-1px_0_rgba(0,0,0,.5),1px_-1px_0_rgba(0,0,0,.5),-1px_1px_0_rgba(0,0,0,.5),1px_1px_0_rgba(0,0,0,.5)]":
-                !selected,
-            },
-          )}
-          style={ink ? { color: ink } : undefined}
-          dangerouslySetInnerHTML={{ __html: icon ? icon : label }}
-        />
-        {dirty && (
-          <span
-            className="absolute -top-0.5 -right-0.5 size-1.5 rounded-full bg-amber-400"
-            title="queued change — not flashed yet"
-          />
-        )}
-        {note && (
-          <span
-            className="absolute left-0 top-0 size-0 border-l-[9px] border-l-amber-400/80 border-t-[9px] border-t-transparent"
-            title={`Note: ${note}`}
-          />
-        )}
-      </div>
+          <div className="relative">
+            <ShapeSvg name={POS_SHAPE[pos]} fill={fill} stroke={stroke} />
+            <span
+              className={cn(
+                "absolute text-sm left-1/2 top-1/2 -translate-1/2 font-medium whitespace-nowrap [&_svg]:block [&_svg]:size-8",
+                !ink && {
+                  "text-gray-900": selected,
+                  "text-gray-100 text-shadow-[-1px_-1px_0_rgba(0,0,0,.5),1px_-1px_0_rgba(0,0,0,.5),-1px_1px_0_rgba(0,0,0,.5),1px_1px_0_rgba(0,0,0,.5)]":
+                    !selected,
+                },
+              )}
+              style={ink ? { color: ink } : undefined}
+              dangerouslySetInnerHTML={{ __html: icon ? icon : label }}
+            />
+            {dirty && (
+              <span
+                className="absolute -top-0.5 -right-0.5 size-1.5 rounded-full bg-amber-400"
+                title="queued change — not flashed yet"
+              />
+            )}
+            {note && (
+              <span
+                className="absolute left-0 top-0 size-0 border-l-[9px] border-l-amber-400/80 border-t-[9px] border-t-transparent"
+                title={`Note: ${note}`}
+              />
+            )}
+          </div>
         </div>
       </TooltipTrigger>
       <TooltipContent>{tip}</TooltipContent>
@@ -297,7 +320,11 @@ function StripDot({
           className="relative h-4 w-2 shrink-0 rounded-[3px] border border-border hover:brightness-125"
           style={
             pressed
-              ? { background: "#4ade80", outline: "2px solid #4ade80", outlineOffset: 1 }
+              ? {
+                  background: "#4ade80",
+                  outline: "2px solid #4ade80",
+                  outlineOffset: 1,
+                }
               : selected && fill
                 ? {
                     background: fill,
@@ -308,7 +335,9 @@ function StripDot({
           }
           onClick={
             onPaintDown
-              ? (onPaintClick ? () => onPaintClick(kk) : undefined)
+              ? onPaintClick
+                ? () => onPaintClick(kk)
+                : undefined
               : (e) => onSelect(kk, kk, e.shiftKey, e.altKey)
           }
           onPointerDown={
@@ -364,7 +393,7 @@ interface KeyboardProps {
   onPaint?: (kk: number) => void;
   /** LED-mode bay swatch click (no drag — a bay is one swatch): paints the
    *  whole 24-LED block of that side; absent → bays render as indicators */
-  onBayPaint?: (side: 'left' | 'right') => void;
+  onBayPaint?: (side: "left" | "right") => void;
   /** cursor override for paint tools (e.g. "cursor-crosshair") */
   cursorClass?: string;
   /** keymap-mode right click on a key: (kk, viewport x, viewport y) */
@@ -386,7 +415,6 @@ export default function Keyboard({
   disabled = false,
   dirty,
   onPaint,
-  onBayPaint,
   cursorClass,
   onContext,
   keyNotes,
@@ -471,52 +499,6 @@ export default function Keyboard({
     </div>
   );
 
-  // Module bays (LED mode only): one swatch per side showing the bay block's
-  // first LED (left 88 / right 112); click paints all 24 blocks of the side.
-  // Without onBayPaint (keymap view) they stay non-interactive indicators.
-  const baySwatch = (side: "left" | "right") => {
-    const kk = side === "left" ? 88 : 112;
-    const led = ledmap.get(kk);
-    // Marker (h 0, s 150) → no fill, same as a bay with no LED.
-    const fill = led && !isLedNoColor(led.h, led.s) ? ledCss(led.h, led.s) : null;
-    return (
-      <Tooltip>
-        <TooltipTrigger asChild>
-          {onBayPaint ? (
-            <button
-              type="button"
-              aria-label={side === "left" ? "Left module bay" : "Right module bay"}
-              className="relative h-11 w-11 rounded-[10px] border-2 border-[#555] hover:brightness-125"
-              style={{ background: fill ?? "#222" }}
-              onClick={() => onBayPaint(side)}
-            >
-              {dirty?.has(kk) && (
-                <span
-                  className="absolute -top-1 -right-1 size-1.5 rounded-full bg-amber-400"
-                  title="queued change — not flashed yet"
-                />
-              )}
-            </button>
-          ) : (
-            <div
-              className="h-11 w-11 rounded-[10px] border-2 border-[#555]"
-              style={{ background: fill ?? "#222" }}
-            />
-          )}
-        </TooltipTrigger>
-        <TooltipContent>
-          <div className="grid gap-0.5">
-            <div className="font-medium">Module bay LED ({side})</div>
-            {led && <LedColorRow led={led} />}
-            <div className="text-muted-foreground">
-              KK 0x{kk.toString(16)} · 24 LEDs
-            </div>
-          </div>
-        </TooltipContent>
-      </Tooltip>
-    );
-  };
-
   const halfLeft = (
     <div className="flex h-full justify-self-end gap-1">
       {ledMode && stripCol([81, 82, 83, 84, 85, 86, 87])}
@@ -563,24 +545,17 @@ export default function Keyboard({
     </div>
   );
 
-  const dock = (
-    <div className="h-11 w-11 rounded-[10px] border-2 border-[#555] bg-[#222]" />
-  );
-
   const middle = (
     <div className="flex flex-col gap-4 justify-between pb-4 items-center h-full">
-      <div className="flex justify-center gap-[3.3rem] h-full items-start pt-4">
-        {ledMode ? (
-          <>
-            {baySwatch("left")}
-            {baySwatch("right")}
-          </>
-        ) : (
-          <>
-            {dock}
-            {dock}
-          </>
-        )}
+      <div className="flex justify-center gap-[3.3rem] h-full items-end pt-4">
+        <div
+          className="size-26 rounded-full rounded-tr-[20px] border-2 border-[#555] bg-[#222]"
+          data-testid="dock-left"
+        />
+        <div
+          className="size-26 rounded-full rounded-tl-[20px] border-2 border-[#555] bg-[#222]"
+          data-testid="dock-right"
+        />
       </div>
       <div className="-mx-12 flex items-center justify-between gap-8">
         <div className="flex gap-1">{[37, 53, 67].map(K)}</div>
